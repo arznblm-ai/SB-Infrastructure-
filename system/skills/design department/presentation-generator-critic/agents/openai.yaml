@@ -1,0 +1,4 @@
+interface:
+  display_name: "Presentation Generator + Critic"
+  short_description: "Iterate decks faster with a stateless builder-review loop"
+  default_prompt: "Use $presentation-generator-critic to apply these presentation comments, create a new version, export the updated PDF, and then run a strict critic review while preserving the meaning."

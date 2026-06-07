@@ -1,0 +1,11 @@
+node_modules
+.next
+out
+data/*.sqlite
+data/*.sqlite-*
+.env*.local
+.tools
+npm-debug.log*
+dashboard-check.png
+dashboard-check-after-crud.png
+dashboard-rub-cockpit-check.png

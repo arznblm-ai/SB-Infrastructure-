@@ -1,0 +1,4 @@
+interface:
+  display_name: "Presentation Art Director"
+  short_description: "Review decks for layout, typography, and near-identical visual fidelity"
+  default_prompt: "Use $presentation-art-director to compare this presentation to the original, check layout and font fidelity, and push it as close as possible without changing the copy."

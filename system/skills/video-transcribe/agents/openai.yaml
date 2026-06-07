@@ -1,0 +1,4 @@
+interface:
+  display_name: "Video Transcribe"
+  short_description: "Transcribe videos into transcripts and auto-create a summary"
+  default_prompt: "Use $video-transcribe to transcribe a video into transcripts, run $transcript-summarizer, and save the summary into education or meetings."

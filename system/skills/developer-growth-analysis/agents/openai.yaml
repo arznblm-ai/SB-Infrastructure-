@@ -1,0 +1,3 @@
+display_name: Developer Growth Analysis
+short_description: Analyze Anton's Codex sessions and turn them into a practical growth report.
+default_prompt: Analyze my recent Codex work and produce a developer growth report in Russian.

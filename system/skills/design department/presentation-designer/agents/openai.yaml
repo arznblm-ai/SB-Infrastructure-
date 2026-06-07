@@ -1,0 +1,4 @@
+interface:
+  display_name: "Presentation Designer"
+  short_description: "Redesign decks with strong hierarchy and Apple-inspired clarity"
+  default_prompt: "Use $presentation-designer to redesign this presentation with stronger visual hierarchy, rhythm, typography, and slide composition."

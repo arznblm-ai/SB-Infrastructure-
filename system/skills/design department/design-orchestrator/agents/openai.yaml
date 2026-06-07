@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Orchestrator"
+  short_description: "Run Design Department as a sequence of specialist roles with explicit handoffs and quality gates"
+  default_prompt: "Use $design-orchestrator to intake this design request, choose the correct workflow mode, route it through the right presentation roles, pass artifacts between them, and return a final design package with review status."

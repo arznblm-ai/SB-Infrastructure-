@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vibecoding Mentor"
+  short_description: "Review progress and guide vibecoding practice"
+  default_prompt: "Use $vibecoding-mentor to review my Second Brain, assess my vibecoding progress, and give me concrete next steps."

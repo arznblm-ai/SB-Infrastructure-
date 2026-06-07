@@ -1,0 +1,3 @@
+display_name: Meeting Insights Analyzer
+short_description: Review Anton's meetings for communication patterns, risks, and follow-ups.
+default_prompt: Analyze my recent meetings and tell me what I should remember, where I was effective, and what follow-ups or risks need attention.

@@ -1,0 +1,50 @@
+.DS_Store
+node_modules/
+.next/
+dist/
+build/
+.turbo/
+.cache/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+tokens/
+config.local.*
+
+# Personal / raw Second Brain data
+meetings/
+transcripts/
+sessions/
+personal context/
+Personal Context/
+workspace/
+runs/
+output/
+exports/
+data/
+
+# Generated research artifacts
+**/workspace/
+**/runs/
+**/output/
+**/exports/
+**/.next/
+**/node_modules/
+
+# Local UI snapshots
+infrastructure/Personal OS/*.png
+infrastructure/Personal OS/*.html
+infrastructure/Personal OS/scripts/import_finance_summary_*.ts
+infrastructure/Personal OS/scripts/seed.ts

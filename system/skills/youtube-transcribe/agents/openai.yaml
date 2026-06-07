@@ -1,0 +1,4 @@
+interface:
+  display_name: "YouTube Transcribe"
+  short_description: "Transcribe YouTube links into transcripts and auto-create a summary"
+  default_prompt: "Use $youtube-transcribe to download this YouTube video, save the raw transcript into transcripts, run $transcript-summarizer with education preference, and save the summary into education."

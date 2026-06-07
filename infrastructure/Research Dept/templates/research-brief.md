@@ -1,0 +1,40 @@
+# Research Brief
+
+- Request title:
+- Request type:
+- Business goal or research purpose:
+- Downstream consumer:
+- Research questions:
+- Out of scope:
+- Required depth:
+- Time horizon:
+- Preferred sources:
+- Required confidence level:
+- Preferred source tiers:
+- Is market-overview coverage required?:
+- Are authoritative external sources required?:
+- Is category evolution required?:
+- Is independent leader mapping required?:
+- Minimum external-market-source coverage:
+- Minimum number of authoritative overview sources:
+- Required balance between primary and external sources:
+- Primary evidence corpus:
+- Secondary evidence corpus:
+- Is corpus shift required?:
+- Allowed legacy reuse:
+- Is interview-led synthesis required?:
+- Source composition target:
+- Minimum interview/operator source coverage:
+- Minimum external-market background coverage:
+- Legacy canon role:
+- Claims requiring strict verification:
+- Freshness requirement:
+- Expected coverage dimensions:
+- Forbidden source shortcuts:
+- CEO reading need:
+- Desired report depth:
+- Final output mix: dossier + CEO report + HTML export (default)
+- Research mode:
+- Output expectations:
+- Success criteria:
+- CEO decisions needed:

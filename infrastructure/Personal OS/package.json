@@ -1,0 +1,41 @@
+{
+  "name": "personal-os-finance",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first Personal OS Finance CRM MVP.",
+  "scripts": {
+    "dev": "NEXT_TELEMETRY_DISABLED=1 NEXT_TEST_WASM_DIR=node_modules/@next/swc-wasm-nodejs next dev",
+    "build": "NEXT_TELEMETRY_DISABLED=1 NEXT_TEST_WASM_DIR=node_modules/@next/swc-wasm-nodejs next build",
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:backup": "tsx scripts/backup.ts",
+    "db:seed": "tsx scripts/seed.ts",
+    "db:reset": "rm -f data/personal-os.sqlite data/personal-os.sqlite-* && tsx scripts/migrate.ts && tsx scripts/seed.ts",
+    "db:empty": "tsx scripts/empty.ts"
+  },
+  "dependencies": {
+    "clsx": "2.1.1",
+    "drizzle-orm": "0.45.2",
+    "lucide-react": "0.511.0",
+    "next": "15.5.18",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "recharts": "2.15.3"
+  },
+  "devDependencies": {
+    "@next/swc-wasm-nodejs": "15.5.18",
+    "@types/node": "24.0.0",
+    "@types/react": "19.1.6",
+    "@types/react-dom": "19.1.5",
+    "autoprefixer": "10.4.20",
+    "drizzle-kit": "0.31.1",
+    "postcss": "8.5.10",
+    "tailwindcss": "3.4.17",
+    "tsx": "4.19.4",
+    "typescript": "5.8.3"
+  },
+  "overrides": {
+    "postcss": "8.5.10"
+  }
+}

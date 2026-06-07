@@ -1,0 +1,4 @@
+interface:
+  display_name: "Transcript Summarizer"
+  short_description: "Turn raw transcripts into structured summaries"
+  default_prompt: "Use $transcript-summarizer to scan transcripts/ and create structured summaries in education/ or meetings/."
