@@ -42,7 +42,7 @@ Use this skill when the user wants to:
 - fix layout, flow, proof screens, or export issues
 - maintain a stateless workflow from one deck round to the next
 
-If the user wants a deeper visual redesign, stronger art direction, or a more radical design pass, use `presentation-designer` instead.
+If the user wants a deeper visual redesign, stronger art direction, or a more radical design pass, use `portal-designer` instead.
 
 ## Working model
 
@@ -52,7 +52,7 @@ Treat every round as stateless.
 2. Explicitly identify the active brief for that round.
 3. If version history matters, create a new version instead of overwriting.
 4. Route the task to the right role before editing:
-   - `presentation-designer` for redesign, composition, hierarchy, and visual language
+   - `portal-designer` for Portal-branded redesign, composition, hierarchy, and visual language
    - `Generator` for content, structure, proof screens, and production changes
 5. Apply the requested changes to that active version only.
 6. Export the updated PDF and any screen renders.

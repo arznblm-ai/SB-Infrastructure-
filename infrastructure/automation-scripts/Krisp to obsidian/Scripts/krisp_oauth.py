@@ -13,8 +13,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-CLIENT_ID = "47cb6e98-90a6-4172-a94a-191f7489d5a4"
-CLIENT_SECRET = "a56b5cb0-365a-4593-86cb-5d9ca3081acc"
+CLIENT_ID = os.environ.get("KRISP_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("KRISP_CLIENT_SECRET", "")
 REDIRECT_URI = "http://localhost:3399/callback"
 AUTH_ENDPOINT = "https://api.krisp.ai/platform/v1/oauth2/authorize"
 TOKEN_ENDPOINT = "https://api.krisp.ai/platform/v1/oauth2/token"
@@ -67,6 +67,9 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise SystemExit("Set KRISP_CLIENT_ID and KRISP_CLIENT_SECRET before running this script.")
+
     # Build auth URL
     params = {
         "client_id": CLIENT_ID,
@@ -120,8 +123,7 @@ def main():
     with urllib.request.urlopen(req, context=ctx, timeout=HTTP_TIMEOUT) as resp:
         token_response = json.loads(resp.read())
 
-    print(f"\nТокен получен!")
-    print(json.dumps(token_response, indent=2))
+    print(f"\nТокен получен. Ответ содержит поля: {', '.join(sorted(token_response.keys()))}")
 
     # Save to ~/.claude/krisp_token.json
     token_path = os.path.expanduser("~/.claude/krisp_token.json")

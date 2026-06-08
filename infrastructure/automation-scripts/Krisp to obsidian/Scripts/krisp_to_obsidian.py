@@ -25,8 +25,8 @@ KRISP_CALLINFO    = Path.home() / "Library/Application Support/Krisp/callinfo.js
 VAULT_MEETINGS    = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
 TOKEN_FILE        = Path.home() / ".claude/krisp_token.json"
 
-OAUTH_CLIENT_ID     = "47cb6e98-90a6-4172-a94a-191f7489d5a4"
-OAUTH_CLIENT_SECRET = "a56b5cb0-365a-4593-86cb-5d9ca3081acc"
+OAUTH_CLIENT_ID     = os.environ.get("KRISP_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("KRISP_CLIENT_SECRET", "")
 TOKEN_ENDPOINT      = "https://api.krisp.ai/platform/v1/oauth2/token"
 MCP_URL             = "https://mcp.krisp.ai/mcp"
 
@@ -72,6 +72,8 @@ def save_token(token: dict):
 
 def refresh_access_token(token: dict) -> dict:
     """Обновляет access_token через refresh_token."""
+    if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+        raise RuntimeError("Set KRISP_CLIENT_ID and KRISP_CLIENT_SECRET before refreshing Krisp tokens.")
     data = urllib.parse.urlencode({
         "grant_type":    "refresh_token",
         "refresh_token": token["refresh_token"],

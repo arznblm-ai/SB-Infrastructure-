@@ -13,7 +13,7 @@
 
 ## Роли
 
-- [presentation-designer](../presentation-designer/SKILL.md) — дизайнерский агент для редизайна, композиции, ритма и визуальной системы deck
+- [portal-designer](../portal-designer/SKILL.md) — дизайнерский агент для редизайна, композиции, ритма и визуальной системы deck внутри Portal identity
 - [generator](../presentation-generator-critic/references/generator.md) — агент, который вносит содержательные и структурные изменения в активную версию
 - [critic](../presentation-generator-critic/references/critic.md) — read-only reviewer
 
@@ -36,7 +36,7 @@
 
 Если нужен именно редизайн, а не просто правки:
 
-1. Сначала запускай `Presentation Designer`.
+1. Сначала запускай `Portal Designer`.
 2. Потом запускай `Generator`, если после редизайна нужны ещё содержательные правки.
 3. В конце запускай `Critic`.
 
@@ -57,6 +57,6 @@
 1. Скопируй весь `design department`.
 2. Выбери активные файлы нового проекта: deck HTML, PDF, рендеры, исходники экранов, export script, дизайн-гайд.
 3. Подставь их пути в шаблоны запуска.
-4. Если нужен редизайн, сначала запускай `Presentation Designer`.
+4. Если нужен редизайн, сначала запускай `Portal Designer`.
 5. Потом запускай `Generator`, если нужны содержательные правки.
 6. В конце запускай `Critic`.

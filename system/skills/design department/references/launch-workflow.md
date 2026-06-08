@@ -1,6 +1,6 @@
 # Launch Workflow
 
-Этот файл задает новый чистый цикл запуска `Presentation Designer`, `Generator` и `Critic`.
+Этот файл задает новый чистый цикл запуска `Portal Designer`, `Generator` и `Critic`.
 
 ## Принцип
 
@@ -21,14 +21,14 @@
 ## Порядок работы
 
 1. Определи активную версию deck для этого раунда.
-2. Если нужен визуальный редизайн, сначала подставь ее пути в [designer-launch-template.md](../launch-templates/designer-launch-template.md) и запусти `Presentation Designer`.
+2. Если нужен визуальный редизайн, сначала подставь ее пути в [designer-launch-template.md](../launch-templates/designer-launch-template.md) и запусти `Portal Designer`.
 3. Если нужны содержательные или структурные правки, подставь ту же версию в [generator-launch-template.md](../launch-templates/generator-launch-template.md) и запусти `Generator`.
 4. После изменений передай эту же активную версию в [critic-launch-template.md](../launch-templates/critic-launch-template.md).
 5. Если `FAIL`, запусти новый раунд снова на той версии, которую считаешь активной после правок.
 
 ## Правила оркестрации
 
-- `Presentation Designer` используется, когда пользователь хочет именно редизайн, усиление композиции, ритма и визуального языка
+- `Portal Designer` используется, когда пользователь хочет именно редизайн, усиление композиции, ритма и визуального языка внутри Portal identity
 - `Generator` используется для смысловых, структурных и production-правок
 - `Critic` всегда read-only
 - если пользователь меняет направление, старое направление не считается обязательным

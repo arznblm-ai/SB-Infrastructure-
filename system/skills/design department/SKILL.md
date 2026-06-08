@@ -32,7 +32,7 @@ description: "Operating system for presentation design: use Design Department wh
 Исполнители живут отдельно и остаются каноническими role-skills:
 
 - [design-orchestrator](./design-orchestrator/SKILL.md)
-- [presentation-designer](./presentation-designer/SKILL.md)
+- [portal-designer](./portal-designer/SKILL.md)
 - [presentation-art-director](./presentation-art-director/SKILL.md)
 - [presentation-generator-critic](./presentation-generator-critic/SKILL.md)
 
@@ -42,7 +42,8 @@ description: "Operating system for presentation design: use Design Department wh
 
 - routing: [references/router.md](./references/router.md)
 - brief: [references/brief-template.md](./references/brief-template.md)
-- design doctrine: [references/apple-presentation-designer.md](./references/apple-presentation-designer.md)
+- Portal brand bible: `/Users/anton/AI AGENT FOLDER/Second Brain/tasks/Portal AI Portfolio/brandbible.md`
+- design doctrine: [references/apple-presentation-designer.md](./references/apple-presentation-designer.md) as secondary craft reference only
 - workflow modes: [references/workflow-modes.md](./references/workflow-modes.md)
 - artifact handoffs: [references/artifact-handoff-model.md](./references/artifact-handoff-model.md)
 - quality gates: [references/quality-gates.md](./references/quality-gates.md)
@@ -63,9 +64,10 @@ description: "Operating system for presentation design: use Design Department wh
 
 - `launch-templates/` — шаблоны запуска для stateless deck-цикла
 - `design-orchestrator/` — главный orchestration layer department
+- `portal-designer/` — канонический Portal-first designer role
 - `references/router.md` — единый decision tree по маршрутизации
 - `references/brief-template.md` — единый входной brief для всех presentation roles
-- `references/apple-presentation-designer.md` — единая design doctrine для designer и art director
+- `references/apple-presentation-designer.md` — вторичная design doctrine для craft-принципов; Portal identity важнее
 - `references/workflow-modes.md` — канонические workflow modes
 - `references/artifact-handoff-model.md` — handoff contracts между ролями
 - `references/quality-gates.md` — правила остановки, revise/fail и final status

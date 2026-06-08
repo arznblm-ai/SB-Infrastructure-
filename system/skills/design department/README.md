@@ -12,7 +12,7 @@
 ## Канонические skill-папки внутри отдела
 
 - [design-orchestrator](./design-orchestrator/SKILL.md)
-- [presentation-designer](./presentation-designer/SKILL.md)
+- [portal-designer](./portal-designer/SKILL.md)
 - [presentation-art-director](./presentation-art-director/SKILL.md)
 - [presentation-generator-critic](./presentation-generator-critic/SKILL.md)
 
@@ -20,7 +20,7 @@
 
 В `system/skills` уже были перенесены:
 
-- `presentation-designer`
+- `portal-designer`
 - `presentation-art-director`
 - `presentation-generator-critic`
 

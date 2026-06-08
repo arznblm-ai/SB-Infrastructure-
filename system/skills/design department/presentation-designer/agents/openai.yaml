@@ -1,4 +1,4 @@
 interface:
   display_name: "Presentation Designer"
-  short_description: "Redesign decks with strong hierarchy and Apple-inspired clarity"
-  default_prompt: "Use $presentation-designer to redesign this presentation with stronger visual hierarchy, rhythm, typography, and slide composition."
+  short_description: "Alias: use Portal Designer instead"
+  default_prompt: "Use $portal-designer to redesign this deck inside Portal identity."

@@ -8,7 +8,7 @@
 
 Минимальный набор:
 
-- `presentation-designer/`
+- `portal-designer/`
 - `presentation-art-director/`
 - `presentation-generator-critic/`
 - `launch-templates/designer-launch-template.md`
@@ -35,7 +35,7 @@
 ## Минимальный сценарий использования
 
 1. Определи активную версию презентации.
-2. Если нужен редизайн, сначала передай ее `Presentation Designer`.
+2. Если нужен редизайн, сначала передай ее `Portal Designer`.
 3. Если после этого нужны содержательные правки, передай ту же версию `Generator`.
 4. После правок передай ту же версию `Critic`.
 5. Повторяй цикл, пока не устроит результат.

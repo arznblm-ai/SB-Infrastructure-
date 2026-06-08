@@ -15,7 +15,7 @@ Use when:
 Sequence:
 
 1. intake
-2. `presentation-designer`
+2. `portal-designer`
 3. `presentation-art-director`
 4. optional `presentation-generator-critic` loop
 5. final design package

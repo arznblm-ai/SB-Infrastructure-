@@ -1,6 +1,6 @@
 # Launch Workflow
 
-Этот файл задает новый чистый цикл запуска `Presentation Designer`, `Generator`, `Critic` и `presentation-art-director`.
+Этот файл задает новый чистый цикл запуска `Portal Designer`, `Generator`, `Critic` и `presentation-art-director`.
 
 ## Принцип
 
@@ -36,7 +36,7 @@
 
 Коротко:
 
-- визуальный редизайн и композиция → `presentation-designer`
+- визуальный редизайн и композиция → `portal-designer`
 - содержательные, structural и production-правки → `Generator`
 - финальная проверка сходства и визуального QA → `presentation-art-director`
 
@@ -45,7 +45,7 @@
 1. Определи активную версию deck для этого раунда.
 2. Определи активный brief для этого же раунда.
 3. Через [router.md](../../references/router.md) выбери основного исполнителя.
-4. Если нужен визуальный редизайн, сначала подставь active deck и brief в `Presentation Designer`.
+4. Если нужен визуальный редизайн, сначала подставь active deck и brief в `Portal Designer`.
 5. Если нужны содержательные или structural-правки, подставь тот же active deck и brief в `Generator`.
 6. После изменений передай эту же активную версию и этот же brief в `Critic`.
 7. Если `Critic` вернул `FAIL`, запусти новый раунд снова на той версии, которую считаешь активной после правок.
@@ -59,7 +59,7 @@
 
 ## Правила оркестрации
 
-- `Presentation Designer` используется, когда пользователь хочет именно редизайн, усиление композиции, ритма и визуального языка
+- `Portal Designer` используется, когда пользователь хочет именно редизайн, усиление композиции, ритма и визуального языка внутри Portal identity
 - `Generator` используется для смысловых, структурных и production-правок
 - `Critic` всегда read-only
 - `presentation-art-director` используется как финальный визуальный QA, если важны сходство, типографика и layout fidelity

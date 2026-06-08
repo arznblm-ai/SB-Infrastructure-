@@ -30,7 +30,7 @@ Purpose:
 
 ## 2. Design Direction Artifact
 
-Created by: `presentation-designer`
+Created by: `portal-designer`
 
 Required fields:
 

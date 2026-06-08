@@ -1,0 +1,3 @@
+display_name: Git Update
+short_description: Safely sync and commit Anton's Second Brain infrastructure to Git.
+default_prompt: Update the SB-Infrastructure repository with the latest safe Second Brain infrastructure changes, run safety checks, and create a commit if clean.

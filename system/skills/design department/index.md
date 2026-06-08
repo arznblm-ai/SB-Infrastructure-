@@ -6,7 +6,7 @@
 | Раздел | Что внутри |
 |--------|------------|
 | [[design department/design-orchestrator/SKILL]] | Канонический orchestration layer: intake, workflow selection, role sequencing, artifact handoff и final package |
-| [[design department/presentation-designer/SKILL]] | Канонический skill для deck redesign, композиции, ритма и визуальной системы |
+| [[design department/portal-designer/SKILL]] | Канонический Portal-first skill для deck redesign, композиции, ритма и визуальной системы |
 | [[design department/presentation-art-director/SKILL]] | Канонический skill для visual fidelity, typographic QA и source matching |
 | [[design department/presentation-generator-critic/SKILL]] | Канонический skill для builder-plus-critic production loop |
 | [[design department/references/canonical-entrypoint-contract]] | Правило, что все cross-thread design requests входят через orchestrator |

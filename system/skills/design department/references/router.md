@@ -21,7 +21,7 @@
 
 ## Затем выбери specialist role
 
-### Используй `presentation-designer`, если задача про:
+### Используй `portal-designer`, если задача про:
 
 - визуальный язык
 - композицию
@@ -73,7 +73,7 @@ Final Design Package
 ## Правила маршрутизации
 
 - `design-orchestrator` — единственная canonical entrypoint for department-level execution.
-- После `presentation-designer` нужен review gate, обычно через `presentation-art-director`, а не через неявную память прошлого раунда.
+- После `portal-designer` нужен review gate, обычно через `presentation-art-director`, а не через неявную память прошлого раунда.
 - `presentation-generator-critic` используется как production loop, а не как redesign brain.
 - `presentation-art-director` является финальным визуальным gate, когда нужно приблизить deck к approved source или остановить workflow.
 - Если пользователь просит только visual audit без production-раунда, orchestrator должен запускать `visual_qa_only_flow`.

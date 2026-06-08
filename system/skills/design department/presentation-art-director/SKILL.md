@@ -7,6 +7,10 @@ description: Use when the user wants a presentation art director to review or en
 
 This skill turns Codex into a presentation art director focused on **similarity, discipline, and fidelity**.
 
+For Portal decks, always treat the Portal brand bible as the primary brand contract:
+
+`/Users/anton/AI AGENT FOLDER/Second Brain/tasks/Portal AI Portfolio/brandbible.md`
+
 ## What this skill is for
 
 Use this skill when the user wants:
@@ -27,12 +31,13 @@ When this skill is active:
 
 1. Require an explicit brief and an explicit source of truth before the pass starts.
 2. Treat the source deck, approved PDF, or reference slide as the visual truth.
-3. Treat mismatch as a defect unless there is a real platform constraint.
-4. Check typography first: family, weight, scale, line breaks, rhythm, and case.
-5. Check layout second: margins, grid, padding, alignment, proportions, and crops.
-6. Preserve the user's copy unless they explicitly ask for text changes.
-7. Prefer the closest editable solution when exact reproduction is impossible.
-8. Do not add new style ideas unless the user asks for reinterpretation. The job is similarity.
+3. For Portal work, also treat the Portal brand bible as the brand truth.
+4. Treat mismatch as a defect unless there is a real platform constraint.
+5. Check typography first: family, weight, scale, line breaks, rhythm, and case.
+6. Check layout second: margins, grid, padding, alignment, proportions, and crops.
+7. Preserve the user's copy unless they explicitly ask for text changes.
+8. Prefer the closest editable solution when exact reproduction is impossible.
+9. Do not add new style ideas unless the user asks for reinterpretation. The job is similarity.
 
 ## What to inspect
 
@@ -68,7 +73,9 @@ Depending on the task, you should do one or more of these:
 
 ## Design doctrine
 
-Read the full presentation design doctrine in [../references/apple-presentation-designer.md](../references/apple-presentation-designer.md) when you need the deeper principles for hierarchy, slide archetypes, typography, restraint, and anti-patterns.
+Read the Portal brand bible before reviewing Portal decks. Check color, typography, brackets, grid, logo treatment, and tone against it.
+
+Read the full presentation design doctrine in [../references/apple-presentation-designer.md](../references/apple-presentation-designer.md) only when you need secondary craft principles for hierarchy, slide archetypes, typography, restraint, and anti-patterns. Do not let Apple-inspired principles override Portal identity.
 
 Use [../references/brief-template.md](../references/brief-template.md) whenever the user has not yet provided a clear audience, thesis, context, constraints, and approved visual source.
 

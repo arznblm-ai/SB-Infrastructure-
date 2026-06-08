@@ -17,7 +17,7 @@ Verdict:
 - `FAIL` if execution cannot start safely
 - `REVISE` if the request is understandable but the brief is incomplete
 
-## Stop after `presentation-designer` if
+## Stop after `portal-designer` if
 
 - no usable design direction was produced
 - the proposed direction conflicts with the stated constraints
