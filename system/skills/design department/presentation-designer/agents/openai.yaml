@@ -1,4 +1,4 @@
 interface:
   display_name: "Presentation Designer"
   short_description: "Alias: use Portal Designer instead"
-  default_prompt: "Use $portal-designer to redesign this deck inside Portal identity."
+  default_prompt: "Use $portal-designer to redesign this deck in the Portal design code, without Portal logo unless requested."

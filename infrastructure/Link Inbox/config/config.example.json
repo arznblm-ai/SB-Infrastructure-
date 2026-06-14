@@ -1,0 +1,33 @@
+{
+  "telegram": {
+    "api_id": "",
+    "api_hash": "",
+    "session_file": "~/.config/link-inbox/telegram.session",
+    "source_channel": "",
+    "review_channel": "",
+    "allowed_chat_ids": [],
+    "max_messages": 100,
+    "bot_token_env": "LINK_INBOX_BOT_TOKEN"
+  },
+  "vault_path": "/Users/anton/AI AGENT FOLDER/Second Brain",
+  "output_dir": "resources/link-inbox",
+  "state_file": "~/.config/link-inbox/state.json",
+  "log_file": "~/Library/Logs/link-inbox.log",
+  "youtube": {
+    "enabled": true,
+    "model": "tiny",
+    "language": null
+  },
+  "ugc": {
+    "enabled": true,
+    "whisper_model": "tiny",
+    "language": null,
+    "max_frames": 4,
+    "skip_second_brain_summary": true,
+    "cookies_from_browser": "",
+    "cookies": ""
+  },
+  "review": {
+    "max_items": 12
+  }
+}

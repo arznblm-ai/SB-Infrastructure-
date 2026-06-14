@@ -67,7 +67,7 @@ description: "Operating system for presentation design: use Design Department wh
 - `portal-designer/` — канонический Portal-first designer role
 - `references/router.md` — единый decision tree по маршрутизации
 - `references/brief-template.md` — единый входной brief для всех presentation roles
-- `references/apple-presentation-designer.md` — вторичная design doctrine для craft-принципов; Portal identity важнее
+- `references/apple-presentation-designer.md` — вторичная design doctrine для craft-принципов; Portal design code важнее
 - `references/workflow-modes.md` — канонические workflow modes
 - `references/artifact-handoff-model.md` — handoff contracts между ролями
 - `references/quality-gates.md` — правила остановки, revise/fail и final status

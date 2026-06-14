@@ -49,6 +49,7 @@ ACTIVITY_COLOR_IDS = {
 }
 DEFAULT_FOCUS_EVENT_COLOR_ID = ACTIVITY_COLOR_IDS["Deep Work"]
 TODO_ONLY_MODE = os.environ.get("TELEGRAM_CODEX_TODO_ONLY", "1") != "0"
+AUTO_CODEX_FOR_QUESTIONS = os.environ.get("TELEGRAM_CODEX_ASK_AUTO", "0") == "1"
 TODO_ONLY_DISABLED_COMMANDS = {
     "/focus",
     "/actions",
@@ -119,11 +120,20 @@ def telegram_request(token: str, method: str, data: dict[str, str] | None = None
     return json.loads(payload)
 
 
+class TelegramPollTimeout(RuntimeError):
+    pass
+
+
 def get_updates(token: str, offset: int | None, timeout: int = 50) -> list[dict]:
     data = {"timeout": str(timeout)}
     if offset is not None:
         data["offset"] = str(offset)
-    payload = telegram_request(token, "getUpdates", data=data, timeout=timeout + 10)
+    try:
+        payload = telegram_request(token, "getUpdates", data=data, timeout=timeout + 15)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == 28:
+            raise TelegramPollTimeout("Telegram long poll timed out without updates") from exc
+        raise
     return payload.get("result", [])
 
 
@@ -619,6 +629,55 @@ def ask_payload(text: str) -> str:
     if lowered.startswith("/ask\n"):
         return stripped[5:].strip()
     return ""
+
+
+def build_help_message() -> str:
+    mode = "capture-only" if TODO_ONLY_MODE else "planner"
+    auto_ask = "on" if AUTO_CODEX_FOR_QUESTIONS else "off"
+    return "\n".join([
+        f"Daily Focus bot — mode: {mode}",
+        "",
+        "Быстро, без Codex:",
+        "/plan — добавить список дел в Planning Inbox",
+        "/focus — быстрый план по текущим задачам",
+        "/actions — кандидаты задач из встреч на подтверждение",
+        "/calendar_status — что уже стоит в календаре",
+        "/calendar_review — что закрыто/в процессе по Focus-слотам",
+        "/done задача — ручной override выполнения",
+        "",
+        "Календарь:",
+        "/calendar_new — предложить слоты только для новых задач",
+        "/calendar — предложить слоты для активных задач",
+        "/calendar_confirm — создать предложенные слоты",
+        "/calendar_clear_done — убрать будущие слоты закрытых задач",
+        "",
+        "Дорогие режимы, запускают Codex:",
+        "/daily_rerun — полный Daily Planning Brief",
+        "/prioritize — Strategic Board review",
+        "/ask вопрос — задать вопрос Codex по vault",
+        "",
+        f"Auto-Codex на вопросы без /ask: {auto_ask}. Обычные сообщения сохраняются как задачи.",
+    ])
+
+
+def build_bot_status() -> str:
+    tasks = current_planning_tasks()
+    pending_actions = pending_meeting_action_candidates()
+    pending_slots = read_calendar_pending()
+    latest_brief = today_daily_briefs()
+    lines = [
+        "Daily Focus status",
+        f"Mode: {'capture-only' if TODO_ONLY_MODE else 'planner'}",
+        f"Auto-Codex questions: {'on' if AUTO_CODEX_FOR_QUESTIONS else 'off'}",
+        f"Active planning tasks: {len(tasks)}",
+        f"Pending meeting actions: {len(pending_actions)}",
+        f"Pending calendar slots: {len(pending_slots)}",
+        f"Today's brief: {'yes' if latest_brief else 'no'}",
+    ]
+    if latest_brief:
+        lines.append(f"Brief file: {latest_brief[0]}")
+    lines.extend(["", "Напиши /help, чтобы увидеть команды."])
+    return "\n".join(lines)
 
 
 def has_question_mark(text: str) -> bool:
@@ -2327,6 +2386,14 @@ def save_to_planning_backlog(token: str, chat_id: str, text: str, detail: str) -
 
 def handle_text(token: str, chat_id: str, text: str) -> None:
     normalized = text.strip()
+    if normalized in {"/start", "/help", "help", "/menu"}:
+        log_route("help", codex=False)
+        send_message(token, chat_id, build_help_message())
+        return
+    if normalized in {"/status", "status"}:
+        log_route("status", codex=False)
+        send_message(token, chat_id, build_bot_status())
+        return
     if normalized in {"/ping", "ping"}:
         log_route("ping", codex=False)
         send_message(token, chat_id, "pong")
@@ -2358,10 +2425,17 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         send_message(token, chat_id, "Команда не активна в to-do режиме. Пришли задачу обычным текстом, я сохраню её в backlog.")
         return
     if has_question_mark(normalized) and not normalized.lower().startswith("/ask"):
-        if TODO_ONLY_MODE:
-            save_to_planning_backlog(token, chat_id, normalized, "question saved")
-        else:
+        if AUTO_CODEX_FOR_QUESTIONS and not TODO_ONLY_MODE:
             answer_with_codex(token, chat_id, normalized, route_detail="question_mark")
+        elif is_planning_message(normalized):
+            save_to_planning_backlog(token, chat_id, normalized, "question planning message")
+        else:
+            log_route("question_no_auto_codex", codex=False)
+            send_message(
+                token,
+                chat_id,
+                "Вопрос увидел, Codex не запускал. Если хочешь ответ по vault, напиши: /ask твой вопрос. Если это задача, пришли через /plan или обычным списком.",
+            )
         return
     if is_planning_message(normalized):
         save_to_planning_backlog(token, chat_id, normalized, "planning message")
@@ -2583,6 +2657,11 @@ def run_loop(token: str, allowed_chat_id: str, once: bool = False) -> None:
     while True:
         try:
             updates = get_updates(token, offset=offset, timeout=50)
+        except TelegramPollTimeout:
+            log("getUpdates idle timeout; no updates")
+            if once:
+                return
+            continue
         except Exception as exc:
             log(f"getUpdates error: {exc}")
             time.sleep(10)
@@ -2611,7 +2690,7 @@ def run_loop(token: str, allowed_chat_id: str, once: bool = False) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Telegram -> Codex local polling bot")
+    parser = argparse.ArgumentParser(description="Telegram -> Daily Focus local polling bot")
     parser.add_argument("--init-offset", action="store_true", help="Mark current Telegram updates as seen")
     parser.add_argument("--once", action="store_true", help="Poll once and exit")
     parser.add_argument("--send-test", action="store_true", help="Send test message and exit")

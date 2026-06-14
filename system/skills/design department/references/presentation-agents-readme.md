@@ -13,7 +13,7 @@
 
 ## Роли
 
-- [portal-designer](../portal-designer/SKILL.md) — дизайнерский агент для редизайна, композиции, ритма и визуальной системы deck внутри Portal identity
+- [portal-designer](../portal-designer/SKILL.md) — дизайнерский агент для редизайна, композиции, ритма и визуальной системы deck внутри Portal design code, без Portal logo по умолчанию
 - [generator](../presentation-generator-critic/references/generator.md) — агент, который вносит содержательные и структурные изменения в активную версию
 - [critic](../presentation-generator-critic/references/critic.md) — read-only reviewer
 

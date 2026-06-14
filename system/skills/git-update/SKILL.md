@@ -23,6 +23,8 @@ The skill must never commit the full Second Brain. It only syncs a whitelist of 
 - `infrastructure/Research Dept/skills/`
 - `infrastructure/Research Dept/agents/`
 - safe source code from `infrastructure/Personal OS/`
+- safe docs/config from `infrastructure/Link Inbox/`
+- safe docs from `infrastructure/Git Update/`
 - `*/Scripts/` folders under `infrastructure/` into `infrastructure/automation-scripts/`
 - Codex session exporter script from `sessions/codex/Scripts/`
 

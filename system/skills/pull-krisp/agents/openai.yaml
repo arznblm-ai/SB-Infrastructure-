@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pull Krisp"
+  short_description: "Pull Krisp transcripts into Second Brain"
+  default_prompt: "Use $pull-krisp to pull recent Krisp transcripts into Second Brain and summarize them."

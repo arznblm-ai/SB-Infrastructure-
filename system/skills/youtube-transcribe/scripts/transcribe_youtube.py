@@ -13,7 +13,7 @@ import yt_dlp
 from faster_whisper import WhisperModel
 
 
-DEFAULT_OUTPUT_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
+DEFAULT_OUTPUT_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources")
 TRANSCRIPTS_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
 SUMMARIZER_SCRIPT = Path(
     "/Users/anton/AI AGENT FOLDER/Second Brain/projects/Transcript summarizer/Scripts/transcript_summarizer.py"

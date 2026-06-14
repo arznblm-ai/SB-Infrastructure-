@@ -1,6 +1,6 @@
 ---
 name: youtube-transcribe
-description: Transcribe public YouTube videos from a URL into Markdown notes, then run `transcript-summarizer` and save the resulting summary into Second Brain. Use when the user pastes a YouTube link and wants the transcript stored in `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts` and the summary routed into `education/` or `meetings/`.
+description: Transcribe public YouTube videos from a URL into Markdown notes, then optionally run `transcript-summarizer` and save the resulting summary into Second Brain. Use when the user pastes a YouTube link and wants the external-resource transcript stored in `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources` unless they explicitly route it to a course, meeting, or project folder.
 ---
 
 # YouTube Transcribe
@@ -21,19 +21,23 @@ This skill is for **public YouTube links**. If the video is private, login-gated
 
 1. Resolve the destination folder inside the Vault.
 2. Run `scripts/transcribe_youtube.py` with the YouTube URL.
-3. Let the script call [$transcript-summarizer](/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md) on the new transcript.
-4. Verify that the transcript note was created in `transcripts/` and the summary was created in `education/` or `meetings/`.
+3. For external saved links, use the default external resources destination and usually `--skip-summary` unless the user asks for a full education/meeting summary.
+4. If the YouTube video is explicitly a course, lecture, workshop, meeting, or user asks for a processed summary, let the script call [$transcript-summarizer](/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md) on the new transcript.
+5. Verify that the transcript note was created in the chosen destination and, when summary routing was requested, the summary was created in `education/` or `meetings/`.
 5. Preview the first lines and report both saved paths back to the user.
 
 ## Destination Rules
 
-Prefer `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts` unless the user explicitly asks for another folder in the Vault.
+Prefer `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources` for ordinary public YouTube links, saved links, Shorts, podcasts, interviews, lectures from the internet, and other external resources.
+
+Use `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts` only when the material belongs to the main course/meeting ingestion pipeline and should be processed by `transcript-summarizer`.
 
 If the user gives a more specific destination, pass it with `--output-dir`.
 
 Examples:
 
-- `transcripts/` for the default YouTube inbox
+- `transcripts/external resources/` for the default YouTube saved-link inbox
+- `transcripts/` for course/meeting ingestion that should route into `education/` or `meetings/`
 - `context/Psychology/Naval Ravikant/` for a specific research thread
 - `tasks/...` when the transcript belongs to an active task
 
@@ -72,23 +76,25 @@ Keep `--beam-size 1` unless there is a quality reason to change it.
 
 ## Summary Rules
 
-After the transcript is created, always hand it off to [$transcript-summarizer](/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md).
+After the transcript is created, hand it off to [$transcript-summarizer](/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md) only when the user wants the material processed into `education/` or `meetings/`.
 
-For YouTube links, call `transcript-summarizer` with an `education` preference, because these imports are part of the learning pipeline by default.
+For external saved links, `--skip-summary` is acceptable and often preferred, because the transcript belongs in `transcripts/external resources/` and may be reviewed later by Link Inbox.
+
+For YouTube course/lecture/workshop imports, call `transcript-summarizer` with an `education` preference.
 
 That skill then routes the summary into:
 
 - `education/` for lectures, workshops, courses, and conference-style learning content
 - `meetings/` for calls, 1-on-1s, and working discussions
 
-Do not create an ad-hoc sibling summary inside `transcripts/`. `transcripts/` is the raw inbox; `education/` and `meetings/` are the processed knowledge layers.
+Do not create an ad-hoc sibling summary inside `transcripts/`. `transcripts/` is the raw inbox; `transcripts/external resources/` is the external-material inbox; `education/` and `meetings/` are the processed knowledge layers.
 
 ## Validation
 
 After transcription and summary creation:
 
-1. Check that the transcript exists in `transcripts/`.
-2. Check that the summary exists in `education/` or `meetings/`.
+1. Check that the transcript exists in the selected destination, usually `transcripts/external resources/`.
+2. If summary routing was requested, check that the summary exists in `education/` or `meetings/`.
 3. Preview the first lines of the transcript.
 4. Preview the first lines of the summary.
 5. Tell the user the exact saved paths.

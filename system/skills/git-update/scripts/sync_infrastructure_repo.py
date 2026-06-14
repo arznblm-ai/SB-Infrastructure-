@@ -152,6 +152,16 @@ def sync_whitelist(dry_run: bool) -> None:
         dry_run,
     )
 
+    link_inbox_src = VAULT / "infrastructure/Link Inbox"
+    link_inbox_dest = REPO / "infrastructure/Link Inbox"
+    sync_file(link_inbox_src / "CLAUDE.md", link_inbox_dest / "CLAUDE.md", dry_run)
+    sync_file(link_inbox_src / "requirements.txt", link_inbox_dest / "requirements.txt", dry_run)
+    sync_dir(link_inbox_src / "config", link_inbox_dest / "config", EXCLUDES, dry_run)
+
+    git_update_src = VAULT / "infrastructure/Git Update"
+    git_update_dest = REPO / "infrastructure/Git Update"
+    sync_file(git_update_src / "CLAUDE.md", git_update_dest / "CLAUDE.md", dry_run)
+
     automation_dest = REPO / "infrastructure/automation-scripts"
     remove_dir(automation_dest, dry_run)
     for scripts_dir in sorted((VAULT / "infrastructure").glob("*/Scripts")):

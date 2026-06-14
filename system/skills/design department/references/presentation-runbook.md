@@ -6,7 +6,7 @@
 
 ## Роли
 
-- `Portal Designer` — дизайнерский агент для визуального направления и редизайна deck внутри Portal identity
+- `Portal Designer` — дизайнерский агент для визуального направления и редизайна deck внутри Portal design code, без Portal logo по умолчанию
 - `Generator` — редактор активной версии deck
 - `Critic` — строгий reviewer активной версии deck
 

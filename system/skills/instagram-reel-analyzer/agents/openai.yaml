@@ -1,0 +1,4 @@
+interface:
+  display_name: "Instagram Reel Analyzer"
+  short_description: "Save reel transcripts with strategic insights"
+  default_prompt: "Use $instagram-reel-analyzer to analyze this Instagram Reel and save a transcript, summary, links, skills, reusable solutions, and Strategic Board implications."

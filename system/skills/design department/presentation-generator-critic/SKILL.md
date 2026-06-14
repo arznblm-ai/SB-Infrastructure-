@@ -33,7 +33,7 @@ Treat every round as stateless.
 2. Explicitly identify the active brief for that round.
 3. If version history matters, create a new version instead of overwriting.
 4. Route the task to the right role before editing:
-   - `portal-designer` for Portal-branded redesign, composition, hierarchy, and visual language
+   - `portal-designer` for Portal-coded redesign, composition, hierarchy, and visual language
    - `Generator` for content, structure, proof screens, and production changes
 5. Apply the requested changes to that active version only.
 6. Export the updated PDF and any screen renders.

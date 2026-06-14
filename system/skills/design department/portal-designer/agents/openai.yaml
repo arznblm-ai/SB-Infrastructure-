@@ -1,4 +1,4 @@
 interface:
   display_name: "Portal Designer"
-  short_description: "Design Portal-branded premium decks"
-  default_prompt: "Use $portal-designer to redesign this deck inside Portal identity with stronger hierarchy, rhythm, typography, and slide composition."
+  short_description: "Design premium Portal-coded decks"
+  default_prompt: "Use $portal-designer to redesign this deck in the Portal design code, without Portal logo or explicit branding unless requested."

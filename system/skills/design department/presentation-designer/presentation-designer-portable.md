@@ -15,4 +15,4 @@ Mandatory source of truth:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/tasks/Portal AI Portfolio/brandbible.md`
 
-Old Apple-first presentation design behavior is deprecated. Apple-inspired guidance may be used only as secondary craft discipline; Portal identity overrides it.
+Old Apple-first presentation design behavior is deprecated. Apple-inspired guidance may be used only as secondary craft discipline; Portal design code overrides it. Do not add Portal logo or explicit Portal branding unless the user asks.
