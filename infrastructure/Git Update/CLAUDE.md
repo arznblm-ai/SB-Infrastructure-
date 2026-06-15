@@ -67,3 +67,14 @@ Uninstall:
 ```bash
 python3 Scripts/install_weekly_git_update_agent.py --uninstall
 ```
+
+## Inputs
+
+- Whitelisted infrastructure files from Second Brain.
+- Sync rules in `system/skills/git-update/scripts/sync_infrastructure_repo.py`.
+- Local Git repository state in `/Users/anton/AI AGENT FOLDER/SB-Infrastructure-/`.
+- GitHub authentication available through the terminal or GitHub Desktop.
+
+## Human Confirmation Gates
+
+Require Anton confirmation before changing whitelist/blacklist policy, adding new infrastructure folders to Git sync, force-pushing/rebasing/resetting, or committing any folder that may contain transcripts, meetings, sessions, runtime state, logs, tokens, or personal data.

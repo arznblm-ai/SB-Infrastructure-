@@ -1,0 +1,3 @@
+display_name: Productivity Review
+short_description: Review calendar productivity stats.
+default_prompt: Analyze my productivity for this week from calendar and planning data, save the review, and summarize it.

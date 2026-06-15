@@ -1,0 +1,4 @@
+interface:
+  display_name: "Saved Video Strategist"
+  short_description: "Summaries plus strategic signal from saved videos"
+  default_prompt: "Проанализируй сохраненные сегодня видео: сначала дай короткое саммари каждого, затем выдели что полезно для меня через Strategic Board, не выкидывая видео если вывод неочевиден."

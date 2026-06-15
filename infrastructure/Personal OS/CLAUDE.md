@@ -1,5 +1,33 @@
 # Personal OS Finance (RUB-first)
 
+Local-first RUB finance cockpit for tracking cash, confirmed projects, obligations, runway and CRM upside without cloud sync or manual web forms.
+
+## Source Map
+
+| What | Path |
+|---|---|
+| Project | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/` |
+| App | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/app/` |
+| Components | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/components/` |
+| Data | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/data/` |
+| DB | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/db/` |
+| Scripts | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Personal OS/scripts/` |
+
+## Workflow
+
+1. Read current dashboard requirements and database schema.
+2. Keep web UI read-only unless Anton explicitly reintroduces forms.
+3. Normalize new data through chat/agent layer before database writes.
+4. Run backup before migrations.
+5. Verify with local app smoke test and database checks.
+
+## Outputs
+
+- Local Next.js dashboard.
+- SQLite database and backups.
+- Migration files under `drizzle/`.
+- Readable dashboard state for finance/planning review.
+
 ## Purpose
 
 Local-first RUB cashflow cockpit for daily control:

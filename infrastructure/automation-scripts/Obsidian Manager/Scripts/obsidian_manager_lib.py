@@ -354,6 +354,8 @@ def collect_projects(folder: Path, config: dict, vault_path: Path) -> list[Proje
     for child in sorted(folder.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_dir():
             continue
+        if child.is_symlink():
+            continue
         if child.name == "archive":
             continue
         if is_skipped_path(child, config, vault_path):
