@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from link_digest import (
+    build_rich_summary,
     build_about,
     extract_numbered_tools,
     extract_urls,
@@ -16,13 +17,17 @@ from link_digest import (
     source_fields,
     transcript_excerpt,
     transcript_lines,
+    transcript_title,
 )
 from link_inbox_common import clean_filename_part, load_config, load_state, paths, save_state, write_link_note
 
 
 def summary_note_path(config: dict, record: dict) -> Path:
     title = clean_filename_part(human_title(record, source_fields(read_text(record.get("brief_path")))), max_len=72)
-    return paths(config)["summaries"] / f"{{link}} {{summary}} {title} – {record.get('date')}.md"
+    base = paths(config)["summaries"] / f"{{link}} {{summary}} {title} – {record.get('date')}.md"
+    if not base.exists() or f'source_url: "{record.get("url", "")}"' in base.read_text(encoding="utf-8", errors="replace")[:1000]:
+        return base
+    return paths(config)["summaries"] / f"{{link}} {{summary}} {title} -- {record['id']} – {record.get('date')}.md"
 
 
 def md_link(path: str | None) -> str:
@@ -40,27 +45,25 @@ def build_summary_note(record: dict) -> str:
     title = human_title(record, meta)
     source_url = record.get("url", "")
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    about = build_about(tools, lines, meta.get("description", "") or record.get("excerpt", ""))
+    rich = build_rich_summary(record, meta, transcript, lines, tools)
+    title = str(rich.get("title") or title)
+    about = str(rich.get("about") or build_about(tools, lines, meta.get("description", "") or record.get("excerpt", "")))
+    insights = list(rich.get("insights") or [])
+    system = list(rich.get("system") or [])
 
     tool_lines = []
     for name, desc in tools[:8]:
         tool_lines.append(f"- **{name}:** {russian_tool_desc(name, desc)}")
     if not tool_lines:
-        tool_lines.append("- Инструменты явно не извлечены. Смотри transcript/brief для деталей.")
+        tool_lines.append("- Явный стек инструментов не найден; это может быть интервью/лекция без tutorial-части.")
 
     system_lines = []
-    if tools:
-        system_lines.extend(
-            [
-                "- Автор собирает workflow из готовых референсов: UI-компоненты, дизайн-DNA сайтов, каталоги экранов, галереи сильных сайтов.",
-                "- Эти ресурсы используются как input для AI/vibe coding, чтобы не начинать интерфейс и продуктовую механику с пустого листа.",
-            ]
-        )
-        if any(name.lower() in {"10x", "10 x"} for name, _ in tools):
-            system_lines.append("- Финальный слой: инструмент, который обещает превратить app idea в native iOS app / reusable UI code / assets за минуты.")
-        system_lines.append("- Практическая польза: быстрее собрать убедительный прототип и повысить визуальное качество результата.")
+    if system:
+        system_lines.extend(f"- {item}" for item in system[:5])
     else:
         system_lines.append("- Система автора не выделена автоматически. Нужен ручной review transcript/brief.")
+
+    insight_lines = [f"- {item}" for item in insights[:6]] or ["- Ключевые идеи автоматически не выделены; смотри transcript excerpt ниже."]
 
     urls = extract_urls(brief, record.get("message_text", ""))
     if source_url and source_url not in urls:
@@ -94,6 +97,10 @@ def build_summary_note(record: dict) -> str:
             "",
             f"- {about}",
             "",
+            "## Ключевые идеи",
+            "",
+            *insight_lines,
+            "",
             "## Инструменты / ресурсы",
             "",
             *tool_lines,
@@ -122,6 +129,7 @@ def build_summary_note(record: dict) -> str:
 
 
 def write_summary_note(config: dict, record: dict) -> Path:
+    write_link_note(config, record)
     path = summary_note_path(config, record)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_summary_note(record), encoding="utf-8")

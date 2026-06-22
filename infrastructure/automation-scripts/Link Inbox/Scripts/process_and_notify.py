@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -13,6 +14,7 @@ from link_inbox_common import load_config, load_state
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCK_FILE = Path.home() / ".config" / "link-inbox" / "process.lock"
+LOCK_POLL_SECONDS = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,42 +44,36 @@ def send_message(token: str, chat_id: str, text: str) -> None:
         subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
 
 
-def lock_is_active() -> bool:
-    if not LOCK_FILE.exists():
-        return False
-    try:
-        pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
-    except Exception:
-        LOCK_FILE.unlink(missing_ok=True)
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        LOCK_FILE.unlink(missing_ok=True)
-        return False
-
-
-def wait_for_lock(timeout_seconds: int = 1800) -> bool:
+def acquire_lock(timeout_seconds: int = 1800):
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "a+", encoding="utf-8")
     started = time.time()
-    while lock_is_active():
+    while True:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_fd.seek(0)
+            lock_fd.truncate()
+            lock_fd.write(str(os.getpid()))
+            lock_fd.flush()
+            os.fchmod(lock_fd.fileno(), 0o600)
+            return lock_fd
+        except BlockingIOError:
+            pass
         if time.time() - started > timeout_seconds:
-            return False
-        time.sleep(5)
-    return True
+            lock_fd.close()
+            return None
+        time.sleep(LOCK_POLL_SECONDS)
 
 
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     token = bot_token(config)
-    if not wait_for_lock():
+    lock_fd = acquire_lock()
+    if lock_fd is None:
         send_message(token, args.chat_id, "Ссылка сохранена, но обработка занята слишком долго. Напиши /process позже.")
         return 1
 
-    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    LOCK_FILE.write_text(str(os.getpid()), encoding="utf-8")
-    os.chmod(LOCK_FILE, 0o600)
     try:
         command = [
             "python3",
@@ -100,7 +96,11 @@ def main() -> int:
         if digests:
             send_message(token, args.chat_id, "\n\n---\n\n".join(digests))
     finally:
-        LOCK_FILE.unlink(missing_ok=True)
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_fd.close()
+            LOCK_FILE.unlink(missing_ok=True)
     return 0
 
 

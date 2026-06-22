@@ -80,6 +80,148 @@ def transcript_lines(text: str) -> list[str]:
     return lines
 
 
+def transcript_title(text: str) -> str:
+    match = re.search(r"^#\s+(.+?)\s*$", text or "", flags=re.M)
+    return compact(match.group(1)) if match else ""
+
+
+def is_weak_title(title: str) -> bool:
+    lowered = compact(title).lower()
+    if not lowered:
+        return True
+    if lowered in {"saved link", "untitled link", "untitled youtube video"}:
+        return True
+    return bool(re.fullmatch(r"https?\s+.*|https\s+.*|www\..*|youtube\.com.*", lowered))
+
+
+def sentence_split(lines: list[str]) -> list[str]:
+    text = compact(" ".join(lines))
+    if not text:
+        return []
+    pieces = re.split(r"(?<=[.!?])\s+(?=[A-ZА-Я0-9])", text)
+    sentences = []
+    for piece in pieces:
+        sentence = compact(piece).strip(" -")
+        if 35 <= len(sentence) <= 360:
+            sentences.append(sentence)
+    return sentences
+
+
+def detect_guest(lines: list[str]) -> str:
+    lead = " ".join(lines[:18])
+    match = re.search(
+        r"Meet\s+([A-Z][A-Za-z'’.-]+(?:\s+[A-Z][A-Za-z'’.-]+){1,3}),\s+([^.;]+)",
+        lead,
+    )
+    if match:
+        return f"{match.group(1)}, {compact(match.group(2)).rstrip('.')}"
+    return ""
+
+
+TOPIC_KEYWORDS = {
+    "AI productivity": ("productivity", "growth", "solve problems", "leverage", "efficient", "gdp"),
+    "Teams and resource allocation": ("resource allocation", "same size teams", "smaller teams", "personnel", "businesses", "teams"),
+    "Engineering talent": ("10x", "100x", "engineer", "load bearing", "polymath", "impact"),
+    "Models and tokens": ("frontier", "open models", "tokens", "model", "commoditize", "value accrual"),
+    "Company building": ("sales", "marketing", "legendary company", "founders", "enterprise", "go to market"),
+}
+
+
+def score_sentence(sentence: str, keywords: tuple[str, ...]) -> int:
+    lowered = sentence.lower()
+    return sum(2 if " " in keyword and keyword in lowered else int(keyword in lowered) for keyword in keywords)
+
+
+def is_question_like(sentence: str) -> bool:
+    lowered = sentence.strip().lower()
+    return "?" in sentence or lowered.startswith(("do you", "what ", "when ", "if i ", "how should", "would you"))
+
+
+def extract_key_points(lines: list[str], limit: int = 5) -> list[str]:
+    sentences = sentence_split(lines)
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        scored = [(score_sentence(sentence, keywords), sentence) for sentence in sentences]
+        declarative = [(score, sentence) for score, sentence in scored if score > 0 and not is_question_like(sentence)]
+        candidates = sorted(declarative or [(score, sentence) for score, sentence in scored if score > 0], reverse=True)
+        if not candidates or candidates[0][0] <= 0:
+            continue
+        sentence = candidates[0][1]
+        normalized = sentence[:90].lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        selected.append(f"{topic}: {sentence}")
+        if len(selected) >= limit:
+            break
+
+    if selected:
+        return selected
+
+    # Fallback: skip intro hooks and return spaced-out substantive sentences.
+    noisy = ("meet ", "before ", "thank you", "ready to go", "it is so good", "this is going to be")
+    filtered = [s for s in sentences if not s.lower().startswith(noisy)]
+    if not filtered:
+        filtered = sentences
+    if not filtered:
+        return []
+    step = max(1, len(filtered) // limit)
+    return [filtered[i] for i in range(0, min(len(filtered), step * limit), step)][:limit]
+
+
+def build_rich_summary(record: dict, meta: dict[str, str], transcript: str, lines: list[str], tools: list[tuple[str, str]]) -> dict[str, list[str] | str]:
+    title_candidates = [meta.get("title", ""), record.get("title", ""), transcript_title(transcript)]
+    title = next((candidate for candidate in title_candidates if candidate and not is_weak_title(candidate)), "")
+    if not title:
+        title = record.get("url") or "Saved link"
+
+    guest = detect_guest(lines)
+    points = extract_key_points(lines, limit=5)
+
+    if tools:
+        about = build_about(tools, lines, meta.get("description", "") or record.get("excerpt", ""))
+    elif guest:
+        about = f"Интервью с {guest}. Главная тема: как AI меняет продуктивность, размер команд, ценность сильных инженеров и распределение ресурсов в компаниях."
+    elif points:
+        about = "Материал о том, как автор/гость объясняет AI leverage, команды, продуктовую работу и практические последствия для бизнеса."
+    else:
+        about = meta.get("description") or record.get("excerpt") or "Содержание пока не извлечено качественно."
+
+    insights: list[str] = []
+    for point in points:
+        if ":" in point:
+            topic, sentence = point.split(":", 1)
+            insights.append(f"{topic.strip()}: {sentence.strip()}")
+        else:
+            insights.append(point)
+
+    system: list[str] = []
+    if tools:
+        system.extend(
+            [
+                "Автор собирает workflow из готовых ресурсов и референсов, чтобы ускорить AI/vibe-coding работу.",
+                "Практическая механика: не начинать с пустого листа, а давать AI готовые паттерны, компоненты и визуальные ориентиры.",
+            ]
+        )
+    elif insights:
+        system.extend(
+            [
+                "Это не tutorial с конкретным стеком инструментов, а интервью/разбор управленческой логики.",
+                "Полезная механика: смотреть на AI как на leverage для решения большего числа задач или тех же задач меньшей командой.",
+                "Отдельный сигнал: ценность смещается к людям, которые умеют брать ответственность за результат, а не просто генерировать больше кода.",
+            ]
+        )
+
+    return {
+        "title": title,
+        "about": about,
+        "insights": insights,
+        "system": system,
+    }
+
+
 def normalize_tool_name(name: str) -> str:
     cleaned = compact(name).strip(" .:-")
     aliases = {
@@ -201,7 +343,7 @@ def human_title(record: dict, meta: dict[str, str]) -> str:
     platform = meta.get("platform") or record.get("kind", "link")
     if creator:
         return f"{platform}: {creator}"
-    title = record.get("title") or meta.get("title") or record.get("url") or "Saved link"
+    title = meta.get("title") or record.get("title") or record.get("url") or "Saved link"
     title = re.sub(r"^\{self\}\s+\{transcript\}\s+UGC\s+", "", title)
     title = re.sub(r"\s+–\s+\d{4}-\d{2}-\d{2}$", "", title)
     return title
@@ -226,13 +368,14 @@ def build_record_digest(record: dict) -> str:
     brief = read_text(record.get("brief_path"))
     transcript = read_text(record.get("transcript_path"))
     meta = source_fields(brief)
+    transcript_items = transcript_lines(transcript)
+    tools = extract_numbered_tools(transcript_items)
+    rich = build_rich_summary(record, meta, transcript, transcript_items, tools)
     lines = [
-        f"Сохранил: {human_title(record, meta)}",
+        f"Сохранил: {rich['title'] or human_title(record, meta)}",
         "",
     ]
 
-    transcript_items = transcript_lines(transcript)
-    tools = extract_numbered_tools(transcript_items)
     if brief:
         core = section(brief, "Core Read")
         core_bullets = bullets(core, limit=4)
@@ -241,12 +384,18 @@ def build_record_digest(record: dict) -> str:
     else:
         core_bullets = []
 
-    title = meta.get("title") or record.get("title") or ""
+    title = meta.get("title") or transcript_title(transcript) or record.get("title") or ""
     description = meta.get("description") or ""
-    about = build_about(tools, transcript_items, description)
+    about = str(rich["about"])
 
     lines.append("О чём видео:")
     lines.append(f"- {about[:620].rstrip()}")
+
+    insights = list(rich.get("insights") or [])
+    if insights:
+        lines.extend(["", "Ключевые идеи:"])
+        for item in insights[:5]:
+            lines.append(f"- {item[:420].rstrip()}")
 
     if tools:
         lines.extend(["", "Инструменты / ресурсы:"])
@@ -256,19 +405,18 @@ def build_record_digest(record: dict) -> str:
                 lines.append(f"- {name}: {readable_desc}")
             else:
                 lines.append(f"- {name}")
-    elif title or description:
+    elif (title and not is_weak_title(title)) or description:
         lines.extend(["", "Что видно из source metadata:"])
-        if title:
+        if title and not is_weak_title(title):
             lines.append(f"- Title: {title}")
         if description:
             lines.append(f"- Caption: {description}")
 
-    if tools:
+    system_lines = list(rich.get("system") or [])
+    if system_lines:
         lines.extend(["", "Система автора:"])
-        lines.append("- Берёт готовые UI-компоненты, дизайн-референсы, экраны приложений и галереи сильных сайтов как input для AI.")
-        if any(name.lower() in {"10x", "10 x"} for name, _ in tools):
-            lines.append("- Финальный слой: сервис, который превращает идею приложения в native iOS app / reusable UI code за минуты.")
-        lines.append("- Польза: меньше начинать с нуля, быстрее доводить идею до визуально убедительного прототипа.")
+        for item in system_lines[:4]:
+            lines.append(f"- {item}")
     elif status == "failed" and record.get("error"):
         lines.extend(["", "Ошибка:", f"- {record['error']}"])
 

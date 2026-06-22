@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -26,6 +27,14 @@ UGC_SCRIPT = Path("/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/UGC 
 INDEX_SCRIPT = Path(__file__).resolve().parent / "build_external_resources_index.py"
 TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 DESC_RE = re.compile(r'(?is)<meta\s+[^>]*(?:name|property)=["\'](?:description|og:description)["\'][^>]*content=["\'](.*?)["\']')
+MARKDOWN_H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+TRANSIENT_UGC_ERRORS = (
+    "failed to resolve",
+    "read timed out",
+    "connection timed out",
+    "temporarily unavailable",
+    "remote end closed connection",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,11 +63,21 @@ def fetch_web_metadata(url: str) -> tuple[str, str]:
     return title, desc
 
 
+def transcript_title(path: str | None) -> str:
+    if not path:
+        return ""
+    transcript_path = Path(path)
+    if not transcript_path.exists():
+        return ""
+    text = transcript_path.read_text(encoding="utf-8", errors="replace")[:4000]
+    match = MARKDOWN_H1_RE.search(text)
+    return clean_filename_part(match.group(1), max_len=96) if match else ""
+
+
 def process_youtube(config: dict, record: dict, logger) -> None:
     if not YOUTUBE_SCRIPT.exists():
         raise RuntimeError(f"YouTube script missing: {YOUTUBE_SCRIPT}")
     out_dir = paths(config)["transcripts"]
-    title = clean_filename_part(record.get("message_text") or record["url"], max_len=48)
     command = [
         "python3",
         str(YOUTUBE_SCRIPT),
@@ -67,8 +86,6 @@ def process_youtube(config: dict, record: dict, logger) -> None:
         str(out_dir),
         "--prefix",
         "{link} {transcript}",
-        "--title",
-        title,
         "--date",
         record.get("date") or today(),
         "--skip-summary",
@@ -93,7 +110,7 @@ def process_youtube(config: dict, record: dict, logger) -> None:
         elif line.startswith("[done] segments=") and " file=" in line:
             output = line.split(" file=", 1)[1].strip()
     record["transcript_path"] = output or ""
-    record["title"] = title
+    record["title"] = transcript_title(output) or record.get("title") or record["url"]
     record["status"] = "processed"
 
 
@@ -129,7 +146,15 @@ def process_ugc_video(config: dict, record: dict, logger) -> None:
 
     logger.info(f"Processing UGC video: {record['url']}")
     env = os.environ.copy() | {"UGC_TRANSCRIPTS_DIR": str(paths(config)["transcripts"])}
-    result = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
+    result = None
+    for attempt in range(1, 4):
+        result = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if result.returncode == 0 or not any(marker in combined for marker in TRANSIENT_UGC_ERRORS):
+            break
+        logger.warning(f"Transient UGC error for {record['url']}; retry {attempt}/3")
+        time.sleep(10 * attempt)
+    assert result is not None
     if result.stdout:
         logger.info(result.stdout.strip())
     if result.stderr:

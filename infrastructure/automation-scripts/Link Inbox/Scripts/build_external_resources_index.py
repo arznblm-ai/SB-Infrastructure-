@@ -8,6 +8,7 @@ from pathlib import Path
 
 from link_digest import (
     build_about,
+    build_rich_summary,
     bullets,
     extract_numbered_tools,
     read_text,
@@ -55,9 +56,10 @@ def brief_summary(record: dict) -> tuple[list[str], list[str]]:
     meta = source_fields(brief)
     lines = transcript_lines(transcript)
     tools = extract_numbered_tools(lines)
+    rich = build_rich_summary(record, meta, transcript, lines, tools)
 
     if tools:
-        summary = [build_about(tools, lines, meta.get("description", ""))]
+        summary = [str(rich.get("about") or build_about(tools, lines, meta.get("description", "")))]
         insights = [f"{name}: {russian_tool_desc(name, desc)}" for name, desc in tools[:5]]
         return summary, insights
 
@@ -74,11 +76,13 @@ def brief_summary(record: dict) -> tuple[list[str], list[str]]:
     if not summary and record.get("excerpt"):
         summary = [str(record["excerpt"]).strip()]
     if not summary and transcript:
-        summary = [transcript_excerpt(transcript, max_chars=360)]
+        summary = [str(rich.get("about") or transcript_excerpt(transcript, max_chars=360))]
     if not insights and transcript:
-        excerpt = transcript_excerpt(transcript, max_chars=360)
-        if excerpt:
-            insights = [excerpt]
+        insights = [str(item) for item in list(rich.get("insights") or [])[:3]]
+        if not insights:
+            excerpt = transcript_excerpt(transcript, max_chars=360)
+            if excerpt:
+                insights = [excerpt]
     return summary, insights
 
 

@@ -250,7 +250,10 @@ def paths(config: dict[str, Any]) -> dict[str, Path]:
 
 def link_note_path(config: dict[str, Any], record: dict[str, Any]) -> Path:
     title = clean_filename_part(record.get("title") or record.get("url"))
-    return paths(config)["links"] / f"{{link}} {title} – {record['date']}.md"
+    base = paths(config)["links"] / f"{{link}} {title} – {record['date']}.md"
+    if not base.exists() or f'source_url: "{record["url"]}"' in base.read_text(encoding="utf-8", errors="replace")[:1000]:
+        return base
+    return paths(config)["links"] / f"{{link}} {title} -- {record['id']} – {record['date']}.md"
 
 
 def write_link_note(config: dict[str, Any], record: dict[str, Any]) -> Path:

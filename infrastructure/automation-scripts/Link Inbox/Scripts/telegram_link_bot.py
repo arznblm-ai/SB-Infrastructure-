@@ -53,7 +53,14 @@ def telegram_request(token: str, method: str, data: dict[str, str] | None = None
     for key, value in (data or {}).items():
         command.extend(["--data-urlencode", f"{key}={value}"])
     command.append(f"https://api.telegram.org/bot{token}/{method}")
-    payload = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+    try:
+        payload = subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        output = (exc.output or "").strip()
+        if token:
+            output = output.replace(token, "<redacted-token>")
+        detail = f": {output[-500:]}" if output else ""
+        raise RuntimeError(f"Telegram API {method} failed with curl exit {exc.returncode}{detail}") from exc
     return json.loads(payload)
 
 
