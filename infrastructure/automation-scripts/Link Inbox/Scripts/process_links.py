@@ -20,7 +20,7 @@ from link_inbox_common import (
     today,
     write_link_note,
 )
-from link_summary_note import write_summary_note
+from external_resource_note import write_external_resource_note
 
 YOUTUBE_SCRIPT = Path("/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/youtube-transcribe/scripts/transcribe_youtube.py")
 UGC_SCRIPT = Path("/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/UGC Downloader/ugc_downloader.py")
@@ -232,7 +232,7 @@ def main() -> int:
             else:
                 process_web(record, logger)
             if record.get("status") == "processed":
-                write_summary_note(config, record)
+                write_external_resource_note(config, record)
             write_link_note(config, record)
             state["links"][uid] = record
             processed += 1

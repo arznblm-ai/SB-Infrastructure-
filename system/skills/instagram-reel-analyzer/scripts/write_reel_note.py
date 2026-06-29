@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""DEPRECATED — kept only as a fallback.
+
+The external-resource pipeline is now unified. The single source of truth for
+note building/enriching is:
+
+    infrastructure/Link Inbox/Scripts/external_resource_note.py
+
+Preferred flow (see the instagram-reel-analyzer SKILL.md):
+  1. transcript -> `external_resource_note.py --path <file> --rebuild-auto --source-url <url>`
+  2. enrich     -> `external_resource_note.py --path <note> --summary ... --essence ... --link ...`
+
+If this script is still invoked, it now writes a schema-compatible note
+(`type: external-resource`, `enrichment: done`) into the canonical folder.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +23,7 @@ from pathlib import Path
 
 
 DEFAULT_OUTPUT_DIR = Path(
-    "/Users/anton/AI AGENT FOLDER/Second Brain/resources/instagram-reels/transcripts"
+    "/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources"
 )
 
 
@@ -111,6 +125,14 @@ def build_note(args: argparse.Namespace) -> str:
     title = clean_scalar(args.title, "Instagram Reel")
     yaml_title = title.replace('"', '\\"')
     source_url = clean_scalar(args.source_url)
+    host = source_url.lower()
+    platform = "instagram"
+    if "tiktok" in host:
+        platform = "tiktok"
+    elif "youtube" in host or "youtu.be" in host:
+        platform = "youtube"
+    elif "x.com" in host or "twitter" in host:
+        platform = "x"
     author_url = args.author_url or (
         f"https://www.instagram.com/{args.author_username}/" if args.author_username else "unknown"
     )
@@ -122,7 +144,9 @@ def build_note(args: argparse.Namespace) -> str:
     frontmatter = textwrap.dedent(
         f"""\
         ---
-        type: instagram-reel-transcript
+        type: external-resource
+        platform: "{platform}"
+        enrichment: done
         title: "{yaml_title}"
         source_url: "{source_url}"
         shortcode: "{clean_scalar(args.shortcode)}"

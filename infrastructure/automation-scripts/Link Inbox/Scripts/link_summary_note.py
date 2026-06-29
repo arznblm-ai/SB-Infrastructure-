@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""DEPRECATED (2026-06-28) — split summary notes were merged into one rich note.
+
+No longer imported by the pipeline. The single source of truth is now
+`external_resource_note.py` (one self-contained note per resource in
+`transcripts/external resources/`). Kept only for reference / one-off recovery.
+"""
 from __future__ import annotations
 
 import argparse

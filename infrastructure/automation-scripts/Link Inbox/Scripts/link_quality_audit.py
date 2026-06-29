@@ -13,23 +13,21 @@ from pathlib import Path
 
 from link_inbox_common import canonicalize_url, load_config, load_state, paths, save_state, url_id, write_link_note
 from link_digest import build_record_digest
-from link_summary_note import write_summary_note
+from external_resource_note import write_external_resource_note
 
 
 VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
 INDEX_SCRIPT = Path(__file__).resolve().parent / "build_external_resources_index.py"
 OBSIDIAN_INDEX_SCRIPT = VAULT / "infrastructure" / "Obsidian Manager" / "Scripts" / "build_indexes.py"
-REQUIRED_SUMMARY_SECTIONS = [
+# After the merge each resource is ONE rich note; these are its load-bearing sections.
+REQUIRED_NOTE_SECTIONS = [
     "## Краткое содержание",
-    "## Инструменты / ресурсы",
-    "## Система автора",
-    "## Где лежит сырьё",
+    "## Полезные ссылки",
+    "## Транскрипт",
 ]
-WEAK_SUMMARY_MARKERS = [
-    "Инструменты явно не извлечены",
-    "Система автора не выделена автоматически",
+# Real defects only — the `pending` enrich marker is expected for auto-tier notes.
+WEAK_NOTE_MARKERS = [
     "Transcript unavailable",
-    "Содержание пока не извлечено",
 ]
 
 
@@ -149,25 +147,24 @@ def audit_records(config: dict, state: dict, issues: list[str], actions: list[st
             if value and not Path(value).exists():
                 issues.append(f"broken {key} for `{uid}`: `{rel(value)}`")
 
-        summary_path = record.get("summary_path")
-        summary_text = read_text(summary_path)
-        summary_missing = not summary_path or not Path(summary_path).exists()
-        missing_sections = [section for section in REQUIRED_SUMMARY_SECTIONS if section not in summary_text]
-        missing_source_links = bool(record.get("transcript_path") and rel(record.get("transcript_path")) not in summary_text)
+        note_path = record.get("summary_path") or record.get("transcript_path")
+        note_text = read_text(note_path)
+        note_missing = not note_path or not Path(note_path).exists()
+        missing_sections = [section for section in REQUIRED_NOTE_SECTIONS if section not in note_text]
 
-        if summary_missing or missing_sections or missing_source_links:
-            reason = "missing" if summary_missing else "incomplete"
-            issues.append(f"{reason} summary for `{uid}`")
-            if not summary_missing and missing_sections:
-                issues.append(f"summary missing sections for `{uid}`: {', '.join(missing_sections)}")
-            actions.append(f"regenerate summary: `{uid}`")
+        if note_missing or missing_sections:
+            reason = "missing" if note_missing else "incomplete"
+            issues.append(f"{reason} note for `{uid}`")
+            if not note_missing and missing_sections:
+                issues.append(f"note missing sections for `{uid}`: {', '.join(missing_sections)}")
+            actions.append(f"rebuild note: `{uid}`")
             if not dry_run:
-                write_summary_note(config, record)
+                write_external_resource_note(config, record)
                 write_link_note(config, record)
 
-        for marker in WEAK_SUMMARY_MARKERS:
-            if marker in summary_text:
-                issues.append(f"weak summary marker for `{uid}`: {marker}")
+        for marker in WEAK_NOTE_MARKERS:
+            if marker in note_text:
+                issues.append(f"weak note marker for `{uid}`: {marker}")
                 break
 
         try:
@@ -233,10 +230,9 @@ def audit_index(config: dict, state: dict, issues: list[str], actions: list[str]
         for uid, record in state.get("links", {}).items():
             if record.get("status") != "processed":
                 continue
-            if uid not in index_text:
-                issues.append(f"index missing id `{uid}`")
-            if record.get("summary_path") and rel(record["summary_path"]) not in index_text:
-                issues.append(f"index missing summary for `{uid}`")
+            note_path = record.get("summary_path") or record.get("transcript_path")
+            if note_path and rel(note_path) not in index_text:
+                issues.append(f"index missing note for `{uid}`")
     if not dry_run:
         subprocess.run([sys.executable, str(INDEX_SCRIPT), "--config", str(config["config_file"])], check=False)
 
@@ -272,8 +268,8 @@ def write_report(config: dict, issues: list[str], actions: list[str], dry_run: b
             "## Retrieval Contract Checked",
             "",
             "- Agents should use `transcripts/external resources/index.md` first.",
-            "- Agents should read `resources/link-inbox/summaries/` before opening full transcripts.",
-            "- Full transcripts are only for exact wording, quotes, timestamps, or missing details.",
+            "- Each resource is one self-contained rich note in `transcripts/external resources/` (summary + links + insights + Strategic Board + transcript).",
+            "- `enrichment: pending` notes carry auto-extracted data only; run the enrich step to fill the smart sections.",
             "",
         ]
     )

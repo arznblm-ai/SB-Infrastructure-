@@ -5,14 +5,22 @@ description: Analyze Instagram Reels from reel URLs or downloaded reel videos, e
 
 # Instagram Reel Analyzer
 
-Use this skill to turn Instagram Reels into durable Second Brain notes.
+Use this skill to turn Instagram Reels (and other external resources) into ONE
+durable Second Brain note. This pipeline is **unified with Link Inbox**: a reel
+saved via the Telegram bot and a reel analyzed here produce the SAME note, in the
+SAME place, in the SAME format.
 
-Default storage:
+Canonical storage (single source of truth):
 
-- Notes: `/Users/anton/AI AGENT FOLDER/Second Brain/resources/instagram-reels/transcripts`
-- Downloaded media: `/Users/anton/AI AGENT FOLDER/Second Brain/resources/instagram-reels/media`
-- Extra reports/HTML/screenshots: `/Users/anton/AI AGENT FOLDER/Second Brain/resources/instagram-reels/reports`
-- Indexes and future rollups: `/Users/anton/AI AGENT FOLDER/Second Brain/resources/instagram-reels/index`
+- Note (one per resource): `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/`
+- Index: `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/index.md`
+- Source card (URL / status / Telegram message): `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/links/`
+- Downloaded media / run artifacts: `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/UGC Downloader/runs/`
+
+Shared note builder (used by both the bot and this skill):
+`/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/external_resource_note.py`
+
+> The legacy `resources/instagram-reels/` tree is archived under `_archive/instagram-reels-merged-2026-06-28/`. Do not write there.
 
 ## Workflow
 
@@ -39,8 +47,14 @@ Default storage:
    - Use the reel transcript as the source artifact and relevant vault context only when it changes the recommendation.
    - Add a concise decision frame, facts vs interpretations, strategic implications, risks, and next move.
    - If the reel is purely entertainment or low strategic value, write `not applicable` in the strategic section.
-7. Write the durable note with `scripts/write_reel_note.py`.
-8. Validate that the note exists and preview the first lines before reporting back.
+7. Produce the unified note (do NOT use the deprecated `scripts/write_reel_note.py`):
+   - If the reel was already saved via the Telegram bot, a `pending` note already exists in `transcripts/external resources/` — find it via `index.md` and skip to enrich.
+   - Otherwise, after transcription, create the auto note:
+     `external_resource_note.py --path <transcript-file> --rebuild-auto --source-url <url>`
+   - Then enrich it (this is the LLM tier — you, the agent, fill the smart sections, verify links, and flip `enrichment: done`):
+     `external_resource_note.py --path <note> --summary "..." --essence "..." --insight "..." --solution "..." --link "Label=https://..." --tool "Name" --anton-relevance "..." --strategic "..."`
+8. Rebuild the index: `python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/build_external_resources_index.py"`.
+9. Validate that the note exists and preview the first lines before reporting back.
 
 ## Note Requirements
 
@@ -62,25 +76,33 @@ Read `references/reel-note-schema.md` before changing the note format or creatin
 
 ## Commands
 
-Create a note from an already prepared transcript:
+Build the auto note from a transcript file (creates frontmatter + transcript + auto-extracted links/tools, smart sections marked `pending`):
 
 ```bash
-python3 "/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/instagram-reel-analyzer/scripts/write_reel_note.py" \
-  --source-url "https://www.instagram.com/reel/SHORTCODE/" \
-  --shortcode "SHORTCODE" \
-  --author-username "creator" \
-  --title "Human title" \
-  --published-at "2026-06-06" \
-  --transcript-file "/private/tmp/reel_transcript.txt" \
+python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/external_resource_note.py" \
+  --path "/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/<note>.md" \
+  --rebuild-auto \
+  --source-url "https://www.instagram.com/reel/SHORTCODE/"
+```
+
+Enrich the note (LLM tier — fills the smart sections, verifies links, flips `enrichment: done`):
+
+```bash
+python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/external_resource_note.py" \
+  --path "/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/<note>.md" \
   --summary "One useful summary bullet" \
+  --essence "Main claim in plain Russian" \
   --insight "One strong insight" \
   --solution "One reusable implementation idea" \
-  --strategic-analysis "Strategic Board: recommended next move..." \
+  --anton-relevance "Why this matters for Anton" \
+  --strategic "Strategic Board: recommended next move..." \
   --tool "Claude" \
   --link "Claude=https://claude.ai/"
 ```
 
-If the transcript is short, pass repeated `--transcript-line` values instead of a file.
+Repeatable flags (`--summary`, `--insight`, `--solution`, `--link`, `--tool`, `--strategic`) can be passed multiple times. Only the sections you pass are overwritten; the transcript is preserved.
+
+> `scripts/write_reel_note.py` is DEPRECATED (kept as a fallback that now writes into the canonical folder). Prefer the unified builder above.
 
 ## Instagram Extraction Hints
 
@@ -112,5 +134,6 @@ Treat this as opportunistic, not guaranteed. If it fails, fall back to the visib
 
 ## Resources
 
-- `scripts/write_reel_note.py`: create the normalized Markdown note.
-- `references/reel-note-schema.md`: field and section standard for future search.
+- `infrastructure/Link Inbox/Scripts/external_resource_note.py`: the shared, canonical note builder (auto + enrich). Use this.
+- `references/reel-note-schema.md`: field and section standard (now the unified external-resource schema).
+- `scripts/write_reel_note.py`: DEPRECATED fallback; redirects to the canonical folder but prefer the builder above.

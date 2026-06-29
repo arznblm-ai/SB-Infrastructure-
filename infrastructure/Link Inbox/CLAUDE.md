@@ -12,10 +12,11 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 |---|---|
 | Проект | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/` |
 | Скрипты | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/` |
-| Ссылки | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/links/` |
-| Summary заметки | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/summaries/` |
-| Транскрипты внешних ресурсов | `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/` |
+| Source cards (URL/статус/TG msg) | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/links/` |
+| Единые заметки ресурсов (одна на ресурс) | `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/` |
 | Индекс внешних ресурсов | `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/index.md` |
+| Общий builder заметки (auto + enrich) | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/external_resource_note.py` |
+| Summary заметки (DEPRECATED, до 2026-06-28) | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/summaries/` |
 | Reviews | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/reviews/` |
 | Quality reports | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/quality-reports/` |
 | Quarantine | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/quarantine/` |
@@ -32,9 +33,10 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 3. После сохранения запускает `process_and_notify.py` в фоне, чтобы бот быстро ответил и не зависал на транскрипте.
 4. YouTube ссылки транскрибируются через существующий `youtube-transcribe` script и сохраняются в `transcripts/external resources/`.
 5. Instagram/TikTok ссылки обрабатываются через `infrastructure/UGC Downloader/ugc_downloader.py`: видео скачивается через `yt-dlp`, транскрибируется через `video-transcribe`, transcript сохраняется в `transcripts/external resources/`, создаётся `remix_brief.md`.
-6. После успешной обработки Link Inbox создаёт readable summary note в `resources/link-inbox/summaries/`.
-7. Web ссылки получают title/description и остаются как durable cards plus summary note.
-8. После обработки Link Inbox пересобирает `transcripts/external resources/index.md`, чтобы агенты могли быстро находить сохранённые материалы.
+6. После успешной обработки Link Inbox строит **одну богатую заметку на ресурс** через `external_resource_note.py` (auto-уровень: frontmatter, транскрипт, caption, ссылки/инструменты по эвристике; умные секции `enrichment: pending`). Заметка заменяет сырой транскрипт по тому же пути.
+7. Web ссылки получают title/description и тоже сводятся к одной заметке того же формата.
+8. **Enrich-уровень (LLM):** умные секции (суть, инсайты, готовые решения, Strategic Board, проверенные ссылки) заполняет агент командой `external_resource_note.py --path <note> --summary ... --essence ...` (см. skill `instagram-reel-analyzer`). Авто-LLM в фоне не включён — для него нужен API-ключ в `~/.config/link-inbox/env`.
+9. После обработки Link Inbox пересобирает `transcripts/external resources/index.md` (note-centric), чтобы агенты быстро находили ресурсы.
 9. После обработки бот присылает короткий digest: содержание, инсайты и пути `summary` / `transcript` / `brief`.
 9. Если Instagram/TikTok закрыт, rate-limited или требует login, обработка падает в `failed` с ошибкой. Тогда нужно включить `ugc.cookies_from_browser` или `ugc.cookies`.
 10. `/review` в боте или `send_review.py --send` создаёт batch review и отправляет его обратно в Telegram.
@@ -48,22 +50,19 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 Обязательный retrieval order для экономии токенов:
 
 1. `index.md` — найти нужный ресурс.
-2. `summary` — прочитать readable context.
-3. `transcript` — открыть только для точной формулировки, цитаты, таймкода или детализации.
-4. `brief` / `card` — открыть только если нужны content mechanics или source metadata.
+2. `note` — открыть одну заметку ресурса; она самодостаточна (краткое содержание, суть, ссылки, инструменты, инсайты, готовые решения, Strategic Board, транскрипт).
+3. `card` — открыть только если нужны source URL, статус обработки или оригинальное Telegram-сообщение.
 
-Запрещено сканировать все transcripts внешних ресурсов до чтения `index.md` и соответствующих summaries.
+Запрещено сканировать все заметки внешних ресурсов до чтения `index.md`.
 
 Правило маршрутизации:
 
-- `index.md` — обзор всех saved links и быстрый выбор нужного материала.
-- `summary` — first-read readable note для Антона и агентов.
-- `card` — источник, URL, Telegram-message, статус обработки.
-- `brief` — короткое human-readable содержание, инсайты, remix/content mechanics.
-- `transcript` — точная речь и полный контекст.
-- `video` — локальный медиафайл, если нужно визуально проверить референс.
+- `index.md` — обзор всех ресурсов и быстрый выбор нужного.
+- `note` — единая богатая заметка (one per resource) в `transcripts/external resources/`.
+- `card` — источник, URL, Telegram-message, статус обработки в `resources/link-inbox/links/`.
+- `enrichment: pending` во frontmatter = умные секции ещё не заполнены агентом; запусти enrich.
 
-Не смешивать saved links с `meetings/` и `education/`: это внешние источники, а не личные встречи и не курсовые summary.
+Не смешивать эти заметки с `meetings/` и `education/`: это внешние источники, а не личные встречи и не курсовые summary.
 
 ## Первый запуск
 
