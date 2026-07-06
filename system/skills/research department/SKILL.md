@@ -1,6 +1,7 @@
 ---
 name: research department
 description: "Operating system for factual research: use Research Department when a request should enter through the canonical research router, be classified into the right factual workflow, routed through specialist roles, and return with explicit artifacts plus readable exports."
+model: inherit
 ---
 
 # Research Department
@@ -85,6 +86,8 @@ description: "Operating system for factual research: use Research Department whe
 
 ## Когда не использовать
 
-- Для стратегии, рекомендаций и выбора лучшего направления
+- Для стратегии, рекомендаций и выбора лучшего направления — это Strategic Board; сюда возвращайся только за фактами через research handoff
 - Для простого веб-поиска без reusable artifacts
 - Для casual brainstorming без brief и evidence trail
+- Для поиска по собственному vault («где я писал про X») — это Vault Semantic Search, а не web research
+- Для быстрого ответа из общих знаний модели, когда Антон не просил искать источники

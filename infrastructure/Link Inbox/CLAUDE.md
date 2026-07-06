@@ -1,5 +1,7 @@
 # Link Inbox
 
+> Разделение ответственности со смежными системами (UGC Downloader, transcribe-скиллы, instagram-reel-analyzer): `system/rules/{POS} {rule} external resources pipeline – 2026-07-05.md`. Link Inbox — владелец pipeline и единственный, кто пересобирает `transcripts/external resources/index.md`.
+
 ## Контекст
 
 Link Inbox — автоматизация для Telegram-бота / канала с полезными ссылками.
@@ -35,8 +37,9 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 5. Instagram/TikTok ссылки обрабатываются через `infrastructure/UGC Downloader/ugc_downloader.py`: видео скачивается через `yt-dlp`, транскрибируется через `video-transcribe`, transcript сохраняется в `transcripts/external resources/`, создаётся `remix_brief.md`.
 6. После успешной обработки Link Inbox строит **одну богатую заметку на ресурс** через `external_resource_note.py` (auto-уровень: frontmatter, транскрипт, caption, ссылки/инструменты по эвристике; умные секции `enrichment: pending`). Заметка заменяет сырой транскрипт по тому же пути.
 7. Web ссылки получают title/description и тоже сводятся к одной заметке того же формата.
-8. **Enrich-уровень (LLM):** умные секции (суть, инсайты, готовые решения, Strategic Board, проверенные ссылки) заполняет агент командой `external_resource_note.py --path <note> --summary ... --essence ...` (см. skill `instagram-reel-analyzer`). Авто-LLM в фоне не включён — для него нужен API-ключ в `~/.config/link-inbox/env`.
+8. **Enrich-уровень (LLM, АВТОМАТИЧЕСКИ при сохранении):** сразу после авто-заметки `process_links.py` вызывает `enrich_note_llm.py` (headless `claude -p` на OAuth-авторизации Антона — отдельный API-ключ НЕ нужен) и заполняет умные секции (суть, инсайты, готовые решения, Strategic Board, проверенные ссылки) → `enrichment: done`. Управляется `enrich.auto` (default true) и `enrich.model` (default haiku) в конфиге. Best-effort: если разбор упал (напр. claude-auth недоступен в LaunchAgent), заметка остаётся `pending`, и её добивает `python3 Scripts/enrich_note_llm.py --all-pending`.
 9. После обработки Link Inbox пересобирает `transcripts/external resources/index.md` (note-centric), чтобы агенты быстро находили ресурсы.
+10. **Канал/батч (агентный):** профиль не выкачивается автоматически (риск аккаунта); reels канала за 30 дней разбирает агент через `batch_reels.py --author <user> URL…` → авто-заметки в `transcripts/external resources/<author>/` → авто-enrich. См. skill `instagram-reel-analyzer`.
 9. После обработки бот присылает короткий digest: содержание, инсайты и пути `summary` / `transcript` / `brief`.
 9. Если Instagram/TikTok закрыт, rate-limited или требует login, обработка падает в `failed` с ошибкой. Тогда нужно включить `ugc.cookies_from_browser` или `ugc.cookies`.
 10. `/review` в боте или `send_review.py --send` создаёт batch review и отправляет его обратно в Telegram.

@@ -85,7 +85,9 @@ def main() -> int:
         ]
         result = subprocess.run(command, cwd=str(SCRIPT_DIR.parent), capture_output=True, text=True, check=False)
         if result.returncode != 0:
-            send_message(token, args.chat_id, "Обработка ссылки завершилась с ошибкой. Покажу что удалось сохранить.\n\n" + result.stdout[-1200:] + result.stderr[-1200:])
+            tail = (result.stderr or result.stdout or "").strip().splitlines()
+            last = tail[-1] if tail else "unknown error"
+            send_message(token, args.chat_id, f"⚠️ Не удалось обработать ссылку автоматически: {last}\nЧто удалось сохранить — ниже.")
 
         state = load_state(config)
         digests = []

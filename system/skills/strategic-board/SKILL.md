@@ -1,6 +1,7 @@
 ---
 name: strategic-board
 description: "Strategic Board router for Anton's CEO decisions: use when the user asks for strategic decision support, business/advisor/board review, prioritization, what to choose, whether to do something, trade-offs, focus, opportunity cost, pre-mortem, CEO decision logs, or source-backed strategy based on Second Brain context. Trigger on Russian and English phrasing such as 'стратегическое решение', 'борд', 'business advisor', 'что выбрать', 'стоит ли', 'приоритизация', 'trade-off', 'decision brief', 'CEO decision'."
+model: inherit
 ---
 
 # Strategic Board Router
@@ -27,6 +28,12 @@ Use this skill when Anton asks for:
 - decision log creation after Anton has chosen
 
 Do not use this skill for factual market research by itself. If the request is primarily factual research, use Research Department first, then use Strategic Board only after the evidence is available.
+
+## When Not To Use
+
+- Gathering fresh external facts, market numbers, or sources — hand that off to Research Department first, then run the board on the collected evidence.
+- Trivial operational questions (run a script, rename a file, schedule a call) that need no trade-off analysis.
+- Code or feature implementation — that is the model-pipeline / project workflow, not a board decision.
 
 ## Required Startup
 

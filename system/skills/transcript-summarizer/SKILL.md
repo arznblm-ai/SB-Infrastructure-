@@ -1,6 +1,7 @@
 ---
 name: transcript-summarizer
 description: "Обрабатывает source materials из папки transcripts/: классифицирует (лекция или встреча), создаёт structured summary по documentation framework (Minto + MECE + BFO + DRY), раскладывает в education/ или meetings/. Claude-сессии не трогает: они живут в sessions/. Используй этот skill когда нужно: обработать новые транскрипты, создать summary из сырого текста, разобрать лекцию или встречу, 'обработай транскрипты', 'разложи сырьё', 'сделай summary', 'что нового в transcripts', 'переработай запись'."
+model: sonnet
 ---
 
 # Transcript Summarizer — обработка сырья в structured knowledge

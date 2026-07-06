@@ -3,6 +3,7 @@ name: developer-growth-analysis
 description: Analyze Anton's recent Codex Desktop sessions and Second Brain work patterns to produce a Russian developer/vibecoding growth report with strengths, bottlenecks, skill gaps, action items, and optional learning resources. Use when Anton asks to analyze his developer growth, coding progress, Codex history, vibe coding progress, recent AI-agent work, GitHub learning, skill-building, or asks "как мне стать лучше" in the context of software, Codex, agents, automations, or Second Brain.
 metadata:
   short-description: Analyze Anton's Codex growth patterns
+model: sonnet
 ---
 
 # Developer Growth Analysis

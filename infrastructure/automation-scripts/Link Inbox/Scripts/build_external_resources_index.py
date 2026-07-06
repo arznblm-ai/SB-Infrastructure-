@@ -67,18 +67,22 @@ def short_summary(text: str, max_chars: int = 320) -> str:
 
 def scan_notes(transcript_dir: Path) -> list[dict]:
     notes = []
-    for path in sorted(transcript_dir.glob("*.md")):
+    # rglob so per-author subfolders (transcripts/external resources/<author>/) are indexed too.
+    for path in sorted(transcript_dir.rglob("*.md")):
         if path.name.lower() in SKIP_NAMES:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         if "type: external-resource" not in text[:200]:
             continue
         fm = read_frontmatter(text)
+        rel_parent = path.parent.relative_to(transcript_dir)
+        author_folder = str(rel_parent) if rel_parent != Path(".") else ""
         notes.append(
             {
                 "path": path,
                 "title": fm.get("title") or path.stem,
                 "platform": fm.get("platform", "web"),
+                "author_folder": author_folder,
                 "source_url": fm.get("source_url", ""),
                 "published_at": fm.get("published_at", ""),
                 "captured_at": fm.get("captured_at", ""),
@@ -92,10 +96,13 @@ def scan_notes(transcript_dir: Path) -> list[dict]:
 
 def format_note(note: dict) -> str:
     badge = "✅ enriched" if note["enrichment"] == "done" else "🟡 pending"
+    detail = f"- **Platform:** `{note['platform']}`  ·  **Enrichment:** {badge}  ·  **Published:** {note['published_at'] or 'unknown'}"
+    if note.get("author_folder"):
+        detail += f"  ·  **Канал:** `{note['author_folder']}`"
     lines = [
         f"### {clean_cell(note['title'])}",
         "",
-        f"- **Platform:** `{note['platform']}`  ·  **Enrichment:** {badge}  ·  **Published:** {note['published_at'] or 'unknown'}",
+        detail,
     ]
     if note["source_url"]:
         lines.append(f"- **URL:** {note['source_url']}")

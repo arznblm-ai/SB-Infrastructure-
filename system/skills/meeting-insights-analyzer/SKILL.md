@@ -3,6 +3,7 @@ name: meeting-insights-analyzer
 description: Analyze Anton's recent meeting summaries and transcripts to produce Russian communication insights, meeting-memory reminders, follow-up risks, negotiation patterns, conflict/avoidance signals, and practical coaching recommendations. Use when Anton asks how recent meetings went, what to remember from calls, where he was persuasive, where he avoided conflict, how he handled negotiations, or wants a communication/leadership review from meetings.
 metadata:
   short-description: Meeting communication insights for Anton
+model: sonnet
 ---
 
 # Meeting Insights Analyzer

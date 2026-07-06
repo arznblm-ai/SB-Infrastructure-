@@ -3,6 +3,7 @@ name: git-update
 description: Safely sync Anton's Second Brain infrastructure changes into the private SB-Infrastructure Git repository, run guardrail scans for secrets/private data/runtime folders, create a clean git commit, and optionally push when terminal GitHub auth works. Use when Anton asks to update Git, commit infrastructure changes, sync Second Brain infrastructure to GitHub, make a safe infra snapshot, or "занеси изменения инфраструктуры в git".
 metadata:
   short-description: Safely commit Second Brain infrastructure changes to Git
+model: haiku
 ---
 
 # Git Update
@@ -10,6 +11,8 @@ metadata:
 Use this skill to snapshot Anton's reusable Second Brain infrastructure into the private Git repo:
 
 `/Users/anton/AI AGENT FOLDER/SB-Infrastructure-`
+
+It takes whitelisted infrastructure files from the vault, mirrors them into that repo, runs secret/private-data safety scans, and produces a clean commit; push stays on GitHub Desktop unless Anton explicitly asks for terminal push.
 
 The skill must never commit the full Second Brain. It only syncs a whitelist of reusable infrastructure files and runs safety checks before committing.
 

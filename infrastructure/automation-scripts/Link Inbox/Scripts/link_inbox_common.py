@@ -65,6 +65,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cookies_from_browser": "",
         "cookies": "",
     },
+    # LLM enrichment ("разбор") runs automatically on save via headless `claude -p`.
+    "enrich": {
+        "auto": True,
+        "model": "claude-haiku-4-5-20251001",
+    },
     "review": {
         "max_items": 12,
     },

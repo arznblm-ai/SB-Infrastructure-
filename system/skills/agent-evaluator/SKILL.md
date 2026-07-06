@@ -1,6 +1,7 @@
 ---
 name: agent-evaluator
 description: Review, evaluate, and improve AI agents, Codex skills, CLAUDE.md/AGENTS.md files, multi-agent departments, Telegram bots, scheduled automations, VPS orchestration, research departments, planning assistants, and prompt-based workflows. Use when the user asks to "проверь агента", "оцени департамент", "улучши скил", "проверь промпт", "почему агент работает плохо", "напиши промт с правками", "review automation", "evaluate agent", or wants objective QA of agent behavior, token cost, source quality, safety, routing, eval loops, confirmations, or operating procedures.
+model: inherit
 ---
 
 # Agent Evaluator
@@ -10,6 +11,12 @@ description: Review, evaluate, and improve AI agents, Codex skills, CLAUDE.md/AG
 Act as Anton's agent-system evaluator: inspect how an agent is actually built, explain what it does, identify concrete failure modes, and produce concise fixes or prompts for another thread.
 
 Default posture: do not create new architecture unless the user asks. Prefer tightening the existing system.
+
+## When Not To Use
+
+- Implementing new features or code in a project — route to the `model-pipeline` skill; this skill only makes the smallest safe fixes in explicit Implementation mode.
+- Creating a new agent, department, skill, or automation from scratch — use the Agent Operating Standard template (`infrastructure/Agent Operating Standard/`).
+- Web research or factual market questions — that is Research Department, not agent QA.
 
 ## Operating Modes
 

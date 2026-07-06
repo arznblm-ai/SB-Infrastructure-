@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from link_inbox_common import (
@@ -28,12 +29,27 @@ INDEX_SCRIPT = Path(__file__).resolve().parent / "build_external_resources_index
 TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 DESC_RE = re.compile(r'(?is)<meta\s+[^>]*(?:name|property)=["\'](?:description|og:description)["\'][^>]*content=["\'](.*?)["\']')
 MARKDOWN_H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
+# A downloadable Instagram video lives under /reel/, /reels/, /p/ or /tv/.
+# A bare profile (instagram.com/username) or other page has no single video.
+INSTAGRAM_VIDEO_PATH_RE = re.compile(r"/(reel|reels|p|tv)/", re.IGNORECASE)
 TRANSIENT_UGC_ERRORS = (
     "failed to resolve",
     "read timed out",
     "connection timed out",
     "temporarily unavailable",
     "remote end closed connection",
+)
+# Markers that mean "not a transient/code bug" — Instagram needs auth or the
+# post is unavailable. Recoverable once cookies are fixed or a public URL is sent.
+UGC_AUTH_ERRORS = (
+    "empty media response",
+    "login required",
+    "login_required",
+    "rate-limit",
+    "rate limit",
+    "requested content is not available",
+    "this content isn't available",
+    "use --cookies",
 )
 
 
@@ -125,6 +141,16 @@ def process_web(record: dict, logger) -> None:
 def process_ugc_video(config: dict, record: dict, logger) -> None:
     if not UGC_SCRIPT.exists():
         raise RuntimeError(f"UGC Downloader script missing: {UGC_SCRIPT}")
+    if record.get("kind") == "instagram" and not INSTAGRAM_VIDEO_PATH_RE.search(urlparse(record["url"]).path):
+        record["status"] = "needs_manual_processing"
+        record["excerpt"] = (
+            "Это ссылка на профиль/канал Instagram. Бот не выкачивает каналы автоматически (риск для аккаунта). "
+            "Разбор канала за 30 дней — агентный флоу: пришли список ссылок на reels или попроси агента "
+            "(skill instagram-reel-analyzer, batch_reels.py) — он скачает и полностью разберёт каждый reel в папку автора. "
+            "Для одного видео пришли ссылку вида instagram.com/reel/… или /p/…"
+        )
+        logger.info(f"Skipping non-video Instagram URL (profile/page): {record['url']}")
+        return
     ugc_cfg = config.get("ugc", {})
     command = [
         "python3",
@@ -160,6 +186,15 @@ def process_ugc_video(config: dict, record: dict, logger) -> None:
     if result.stderr:
         logger.warning(result.stderr.strip())
     if result.returncode != 0:
+        combined = f"{result.stdout}\n{result.stderr}".lower()
+        if any(marker in combined for marker in UGC_AUTH_ERRORS):
+            record["status"] = "needs_manual_processing"
+            record["excerpt"] = (
+                "Instagram не отдал видео — нужна авторизация (cookies) или пост недоступен/приватный. "
+                "Проверь ugc.cookies_from_browser в ~/.config/link-inbox/config.json и что пост публичный."
+            )
+            logger.warning(f"UGC needs auth or unavailable: {record['url']}")
+            return
         raise RuntimeError(f"ugc downloader failed with code {result.returncode}")
 
     transcript_path = ""
@@ -199,6 +234,20 @@ def rebuild_external_resources_index(config: dict, logger) -> None:
         logger.warning(f"External resources index rebuild failed with code {result.returncode}")
 
 
+def maybe_auto_enrich(config: dict, note_path, logger) -> None:
+    """Run LLM enrichment ("разбор") on save. Best-effort: if it fails, the note
+    stays `pending` and the backlog/scheduled run picks it up later."""
+    enrich_cfg = config.get("enrich", {})
+    if not enrich_cfg.get("auto", True) or not note_path:
+        return
+    try:
+        from enrich_note_llm import enrich_one
+        status = enrich_one(Path(note_path), enrich_cfg.get("model") or "claude-haiku-4-5-20251001")
+        logger.info(f"auto-enrich {status}: {note_path}")
+    except Exception as exc:
+        logger.warning(f"auto-enrich failed (note stays pending, backlog will catch it): {exc}")
+
+
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
@@ -232,7 +281,8 @@ def main() -> int:
             else:
                 process_web(record, logger)
             if record.get("status") == "processed":
-                write_external_resource_note(config, record)
+                note_path = write_external_resource_note(config, record)
+                maybe_auto_enrich(config, note_path, logger)
             write_link_note(config, record)
             state["links"][uid] = record
             processed += 1

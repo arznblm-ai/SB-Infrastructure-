@@ -1,6 +1,7 @@
 ---
 name: productivity-review
 description: Analyze Anton's productivity from Google Calendar, past Focus calendar events, Daily Focus planning logs, and Second Brain context. Use when Anton asks for weekly, monthly, yearly, end-of-week, end-of-month, productivity, calendar hours, work/study/fitness time, progress review, or accumulated productivity statistics under the Productivity Review branch.
+model: sonnet
 ---
 
 # Productivity Review

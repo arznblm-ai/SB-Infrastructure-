@@ -1,6 +1,7 @@
 ---
 name: youtube-transcribe
 description: Transcribe public YouTube videos from a URL into Markdown notes, then optionally run `transcript-summarizer` and save the resulting summary into Second Brain. Use when the user pastes a YouTube link and wants the external-resource transcript stored in `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources` unless they explicitly route it to a course, meeting, or project folder.
+model: haiku
 ---
 
 # YouTube Transcribe
@@ -24,7 +25,7 @@ This skill is for **public YouTube links**. If the video is private, login-gated
 3. For external saved links, use the default external resources destination and usually `--skip-summary` unless the user asks for a full education/meeting summary.
 4. If the YouTube video is explicitly a course, lecture, workshop, meeting, or user asks for a processed summary, let the script call [$transcript-summarizer](/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md) on the new transcript.
 5. Verify that the transcript note was created in the chosen destination and, when summary routing was requested, the summary was created in `education/` or `meetings/`.
-5. Preview the first lines and report both saved paths back to the user.
+6. Preview the first lines and report both saved paths back to the user.
 
 ## Destination Rules
 
@@ -98,6 +99,8 @@ After transcription and summary creation:
 3. Preview the first lines of the transcript.
 4. Preview the first lines of the summary.
 5. Tell the user the exact saved paths.
+6. Check that the transcript is not empty and its word count is plausible for the video length — a note cut off after the first seconds means the run failed.
+7. If the script exits with an error, show its stderr to the user. Do not report success and do not fabricate a transcript or summary.
 
 ## Resource
 

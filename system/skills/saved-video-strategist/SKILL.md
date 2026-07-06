@@ -1,9 +1,12 @@
 ---
 name: saved-video-strategist
 description: Analyze Anton's saved Telegram/Link Inbox videos and external-resource summaries through Strategic Board lenses, while always preserving the core summary of each saved item. Use when Anton asks for insights from saved videos/links, asks what is useful from today's saved videos, wants Strategic Board analysis of saved reels/posts, or wants to turn saved content into practical ideas for his projects. If no strong Anton-specific insight is visible, provide a clear summary anyway instead of discarding the item as noise.
+model: sonnet
 ---
 
 # Saved Video Strategist
+
+This skill reads Anton's saved-link summaries from the Link Inbox layer (`transcripts/external resources/index.md` + `resources/link-inbox/summaries/`, full transcripts only as fallback) and returns a compact readout in chat: the preserved core summary of each saved item plus a Strategic Board layer where a clear connection to Anton's projects exists.
 
 ## Purpose
 

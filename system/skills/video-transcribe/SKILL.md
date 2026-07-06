@@ -1,6 +1,7 @@
 ---
 name: video-transcribe
 description: Transcribe local video files into Markdown notes with faster-whisper. Save course/meeting raw transcripts into `transcripts/` for transcript-summarizer, but save short external videos, reels, X/Twitter videos, TikToks, YouTube Shorts, and similar internet clips into `transcripts/external resources/` unless the user asks otherwise.
+model: haiku
 ---
 
 # Video Transcribe
@@ -85,6 +86,9 @@ After transcription:
 3. For `transcripts/external resources/`, do not require an `education/` or `meetings/` summary.
 4. Preview the first lines of the transcript.
 5. Report the saved path back to the user.
+6. Check that the transcript is not empty and its word count is plausible for the video length — a file cut off after the first seconds is a failed run, not a success.
+7. Confirm the file landed in the folder required by the Destination Rules (`transcripts/` vs `transcripts/external resources/`).
+8. If the script exits with an error, show its stderr to the user. Do not report success and do not fabricate a transcript or summary.
 
 ## Resource
 

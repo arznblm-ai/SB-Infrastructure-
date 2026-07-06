@@ -25,6 +25,23 @@ def read_text(path: str | None, max_chars: int = 18000) -> str:
     return p.read_text(encoding="utf-8", errors="replace")[:max_chars]
 
 
+def read_enriched(record: dict) -> dict | None:
+    """If the resource note has been LLM-enriched (`enrichment: done`), pull its
+    smart sections so the bot reply shows the actual разбор, not heuristics."""
+    path = record.get("summary_path") or record.get("transcript_path")
+    text = read_text(path, max_chars=9000)
+    if not text or "enrichment: done" not in text[:600]:
+        return None
+    def sec(h: str) -> str:
+        m = re.search(rf"^##\s+{re.escape(h)}\s*\n(.*?)(?=^##\s+|\Z)", text, flags=re.M | re.S)
+        return m.group(1).strip() if m else ""
+    return {
+        "essence": sec("Суть"),
+        "insights": sec("Главные инсайты"),
+        "links": sec("Полезные ссылки"),
+    }
+
+
 def compact(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return text
@@ -371,8 +388,26 @@ def build_record_digest(record: dict) -> str:
     transcript_items = transcript_lines(transcript)
     tools = extract_numbered_tools(transcript_items)
     rich = build_rich_summary(record, meta, transcript, transcript_items, tools)
+    title = rich["title"] or human_title(record, meta)
+
+    enriched = read_enriched(record)
+    if enriched:
+        out = [f"Сохранил и разобрал: {title}", ""]
+        if enriched["essence"]:
+            out += ["Суть:", f"- {compact(enriched['essence'])[:500]}", ""]
+        ins = [ln for ln in enriched["insights"].splitlines() if ln.strip().startswith("- ")][:3]
+        if ins:
+            out += ["Инсайты:", *ins, ""]
+        link_lines = [ln for ln in enriched["links"].splitlines() if ln.strip().startswith("- ")][:5]
+        if link_lines and "not found" not in link_lines[0]:
+            out += ["Ссылки:", *link_lines, ""]
+        out += ["Сохранено:", "- index: transcripts/external resources/index.md"]
+        if record.get("summary_path"):
+            out.append(f"- заметка: {short_path(record['summary_path'])}")
+        return "\n".join(out).strip()
+
     lines = [
-        f"Сохранил: {rich['title'] or human_title(record, meta)}",
+        f"Сохранил: {title}",
         "",
     ]
 
@@ -388,8 +423,9 @@ def build_record_digest(record: dict) -> str:
     description = meta.get("description") or ""
     about = str(rich["about"])
 
-    lines.append("О чём видео:")
-    lines.append(f"- {about[:620].rstrip()}")
+    if status != "needs_manual_processing":
+        lines.append("О чём видео:")
+        lines.append(f"- {about[:620].rstrip()}")
 
     insights = list(rich.get("insights") or [])
     if insights:
@@ -413,7 +449,9 @@ def build_record_digest(record: dict) -> str:
             lines.append(f"- Caption: {description}")
 
     system_lines = list(rich.get("system") or [])
-    if system_lines:
+    if status == "needs_manual_processing" and record.get("excerpt"):
+        lines.extend(["", "⚠️ Требует ручной обработки:", f"- {compact(str(record['excerpt']))}"])
+    elif system_lines:
         lines.extend(["", "Система автора:"])
         for item in system_lines[:4]:
             lines.append(f"- {item}")

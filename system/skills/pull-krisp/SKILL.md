@@ -1,9 +1,12 @@
 ---
 name: pull-krisp
 description: Pull recent Krisp meeting transcripts into Anton's Second Brain on command, then run transcript summarization so raw Krisp notes land in transcripts/ and structured summaries land in meetings/ or education/. Use when Anton says "pull krisp", "забери транскрипты из Krisp", "подтяни встречи", "импортируй Krisp", or asks to manually fetch recent meeting transcripts.
+model: haiku
 ---
 
 # Pull Krisp
+
+On command, this skill pulls ready meeting transcripts from Krisp (MCP + `krisp_import_all.py`) into `transcripts/`, then runs the summarizer so structured summaries land in `meetings/` or `education/`.
 
 This skill is the manual command layer for the existing Krisp -> Second Brain pipeline.
 
@@ -60,6 +63,16 @@ After running, report:
 - next action only if needed
 
 Keep the response short. Do not paste full logs unless Anton asks.
+
+## Verification
+
+Before reporting success:
+
+1. Check that the new/updated transcript files actually exist in `transcripts/` (e.g. list the most recent files for the lookback window).
+2. Open at least one new transcript and confirm it is not empty and not cut off after the first seconds; a real meeting transcript has a plausible word count.
+3. Confirm raw notes landed in `transcripts/` — not in `meetings/`, `education/`, or `transcripts/external resources/`.
+4. If summarization ran, confirm the corresponding summary notes appeared in `meetings/` or `education/`.
+5. If the script failed, show the exact stderr/error output to Anton. Never report success the script did not actually produce.
 
 ## Failure Handling
 

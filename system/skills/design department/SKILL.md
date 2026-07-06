@@ -1,6 +1,7 @@
 ---
 name: design department
 description: "Operating system for presentation design: use Design Department when a request should enter through `design-orchestrator`, be classified into the right workflow mode, routed through specialist roles, and return with explicit artifacts plus review status."
+model: sonnet
 ---
 
 # Design Department
@@ -84,3 +85,9 @@ description: "Operating system for presentation design: use Design Department wh
 3. Orchestrator сам читает [references/router.md](./references/router.md), выбирает workflow mode и решает sequence of roles.
 4. Specialist roles используются не напрямую по умолчанию, а как исполнители внутри orchestrated workflow.
 5. Если нужен быстрый рабочий запуск, бери шаблоны из `launch-templates/`, но sequencing всё равно валидируй через orchestrator contracts в `references/`.
+
+## Когда НЕ использовать
+
+- Для правок текста, копирайтинга или структуры документа без визуальной/презентационной задачи
+- Для кодовых и инфраструктурных задач — это model-pipeline и соответствующие infrastructure-проекты, а не design department
+- Когда Антон просит только критику существующего дизайна без производства новых слайдов — достаточно роли `presentation-generator-critic`, полный department-цикл с brief и orchestrator не нужен

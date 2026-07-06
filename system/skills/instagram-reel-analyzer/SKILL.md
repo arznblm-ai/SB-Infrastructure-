@@ -1,6 +1,7 @@
 ---
 name: instagram-reel-analyzer
-description: Analyze Instagram Reels from reel URLs or downloaded reel videos, extract metadata and transcript, find mentioned tools/links, run a post-analysis with Strategic Board when business/product relevance exists, and save a searchable Markdown note with summary, insights, reusable solutions, skills, source links, and strategic implications. Use when the user sends an Instagram reel link, asks to разбери/проанализируй рилс из инстаграма, wants reel transcripts saved for future search, asks for strategic/business implications of a reel, or asks to build an insight library from Instagram reels.
+description: "Analyze Instagram Reels from reel URLs or downloaded reel videos, extract metadata and transcript, find mentioned tools/links, run a post-analysis with Strategic Board when business/product relevance exists, and save a searchable Markdown note with summary, insights, reusable solutions, skills, source links, and strategic implications. Also handles a whole channel/author over the last ~30 days: batch-download their reels into a per-author folder and fully analyze each. Use when the user sends an Instagram reel link, sends a profile/channel link, asks to разбери/проанализируй рилс или канал из инстаграма, asks to download a creator's reels for the last 30 days, wants reel transcripts saved for future search, asks for strategic/business implications of a reel, or asks to build an insight library from Instagram reels."
+model: sonnet
 ---
 
 # Instagram Reel Analyzer
@@ -103,6 +104,29 @@ python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scr
 Repeatable flags (`--summary`, `--insight`, `--solution`, `--link`, `--tool`, `--strategic`) can be passed multiple times. Only the sections you pass are overwritten; the transcript is preserved.
 
 > `scripts/write_reel_note.py` is DEPRECATED (kept as a fallback that now writes into the canonical folder). Prefer the unified builder above.
+
+## Channel / batch workflow (per-author folder)
+
+Use when Anton sends a profile/channel link or says "разбери канал X за 30 дней".
+
+**Account-safety rule (decided by Anton):** never bulk-scrape a profile feed via an API/instaloader — that risks an Instagram flag/ban. yt-dlp also cannot enumerate IG profiles. So the reel list is obtained WITHOUT automated profile scraping.
+
+1. **Get the reel list (no profile scraping):**
+   - Preferred: ask Anton to paste the reel URLs, or
+   - Gather them manually in-session via the browser (Chrome MCP / computer-use) by opening his logged-in profile and reading the visible recent reels. Keep it low-volume and interactive.
+   - Keep only video **reels** published in the **last ~30 days**.
+2. **Batch download + auto notes into the author folder:**
+   ```bash
+   python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/batch_reels.py" \
+     --author <username> "https://www.instagram.com/reel/AAA/" "https://www.instagram.com/reel/BBB/" ...
+   ```
+   This downloads + transcribes each into `transcripts/external resources/<username>/` and builds the auto note. It dedups by shortcode and rejects non-reel URLs. (Cookies come from `ugc.cookies_from_browser` in the config — downloading specific reels is low risk.)
+3. **Fully analyze EACH built note** (this is the LLM tier — you do it): for every note in the author folder run the enrich command with суть, инсайты, готовые решения, Strategic Board and verified links:
+   ```bash
+   python3 ".../external_resource_note.py" --path "<author folder>/<note>.md" --summary "…" --essence "…" --insight "…" --solution "…" --strategic "…" --link "Name=https://…"
+   ```
+4. **Rebuild the index:** `python3 ".../build_external_resources_index.py"` — author-folder notes appear with a `Канал:` label.
+5. **Optional channel rollup:** after enriching, write a short `transcripts/external resources/<username>/_channel-rollup.md` summarizing recurring hooks, formats, tools and 3-5 reusable patterns across the channel.
 
 ## Instagram Extraction Hints
 
