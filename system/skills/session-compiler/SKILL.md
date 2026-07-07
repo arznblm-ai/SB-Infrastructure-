@@ -16,7 +16,7 @@ model: sonnet
 
 | Слой | Путь | Правило |
 |---|---|---|
-| Raw (не трогать) | `sessions/*.md`, `sessions/codex/*.md` | Только чтение. Auto-import, владелец — Claude to obsidian |
+| Raw (не трогать) | `sessions/claude/exports/**/*.md`, `sessions/codex/exports/**/*.md`; legacy-архив `sessions/*.md` (до 2026-07-06, новых не появляется) | Только чтение. Auto-import, владелец — Claude to obsidian |
 | Daily log | `sessions/compiled/daily/{self} {summary} sessions daily log – YYYY-MM-DD.md` | Один файл на день, в котором были сессии |
 | Topic-статьи | `sessions/compiled/topics/{self} {analysis} <тема> – YYYY-MM-DD.md` | Живые документы; дата в имени = дата создания, актуальность — в frontmatter `updated:` |
 | Журнал | `sessions/compiled/log.md` | Append-only: что и когда компилятор изменил (аудит-трейл + state последнего прогона) |
@@ -24,7 +24,7 @@ model: sonnet
 ## Workflow
 
 1. **Определи окно.** Прочитай последнюю запись `sessions/compiled/log.md` → компилируй сессии с датой позже последнего прогона. Если журнал пуст — возьми последние 7 дней (или окно, названное Антоном).
-2. **Собери новые сессии.** `ls` по `sessions/` и `sessions/codex/`, отфильтруй по дате из имени/frontmatter. Крупные транскрипты читай выборочно: заголовок, [user]-реплики и финальные ответы важнее промежуточных tool-call строк.
+2. **Собери новые сессии.** `ls` по `sessions/claude/exports/YYYY/MM/` и `sessions/codex/exports/YYYY/MM/` (плоский `sessions/` — legacy-архив до 2026-07-06, для старых окон), отфильтруй по дате из имени/frontmatter. Крупные транскрипты читай выборочно: заголовок, [user]-реплики и финальные ответы важнее промежуточных tool-call строк.
    Правила подсчёта (из опыта первого прогона 2026-07-06):
    - **Единица — сессия, не файл.** Report-артефакты рядом с транскриптом (`{automation} {report} …` той же даты/задачи) — часть той же сессии.
    - **Дубликаты `session_id`** (Codex-экспортёр иногда пишет partial + complete): бери файл с бóльшим числом сообщений, partial игнорируй.
