@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 
+from task_owner import classify_owner
+
 VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
 DAILY_DIR = VAULT / "infrastructure" / "daily focus"
 ENV_FILE = Path("/Users/anton/.config/second-brain/daily-focus.env")
@@ -30,6 +32,9 @@ DAILY_MESSAGES_DIR = DAILY_DIR / "daily focus messages"
 PLANNING_INBOX_DIR = DAILY_DIR / "planning inbox"
 PLANNING_MEMORY_DIR = DAILY_DIR / "planning memory"
 MEETING_ACTION_CANDIDATES_DIR = DAILY_DIR / "meeting action candidates"
+MEETING_TODO_DIR = DAILY_DIR / "meeting todo"
+MEETING_NOTES_STATE_FILE = STATE_DIR / "meeting-notes-state.json"
+MEETING_NOTES_SCRIPT = DAILY_DIR / "Scripts" / "meeting_notes.py"
 STRATEGIC_REVIEW_DIR = DAILY_DIR / "strategic planning reviews"
 STRATEGIC_BOARD_SKILL = Path("/Users/anton/.codex/skills/strategic-board/SKILL.md")
 DEFAULT_CALENDAR_NAME = "a.rznblm@gmail.com"
@@ -137,23 +142,43 @@ def get_updates(token: str, offset: int | None, timeout: int = 50) -> list[dict]
     return payload.get("result", [])
 
 
-def send_message(token: str, chat_id: str, text: str) -> None:
+def send_message(token: str, chat_id: str, text: str, reply_markup: dict | None = None) -> None:
     chunks = []
     remaining = text.strip() or "(empty response)"
     while remaining:
         chunks.append(remaining[:3500])
         remaining = remaining[3500:]
-    for chunk in chunks:
-        telegram_request(
-            token,
-            "sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": chunk,
-                "disable_web_page_preview": "true",
-            },
-            timeout=30,
-        )
+    for index, chunk in enumerate(chunks):
+        data = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "disable_web_page_preview": "true",
+        }
+        if reply_markup and index == len(chunks) - 1:
+            data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        telegram_request(token, "sendMessage", data=data, timeout=30)
+
+
+def answer_callback_query(token: str, callback_id: str, text: str = "") -> None:
+    data = {"callback_query_id": callback_id}
+    if text:
+        data["text"] = text
+    try:
+        telegram_request(token, "answerCallbackQuery", data=data, timeout=15)
+    except Exception as exc:
+        log(f"answerCallbackQuery warning: {exc}")
+
+
+def edit_message_text(token: str, chat_id: str, message_id: str, text: str, reply_markup: dict | None = None) -> None:
+    data = {
+        "chat_id": chat_id,
+        "message_id": str(message_id),
+        "text": text[:3500],
+        "disable_web_page_preview": "true",
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    telegram_request(token, "editMessageText", data=data, timeout=15)
 
 
 def send_typing(token: str, chat_id: str) -> None:
@@ -641,6 +666,11 @@ def build_help_message() -> str:
         "/plan — добавить список дел в Planning Inbox",
         "/focus — быстрый план по текущим задачам",
         "/actions — кандидаты задач из встреч на подтверждение",
+        "/todo — мои задачи из встреч, кнопка ✔ закрывает",
+        "/todo_done T1 T2 — закрыть текстом, /todo_drop T3 — убрать",
+        "/todo_claim T16 — взять себе задачу без исполнителя (кнопка ➕ в саммари встречи)",
+        "/meetings — список последних встреч",
+        "/meeting N — детальное саммари встречи (без N — последняя)",
         "/calendar_status — что уже стоит в календаре",
         "/calendar_review — что закрыто/в процессе по Focus-слотам",
         "/done задача — ручной override выполнения",
@@ -671,6 +701,7 @@ def build_bot_status() -> str:
         f"Auto-Codex questions: {'on' if AUTO_CODEX_FOR_QUESTIONS else 'off'}",
         f"Active planning tasks: {len(tasks)}",
         f"Pending meeting actions: {len(pending_actions)}",
+        f"Open meeting todos: {len(open_meeting_todos())}",
         f"Pending calendar slots: {len(pending_slots)}",
         f"Today's brief: {'yes' if latest_brief else 'no'}",
     ]
@@ -1276,22 +1307,22 @@ def candidate_by_id(ids: list[str]) -> tuple[list[dict[str, str]], list[str]]:
     return [found[item] for item in normalized_ids if item in found], missing
 
 
-def replace_candidate_status_in_block(block: list[str], new_status: str) -> list[str]:
+def replace_block_field(block: list[str], field: str, value: str) -> list[str]:
     replaced = False
     result: list[str] = []
     for line in block:
-        if line.strip().startswith("status:"):
+        if line.strip().startswith(f"{field}:"):
             indent = line[:len(line) - len(line.lstrip())]
-            result.append(f"{indent}status: {new_status}")
+            result.append(f"{indent}{field}: {value}")
             replaced = True
         else:
             result.append(line)
     if not replaced:
-        result.append(f"  status: {new_status}")
+        result.append(f"  {field}: {value}")
     return result
 
 
-def update_candidates_status(candidates: list[dict[str, str]], new_status: str) -> int:
+def update_candidates_field(candidates: list[dict[str, str]], field: str, value: str, files: list[Path] | None = None) -> int:
     targets_by_file: dict[str, set[str]] = {}
     for candidate in candidates:
         file_path = candidate.get("file", "")
@@ -1300,7 +1331,7 @@ def update_candidates_status(candidates: list[dict[str, str]], new_status: str) 
             targets_by_file.setdefault(file_path, set()).add(candidate_id)
 
     changed = 0
-    for path in candidate_files():
+    for path in (files if files is not None else candidate_files()):
         target_ids = targets_by_file.get(str(path), set())
         if not target_ids:
             continue
@@ -1321,7 +1352,7 @@ def update_candidates_status(candidates: list[dict[str, str]], new_status: str) 
                     block.append(lines[index])
                     index += 1
                 if candidate_id in target_ids:
-                    block = replace_candidate_status_in_block(block, new_status)
+                    block = replace_block_field(block, field, value)
                     changed += 1
                     file_changed = True
                 output.extend(block)
@@ -1331,6 +1362,10 @@ def update_candidates_status(candidates: list[dict[str, str]], new_status: str) 
         if file_changed:
             path.write_text("\n".join(output) + "\n", encoding="utf-8")
     return changed
+
+
+def update_candidates_status(candidates: list[dict[str, str]], new_status: str, files: list[Path] | None = None) -> int:
+    return update_candidates_field(candidates, "status", new_status, files=files)
 
 
 def clear_pending_meeting_actions() -> int:
@@ -1373,6 +1408,163 @@ def build_actions_message() -> str:
         "Очистить всё: /actions_clear",
     ])
     return "\n".join(lines)
+
+
+def todo_files(limit: int | None = None) -> list[Path]:
+    if not MEETING_TODO_DIR.exists():
+        return []
+    files = [p for p in MEETING_TODO_DIR.iterdir() if p.is_file() and p.suffix == ".md"]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return files if limit is None else files[:limit]
+
+
+def todo_owner(item: dict[str, str]) -> str:
+    """me/other/unknown; блоки без owner: классифицируем по who на лету."""
+    owner = item.get("owner", "").strip()
+    if owner in {"me", "other", "unknown"}:
+        return owner
+    return classify_owner(item.get("who", ""))
+
+
+def open_meeting_todos() -> list[dict[str, str]]:
+    todos: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    for path in todo_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for item in parse_meeting_action_candidates(text, path):
+            if item.get("status", "") != "open":
+                continue
+            if todo_owner(item) != "me":
+                continue
+            key = task_key(item.get("task", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            todos.append(item)
+    return todos
+
+
+def todo_by_id(ids: list[str]) -> tuple[list[dict[str, str]], list[str]]:
+    normalized_ids = [item.upper() for item in ids]
+    found: dict[str, dict[str, str]] = {}
+    for path in todo_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for item in parse_meeting_action_candidates(text, path):
+            item_id = item.get("id", "").upper()
+            if item_id in normalized_ids and item_id not in found:
+                found[item_id] = item
+    missing = [item for item in normalized_ids if item not in found]
+    return [found[item] for item in normalized_ids if item in found], missing
+
+
+def build_todo_message() -> str:
+    todos = open_meeting_todos()
+    if not todos:
+        return "Meeting TODO: открытых задач из встреч нет."
+    by_meeting: dict[str, list[dict[str, str]]] = {}
+    for todo in todos:
+        source = todo.get("source_meeting", "unknown").strip()
+        by_meeting.setdefault(source, []).append(todo)
+    lines = [f"Meeting TODO — открыто: {len(todos)}", ""]
+    for source, items in by_meeting.items():
+        display = re.sub(r"\s+", " ", source)
+        if len(display) > 60:
+            display = display[:57].rstrip() + "..."
+        lines.append(f"{display}:")
+        for todo in items:
+            task = todo.get("task", "unknown").strip()
+            if len(task) > 90:
+                task = task[:87].rstrip() + "..."
+            entry = f"{todo.get('id', '?')}. {task}"
+            who = todo.get("who", "").strip()
+            if who and who != "unknown":
+                entry += f" — {who}"
+            deadline = todo.get("deadline", "").strip()
+            if deadline and deadline != "unknown":
+                entry += f" (до {deadline})"
+            lines.append(entry)
+        lines.append("")
+    first_id = todos[0].get("id", "T1")
+    lines.append(f"Кнопка ✔ закрывает задачу. Текстом: /todo_done {first_id} · убрать: /todo_drop {first_id}")
+    return "\n".join(lines)
+
+
+def build_todo_keyboard(todos: list[dict[str, str]]) -> dict | None:
+    buttons = [
+        {"text": f"✔ {todo.get('id', '?')}", "callback_data": f"todo_done:{todo.get('id', '?')}"}
+        for todo in todos[:30]
+        if todo.get("id")
+    ]
+    if not buttons:
+        return None
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    return {"inline_keyboard": rows}
+
+
+def read_meeting_notes_state() -> list[dict[str, str]]:
+    """Sent-встречи Meeting Notes Assistant, новые первыми: key, title, date."""
+    try:
+        data = json.loads(MEETING_NOTES_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    meetings = []
+    for key, entry in (data.get("meetings") or {}).items():
+        if entry.get("status") != "sent":
+            continue
+        meetings.append({
+            "key": key,
+            "title": entry.get("title", "unknown"),
+            "date": entry.get("date", ""),
+            "has_detail": bool((entry.get("summary") or {}).get("detailed_lines")),
+        })
+    meetings.sort(key=lambda item: item["date"], reverse=True)
+    return meetings
+
+
+def format_meeting_date(date: str) -> str:
+    try:
+        return dt.datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m")
+    except ValueError:
+        return date
+
+
+def build_meetings_message() -> str:
+    meetings = read_meeting_notes_state()[:7]
+    if not meetings:
+        return "Встреч в Meeting Notes пока нет."
+    lines = ["Последние встречи:"]
+    for index, meeting in enumerate(meetings, start=1):
+        title = meeting["title"]
+        if len(title) > 60:
+            title = title[:57].rstrip() + "..."
+        lines.append(f"{index}. {title} — {format_meeting_date(meeting['date'])}")
+    lines.extend(["", "Детали: /meeting 1 (или просто /meeting — последняя)"])
+    return "\n".join(lines)
+
+
+def meeting_detail_text(index: int) -> str:
+    meetings = read_meeting_notes_state()
+    if not meetings:
+        return "Встреч в Meeting Notes пока нет."
+    if index < 1 or index > len(meetings):
+        return f"Есть встречи 1–{min(len(meetings), 7)}, см. /meetings"
+    meeting = meetings[index - 1]
+    command = [sys.executable or "/usr/bin/python3", str(MEETING_NOTES_SCRIPT), "--detail", meeting["key"]]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return "Детальное саммари не успело сгенерироваться (timeout). Попробуй ещё раз."
+    output = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not output:
+        log(f"meeting detail failed rc={proc.returncode}: {(proc.stderr or output)[:200]}")
+        return "Не получилось собрать детали встречи. Лог: ~/Library/Logs/meeting-notes.log"
+    return output
 
 
 def read_calendar_events(days: int = CALENDAR_PLANNING_DAYS, start_date: dt.date | None = None) -> list[dict[str, str]]:
@@ -2398,6 +2590,58 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         log_route("ping", codex=False)
         send_message(token, chat_id, "pong")
         return
+    if normalized in {"/todo", "todo"}:
+        log_route("todo", codex=False)
+        send_message(token, chat_id, build_todo_message(), reply_markup=build_todo_keyboard(open_meeting_todos()))
+        return
+    if normalized in {"/meetings", "meetings"}:
+        log_route("meetings", codex=False)
+        send_message(token, chat_id, build_meetings_message())
+        return
+    if normalized == "/meeting" or normalized.startswith("/meeting "):
+        arg = normalized[len("/meeting"):].strip()
+        index = int(arg) if arg.isdigit() else 1
+        log_route("meeting_detail", codex=False, detail=str(index))
+        send_typing(token, chat_id)
+        send_message(token, chat_id, meeting_detail_text(index))
+        return
+    if normalized.startswith("/todo_claim"):
+        ids = re.findall(r"\bT\d+\b", normalized, flags=re.IGNORECASE)
+        if not ids:
+            send_message(token, chat_id, "Укажи id задач, например: /todo_claim T16")
+            return
+        found, missing = todo_by_id(ids)
+        to_claim = [item for item in found if todo_owner(item) != "me"]
+        already = [item for item in found if todo_owner(item) == "me"]
+        changed = update_candidates_field(to_claim, "owner", "me", files=todo_files()) if to_claim else 0
+        log_route("todo_claim", codex=False, detail=",".join(ids))
+        parts = []
+        if changed:
+            parts.append(f"Взял себе: {', '.join(item.get('id', '?') for item in to_claim)}")
+        if already:
+            parts.append(f"Уже твои: {', '.join(item.get('id', '?') for item in already)}")
+        if missing:
+            parts.append(f"Не нашёл: {', '.join(missing)}")
+        send_message(token, chat_id, ". ".join(parts) if parts else "Ничего не изменил.")
+        return
+    if normalized.startswith("/todo_done") or normalized.startswith("/todo_drop"):
+        new_status = "done" if normalized.startswith("/todo_done") else "dropped"
+        ids = re.findall(r"\bT\d+\b", normalized, flags=re.IGNORECASE)
+        if not ids:
+            command = "/todo_done" if new_status == "done" else "/todo_drop"
+            send_message(token, chat_id, f"Укажи id задач, например: {command} T1 T2")
+            return
+        found, missing = todo_by_id(ids)
+        changed = update_candidates_status(found, new_status, files=todo_files()) if found else 0
+        log_route(f"todo_{new_status}", codex=False, detail=",".join(ids))
+        parts = []
+        if changed:
+            verb = "Закрыл" if new_status == "done" else "Убрал"
+            parts.append(f"{verb}: {', '.join(item.get('id', '?') for item in found)}")
+        if missing:
+            parts.append(f"Не нашёл: {', '.join(missing)}")
+        send_message(token, chat_id, ". ".join(parts) if parts else "Ничего не изменил.")
+        return
     if is_ignored_message(normalized):
         log_route("ignored", codex=False, detail=normalized)
         if normalized in {"спасибо", "спс"}:
@@ -2651,6 +2895,97 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
     return
 
 
+def handle_callback(token: str, allowed_chat_id: str, callback: dict) -> None:
+    callback_id = str(callback.get("id", ""))
+    message = callback.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id", ""))
+    if chat_id != str(allowed_chat_id):
+        answer_callback_query(token, callback_id)
+        log(f"ignored callback from chat_id={chat_id}")
+        return
+    data = str(callback.get("data", ""))
+    match = re.match(r"^(todo_done|mnote_done|todo_claim):(T\d+)$", data)
+    if not match:
+        answer_callback_query(token, callback_id)
+        return
+    origin, todo_id = match.group(1), match.group(2)
+
+    if origin == "todo_claim":
+        # ➕ из per-meeting сообщения: взять unknown-задачу себе (owner → me)
+        found, _missing = todo_by_id([todo_id])
+        if not found:
+            answer_callback_query(token, callback_id, f"{todo_id} не найден")
+            return
+        if todo_owner(found[0]) == "me":
+            answer_callback_query(token, callback_id, f"{todo_id} уже твоя")
+        else:
+            update_candidates_field(found, "owner", "me", files=todo_files())
+            answer_callback_query(token, callback_id, f"➕ {todo_id} добавил в /todo")
+        log_route("todo_claim", codex=False, detail=todo_id)
+        message_id = message.get("message_id")
+        if message_id is None:
+            return
+        # кнопку ➕ заменяем на ✔, чтобы задачу можно было закрыть из этого же сообщения
+        rows = ((message.get("reply_markup") or {}).get("inline_keyboard")) or []
+        new_rows = [
+            [
+                {"text": f"✔ {todo_id}", "callback_data": f"mnote_done:{todo_id}"}
+                if b.get("callback_data") == data else b
+                for b in row
+            ]
+            for row in rows
+        ]
+        try:
+            telegram_request(token, "editMessageReplyMarkup", data={
+                "chat_id": chat_id,
+                "message_id": str(message_id),
+                "reply_markup": json.dumps({"inline_keyboard": new_rows}, ensure_ascii=False),
+            }, timeout=15)
+        except Exception as exc:
+            log(f"editMessageReplyMarkup warning: {exc}")
+        return
+
+    found, _missing = todo_by_id([todo_id])
+    if found and found[0].get("status") != "open":
+        answer_callback_query(token, callback_id, f"{todo_id} уже закрыт")
+        changed = 0
+    else:
+        changed = update_candidates_status(found, "done", files=todo_files()) if found else 0
+        if changed:
+            answer_callback_query(token, callback_id, f"✔ {todo_id} закрыт")
+        else:
+            answer_callback_query(token, callback_id, f"{todo_id} не найден")
+    log_route("todo_button", codex=False, detail=f"{origin}:{todo_id}:changed={changed}")
+
+    message_id = message.get("message_id")
+    if message_id is None:
+        return
+    if origin == "todo_done":
+        # /todo-сообщение: перерисовать список и клавиатуру
+        todos = open_meeting_todos()
+        try:
+            edit_message_text(
+                token, chat_id, str(message_id), build_todo_message(),
+                reply_markup=build_todo_keyboard(todos) or {"inline_keyboard": []},
+            )
+        except Exception as exc:
+            log(f"editMessageText warning: {exc}")
+    else:
+        # per-meeting сообщение: текст не трогаем, убираем нажатую кнопку
+        rows = ((message.get("reply_markup") or {}).get("inline_keyboard")) or []
+        new_rows = [[b for b in row if b.get("callback_data") != data] for row in rows]
+        new_rows = [row for row in new_rows if row]
+        try:
+            telegram_request(token, "editMessageReplyMarkup", data={
+                "chat_id": chat_id,
+                "message_id": str(message_id),
+                "reply_markup": json.dumps({"inline_keyboard": new_rows}, ensure_ascii=False),
+            }, timeout=15)
+        except Exception as exc:
+            log(f"editMessageReplyMarkup warning: {exc}")
+
+
 def run_loop(token: str, allowed_chat_id: str, once: bool = False) -> None:
     offset = read_offset()
     log(f"bot loop started; offset={offset}; allowed_chat_id={allowed_chat_id}")
@@ -2671,6 +3006,14 @@ def run_loop(token: str, allowed_chat_id: str, once: bool = False) -> None:
             update_id = int(update["update_id"])
             offset = update_id + 1
             write_offset(offset)
+
+            callback = update.get("callback_query")
+            if callback:
+                try:
+                    handle_callback(token, allowed_chat_id, callback)
+                except Exception as exc:
+                    log(f"callback error: {exc}")
+                continue
 
             message = update.get("message") or update.get("edited_message") or {}
             chat = message.get("chat") or {}

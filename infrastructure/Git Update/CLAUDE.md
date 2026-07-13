@@ -75,6 +75,14 @@ python3 Scripts/install_weekly_git_update_agent.py --uninstall
 - Local Git repository state in `/Users/anton/AI AGENT FOLDER/SB-Infrastructure-/`.
 - GitHub authentication available through the terminal or GitHub Desktop.
 
+## GitHub Auth (настроено 2026-07-08)
+
+- Remote `origin` переключён на SSH: `git@github.com:arznblm-ai/SB-Infrastructure-.git`.
+- Ключ: `~/.ssh/id_ed25519_github` (ed25519, без passphrase — нужен для headless LaunchAgent), прописан в `~/.ssh/config` для `github.com`.
+- Публичный ключ добавлен в GitHub-аккаунт `arznblm-ai` (comment: `anton-mac-sb-infrastructure`).
+- До 2026-07-08 push падал молча (HTTPS без кредов) — коммиты копились локально; 7 штук допушены вручную через GitHub Desktop.
+- Если push снова падает: проверь `ssh -T git@github.com` — ключ мог быть удалён из GitHub.
+
 ## Human Confirmation Gates
 
 Require Anton confirmation before changing whitelist/blacklist policy, adding new infrastructure folders to Git sync, force-pushing/rebasing/resetting, or committing any folder that may contain transcripts, meetings, sessions, runtime state, logs, tokens, or personal data.

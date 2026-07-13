@@ -8,6 +8,8 @@ model: inherit
 
 Это master skill для factual research.
 
+> **Executor policy (2026-07-11):** токеноёмкие стадии — массовое чтение источников и сборка финального HTML-отчёта — по умолчанию выполняются GPT 5.6 через Codex CLI (с `network_access=true`), чтобы не жечь лимиты Claude. Мозг (главная сессия): brief, source plan, верификация, синтез. Шаблоны вызова — `system/skills/route/SKILL.md`, секция «Контент-deliverables».
+
 Канонический department теперь живёт в `infrastructure/Research Dept/`.
 
 Он не заменяет отдельные роли внутри `Research Dept`, а даёт единый вход в department:

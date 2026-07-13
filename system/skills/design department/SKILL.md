@@ -8,6 +8,8 @@ model: sonnet
 
 Это master skill для презентационного дизайна.
 
+> **Executor policy (2026-07-11):** генерация HTML/кода слайдов — самая токеноёмкая стадия — по умолчанию выполняется GPT 5.6 через Codex CLI (руки), а не моделью сессии. Мозг (главная сессия): brief, нарратив, design direction, визуальное ревью. Шаблоны вызова и правило fallback на Opus — `system/skills/route/SKILL.md`, секция «Контент-deliverables».
+
 Он не заменяет отдельные роли, а даёт единый вход в department:
 
 - объясняет, что делает Design Department

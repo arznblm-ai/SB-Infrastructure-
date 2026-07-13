@@ -42,6 +42,13 @@ HTTP_TIMEOUT       = 30  # секунд
 STALE_PENDING_RETRY_DAYS = 3
 CALLINFO_LOOKBACK_DAYS = 7
 
+# Generic-имя не разрезолвилось через MCP (облако ещё не отдало встречу):
+# через сколько минут после начала звонка всё равно создать заметку,
+# чтобы встреча попала в retry-конвейер и в Meeting Notes, а не потерялась молча.
+GENERIC_FALLBACK_MINUTES = 45
+# ...но только для звонков длиннее порога — отсекаем случайные подключения.
+GENERIC_FALLBACK_MIN_DURATION_SEC = 600
+
 TRANSCRIPT_LOADING_PLACEHOLDER = "_Транскрипт загружается из Krisp..._"
 TRANSCRIPT_MISSING_PLACEHOLDER = "_Транскрипт не получен. Откройте Krisp и скопируйте вручную._"
 
@@ -545,6 +552,16 @@ def should_skip(call_name: str) -> bool:
     return any(re.search(p, call_name) for p in SKIP_NAME_PATTERNS)
 
 
+def generic_fallback_due(call: dict) -> bool:
+    """Пора ли создать заметку для generic-имени, которое MCP так и не разрезолвил."""
+    if call["date"] is None:
+        return False
+    if (call.get("duration_sec") or 0) < GENERIC_FALLBACK_MIN_DURATION_SEC:
+        return False
+    age_min = (datetime.now(tz=call["date"].tzinfo) - call["date"]).total_seconds() / 60
+    return age_min >= GENERIC_FALLBACK_MINUTES
+
+
 def format_duration(seconds: int) -> str:
     if not seconds:
         return ""
@@ -720,6 +737,10 @@ def main():
                         skipped += 1
                         continue
                     call = dict(call, call_name=mcp_match["name"], _mcp_id=mcp_match["id"])
+                elif generic_fallback_due(call):
+                    # Облако Krisp ещё не отдало встречу — создаём заметку с generic-именем,
+                    # дальше retry-конвейер сам вставит транскрипт и переименует.
+                    print(f"⚠ «{call['call_name']}»: не найдено в облаке Krisp — создаю заметку с generic-именем")
                 else:
                     skipped_auto += 1
                     continue
