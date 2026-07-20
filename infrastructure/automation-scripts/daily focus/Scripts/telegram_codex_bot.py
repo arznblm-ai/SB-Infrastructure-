@@ -667,6 +667,7 @@ def build_help_message() -> str:
         "/focus — быстрый план по текущим задачам",
         "/actions — кандидаты задач из встреч на подтверждение",
         "/todo — мои задачи из встреч, кнопка ✔ закрывает",
+        "/todo_add текст — добавить задачу вручную (несколько строк — несколько задач)",
         "/todo_done T1 T2 — закрыть текстом, /todo_drop T3 — убрать",
         "/todo_claim T16 — взять себе задачу без исполнителя (кнопка ➕ в саммари встречи)",
         "/meetings — список последних встреч",
@@ -1461,6 +1462,63 @@ def todo_by_id(ids: list[str]) -> tuple[list[dict[str, str]], list[str]]:
                 found[item_id] = item
     missing = [item for item in normalized_ids if item not in found]
     return [found[item] for item in normalized_ids if item in found], missing
+
+
+def add_manual_todos(texts: list[str]) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Ручное добавление задач в meeting todo (owner: me).
+    Возвращает (added, duplicates); дубли — только против открытых задач."""
+    open_by_key: dict[str, dict[str, str]] = {}
+    max_id = 0
+    for path in todo_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for item in parse_meeting_action_candidates(text, path):
+            m = re.match(r"^T(\d+)$", item.get("id", "").strip(), flags=re.IGNORECASE)
+            if m:
+                max_id = max(max_id, int(m.group(1)))
+            key = task_key(item.get("task", ""))
+            if key and item.get("status", "") == "open" and key not in open_by_key:
+                open_by_key[key] = item
+    added: list[dict[str, str]] = []
+    duplicates: list[dict[str, str]] = []
+    blocks: list[str] = []
+    now_stamp = time.strftime("%Y-%m-%d %H:%M")
+    for raw in texts:
+        task = re.sub(r"^[-*•]\s*", "", raw.strip())
+        key = task_key(task)
+        if not key:
+            continue
+        if key in open_by_key:
+            duplicates.append(open_by_key[key])
+            continue
+        max_id += 1
+        todo_id = f"T{max_id}"
+        item = {"id": todo_id, "task": task}
+        open_by_key[key] = item
+        added.append(item)
+        blocks.append(
+            f"- id: {todo_id}\n"
+            f"  task: {task}\n"
+            f"  who: Антон\n"
+            f"  owner: me\n"
+            f"  deadline: unknown\n"
+            f"  source_meeting: Добавлено вручную\n"
+            f"  source_path: telegram\n"
+            f"  status: open\n"
+            f"  created: {now_stamp}\n"
+        )
+    if blocks:
+        today = dt.date.today().isoformat()
+        todo_path = MEETING_TODO_DIR / f"{{todo}} meeting tasks – {today}.md"
+        MEETING_TODO_DIR.mkdir(parents=True, exist_ok=True)
+        is_new = not todo_path.exists()
+        with todo_path.open("a", encoding="utf-8") as f:
+            if is_new:
+                f.write(f"# Meeting TODO — {today}\n\n")
+            f.write("\n".join(blocks) + "\n")
+    return added, duplicates
 
 
 def build_todo_message() -> str:
@@ -2604,6 +2662,26 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         log_route("meeting_detail", codex=False, detail=str(index))
         send_typing(token, chat_id)
         send_message(token, chat_id, meeting_detail_text(index))
+        return
+    if normalized.startswith("/todo_add"):
+        payload = normalized[len("/todo_add"):].strip()
+        texts = [line for line in payload.splitlines() if line.strip()]
+        if not texts:
+            send_message(token, chat_id, "Укажи задачу: /todo_add текст задачи (несколько строк — несколько задач)")
+            return
+        added, duplicates = add_manual_todos(texts)
+        log_route("todo_add", codex=False, detail=",".join(i["id"] for i in added) or "none")
+        parts = []
+        if added:
+            parts.append("Добавил в /todo:\n" + "\n".join(f"• {i['id']} — {i['task']}" for i in added))
+        if duplicates:
+            parts.append("Уже в списке: " + ", ".join(f"{i.get('id', '?')}" for i in duplicates))
+        reply = "\n\n".join(parts) if parts else "Ничего не добавил (пустые строки)."
+        keyboard = None
+        if added:
+            buttons = [{"text": f"✔ {i['id']}", "callback_data": f"mnote_done:{i['id']}"} for i in added[:30]]
+            keyboard = {"inline_keyboard": [buttons[i:i + 3] for i in range(0, len(buttons), 3)]}
+        send_message(token, chat_id, reply, reply_markup=keyboard)
         return
     if normalized.startswith("/todo_claim"):
         ids = re.findall(r"\bT\d+\b", normalized, flags=re.IGNORECASE)

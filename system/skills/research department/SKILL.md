@@ -8,7 +8,7 @@ model: inherit
 
 Это master skill для factual research.
 
-> **Executor policy (2026-07-11):** токеноёмкие стадии — массовое чтение источников и сборка финального HTML-отчёта — по умолчанию выполняются GPT 5.6 через Codex CLI (с `network_access=true`), чтобы не жечь лимиты Claude. Мозг (главная сессия): brief, source plan, верификация, синтез. Шаблоны вызова — `system/skills/route/SKILL.md`, секция «Контент-deliverables».
+> **Executor policy (обновлено 2026-07-13):** токеноёмкие стадии — **discovery (поиск URL через curl: DuckDuckGo lite / Google News RSS)**, массовое чтение источников и сборка финального HTML-отчёта — выполняются GPT 5.6 через Codex CLI (с `network_access=true`), чтобы не жечь лимиты Claude. Мозг (главная сессия): brief, source plan, точечная верификация (≤3 WebFetch), синтез — WebSearch/WebFetch массово не вызывает. Fallback discovery при блокировке curl — Haiku/Sonnet-субагент (только URL-список, без чтения страниц). Квота GPT выбита → сообщить Антону; Opus — только по явной команде. Шаблоны вызова — `system/skills/route/SKILL.md`, секция «Контент-deliverables»; полная политика — `infrastructure/Research Dept/CLAUDE.md`, Executor Policy.
 
 Канонический department теперь живёт в `infrastructure/Research Dept/`.
 

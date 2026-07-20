@@ -88,7 +88,7 @@ PROMPT_TEMPLATE = """Ты готовишь короткую заметку по 
 - Строго по транскрипту: ничего не выдумывай, не додумывай имена, даты и договорённости.
 - summary_lines: 3-6 коротких строк (каждая до 90 символов) — суть обсуждения, решения и договорённости. Без воды, без вступлений вроде "на встрече обсудили".
 - НИКАКОЙ личной информации об Антоне: ни финансов, ни здоровья, ни планов, ни других его проектов и бизнесов, если они не были предметом именно этой встречи.
-- tasks: только явные договорённости и обещания из встречи. who — имя исполнителя из транскрипта. Владелец этих заметок — Антон Розенблюм: если исполнитель — участник, подписанный как Speaker_N, но по контексту транскрипта понятно, кто это (например, к нему обращаются по имени), пиши реальное имя. "unknown" — только если исполнителя действительно нельзя определить. what — короткая формулировка задачи. deadline — только если срок явно назван (формат как в транскрипте), иначе пустая строка.
+- tasks: только явные договорённости и обещания из встречи. who — имя исполнителя из транскрипта. Владелец этих заметок — Антон Розенблюм: если исполнитель — участник, подписанный как Speaker_N, но по контексту транскрипта понятно, кто это (например, к нему обращаются по имени), пиши реальное имя. Если транскрипт без меток спикеров (диктофонная запись) и обещание сформулировано от первого лица («я сделаю», «я напишу»), исполнитель — Антон. "unknown" — только если исполнителя действительно нельзя определить. what — короткая формулировка задачи. deadline — только если срок явно назван (формат как в транскрипте), иначе пустая строка.
 - title: короткое название встречи по её содержанию (2-5 слов).
 - detailed_lines: развёрнутое саммари, 10-25 строк (каждая до 200 символов) — тоже безопасное для пересылки коллегам, те же запреты на личную информацию. Покрой: контекст и цель встречи; участники и их роли; ход обсуждения с позициями и аргументами сторон; названные цифры, факты, названия; принятые решения; договорённости; открытые вопросы и на чём остановились. Пиши плотно и конкретно, без воды, каждая строка — законченная мысль.
 
@@ -167,6 +167,9 @@ def note_key(content: str) -> Optional[str]:
     mcp_id = extract_frontmatter_value(content, "krisp_mcp_id") or extract_frontmatter_value(content, "krisp_id")
     if mcp_id:
         return f"mcp:{mcp_id}"
+    voice_id = extract_frontmatter_value(content, "voice_memo_id")
+    if voice_id:
+        return f"voice:{voice_id}"
     return None
 
 
@@ -681,7 +684,7 @@ def process_meeting(
             entry["todo_ids"] = [i["id"] for i in entry["todo_items"]]
 
     shareable = format_shareable_message(summary, entry["date"])
-    private = format_private_message(entry["todo_items"], summary.get("engine", "llm"))
+    private = f"Встреча: {title}\n\n" + format_private_message(entry["todo_items"], summary.get("engine", "llm"))
 
     if dry_run:
         print("--- message 1 (shareable) ---")
@@ -792,6 +795,31 @@ def main() -> int:
             if not token or not chat_id:
                 log("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing in env file")
                 return 1
+
+        # защита: два файла с одним krisp/voice id — признак сбоя матчинга
+        # (реальный транскрипт мог попасть в чужую заметку и остаться необработанным)
+        paths_by_key: dict[str, list[Path]] = {}
+        for path, _content, key, _date in notes:
+            paths_by_key.setdefault(key, []).append(path)
+        for key, dup_paths in paths_by_key.items():
+            if len(dup_paths) < 2:
+                continue
+            entry = meetings.setdefault(key, {})
+            if entry.get("dup_warned"):
+                continue
+            entry["dup_warned"] = True
+            names = ", ".join(p.name for p in dup_paths)
+            log(f"WARNING: duplicate key {key} in files: {names}")
+            if not args.dry_run:
+                try:
+                    send_message(
+                        token, chat_id,
+                        f"⚠️ Два транскрипта с одним Krisp ID ({key[:13]}…): {names}. "
+                        f"Возможен сбой матчинга krisp-логгера — саммари одной из встреч могло не прийти. Проверь файлы.",
+                    )
+                except Exception as exc:
+                    entry["dup_warned"] = False
+                    log(f"dup warn send failed: {exc}")
 
         for path, content, key, date in notes:
             if args.dry_run and only_file is not None:
