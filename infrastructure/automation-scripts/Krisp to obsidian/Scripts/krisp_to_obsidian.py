@@ -15,7 +15,7 @@ import subprocess
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +41,7 @@ MCP_RETRY_INTERVAL = 60  # секунд
 HTTP_TIMEOUT       = 30  # секунд
 STALE_PENDING_RETRY_DAYS = 3
 CALLINFO_LOOKBACK_DAYS = 7
+MCP_MATCH_MAX_TIME_DELTA_SEC = 45 * 60
 
 # Generic-имя не разрезолвилось через MCP (облако ещё не отдало встречу):
 # через сколько минут после начала звонка всё равно создать заметку,
@@ -168,6 +169,7 @@ def note_is_pending(content: str) -> bool:
     return (
         TRANSCRIPT_LOADING_PLACEHOLDER in content
         or TRANSCRIPT_MISSING_PLACEHOLDER in content
+        or extract_frontmatter_value(content, "transcript_source") == "local-whisper-tiny"
     )
 
 
@@ -394,17 +396,37 @@ def upsert_frontmatter_field(content: str, field: str, value: str) -> str:
     return updated
 
 
-def ensure_note_metadata(filepath: Path, call_id: str = "", mcp_id: str = ""):
+def ensure_note_metadata(filepath: Path, call_id: str = "", mcp_id: str = "") -> bool:
     if not filepath.exists():
-        return
+        return True
 
     content = filepath.read_text(encoding="utf-8")
+    existing_call_id = extract_frontmatter_value(content, "krisp_call_id")
+    if call_id and existing_call_id and existing_call_id != call_id:
+        print(
+            f"  ⚠ WARN: отказ обновлять {filepath.name}: "
+            f"krisp_call_id={existing_call_id} не совпадает с {call_id}"
+        )
+        return False
+
     updated = content
     if call_id:
         updated = upsert_frontmatter_field(updated, "krisp_call_id", call_id)
     if mcp_id:
         updated = upsert_frontmatter_field(updated, "krisp_mcp_id", mcp_id)
 
+    if updated != content:
+        filepath.write_text(updated, encoding="utf-8")
+        sync_note_timestamp(filepath)
+    return True
+
+
+def set_transcript_source(filepath: Path, source: str):
+    if not filepath.exists():
+        return
+
+    content = filepath.read_text(encoding="utf-8")
+    updated = upsert_frontmatter_field(content, "transcript_source", source)
     if updated != content:
         filepath.write_text(updated, encoding="utf-8")
         sync_note_timestamp(filepath)
@@ -472,11 +494,44 @@ def sync_note_timestamp(filepath: Path, explicit_date: Optional[str] = None):
 
 # ── Сопоставление встречи ─────────────────────────────────────────────────────
 
-def best_match(call_time: Optional[datetime], call_name: str, meetings: list[dict]) -> Optional[dict]:
+def meeting_within_time_guard(
+    call_time: Optional[datetime],
+    meeting: dict,
+) -> bool:
+    if call_time is None or meeting.get("start_time") is None:
+        return True
+    delta = abs((meeting["start_time"] - call_time).total_seconds())
+    return delta <= MCP_MATCH_MAX_TIME_DELTA_SEC
+
+
+def call_start_for_matching(call: dict) -> Optional[datetime]:
+    record_time = call.get("date")
+    if record_time is None:
+        return None
+    duration = max(float(call.get("duration_sec") or 0), 0.0)
+    return record_time - timedelta(seconds=duration) if duration else record_time
+
+
+def best_match(
+    call_time: Optional[datetime],
+    call_name: str,
+    meetings: list[dict],
+    allow_name_fallback: bool = True,
+) -> Optional[dict]:
     """
     Сопоставляет встречу по времени начала (приоритет) или по имени.
     Допуск по времени: ±30 минут.
     """
+    if not meetings:
+        return None
+
+    # Временной guard применяется до любых fallback-эвристик. Иначе одна
+    # встреча за день или случайное совпадение слов может выбрать чужой звонок.
+    meetings = [
+        meeting
+        for meeting in meetings
+        if meeting_within_time_guard(call_time, meeting)
+    ]
     if not meetings:
         return None
 
@@ -490,8 +545,18 @@ def best_match(call_time: Optional[datetime], call_name: str, meetings: list[dic
             if delta <= 1800:  # в пределах 30 минут
                 return closest
 
-    # 2. Fallback: одна встреча за день
-    if len(meetings) == 1:
+    # Generic-имена содержат только время/приложение. Для них fallback по
+    # количеству встреч или словам опасен: соседний звонок того же приложения
+    # может получить чужой MCP ID и "поглотить" исходную pending-заметку.
+    if not allow_name_fallback:
+        return None
+
+    # 2. Fallback: одна встреча за день — только когда у кандидата нет времени.
+    # При известном времени этот fallback уже приводил к выбору соседнего звонка.
+    if (
+        len(meetings) == 1
+        and (call_time is None or meetings[0].get("start_time") is None)
+    ):
         return meetings[0]
 
     # 3. Fallback: совпадение по словам (≥20%)
@@ -660,7 +725,33 @@ def fetch_and_inject_transcript(call: dict, filepath: Path) -> tuple[bool, Path]
         print(f"  [MCP] попытка {attempt}/{MCP_RETRY_COUNT} — ищу «{call['call_name']}»...")
 
         meetings = mcp_search_meetings(date_str)
-        match    = best_match(call["date"], call["call_name"], meetings)
+        known_mcp_id = call.get("_mcp_id")
+        if known_mcp_id:
+            # После первичного резолва держимся за конкретный MCP ID. Иначе при
+            # временном исчезновении встречи из поиска retry может выбрать
+            # соседний звонок и переименовать pending-заметку под него.
+            pinned_match = next(
+                (m for m in meetings if m["id"] == known_mcp_id),
+                None,
+            )
+            if pinned_match and not meeting_within_time_guard(
+                call_start_for_matching(call), pinned_match
+            ):
+                print(
+                    f"  ⚠ WARN: MCP-встреча «{pinned_match['name']}» отклонена: "
+                    f"разница времени больше 45 минут"
+                )
+                call.pop("_mcp_id", None)
+                match = None
+            else:
+                match = pinned_match
+        else:
+            match = best_match(
+                call_start_for_matching(call),
+                call["call_name"],
+                meetings,
+                allow_name_fallback=not should_skip(call["call_name"]),
+            )
 
         if not match:
             print(f"  [MCP] встреча не найдена в облаке Krisp, жду {MCP_RETRY_INTERVAL}с...")
@@ -687,23 +778,50 @@ def fetch_and_inject_transcript(call: dict, filepath: Path) -> tuple[bool, Path]
         # Используем локально очищенное MCP-название без внешних LLM/API.
         key_points = extract_key_points(doc_text)
         ai_title = generate_meeting_title(match["name"], key_points)
+        source_filepath = filepath
+        filepath_message = ""
         if ai_title:
             new_filepath = pick_ai_title_filepath(filepath, ai_title, call["date_str"])
             old_filepath = filepath
             filepath = move_note_if_needed(filepath, new_filepath)
             if filepath != old_filepath:
                 if filepath.exists() and filepath == new_filepath and old_filepath.exists():
-                    print(f"  [MCP] использую существующую заметку → «{ai_title}»")
+                    filepath_message = (
+                        f"  [MCP] использую существующую заметку → «{ai_title}»"
+                    )
                 else:
-                    print(f"  [MCP] переименовано → «{ai_title}»")
+                    filepath_message = f"  [MCP] переименовано → «{ai_title}»"
 
-        ensure_note_metadata(filepath, call.get("call_id", ""), match["id"])
+        if not ensure_note_metadata(
+            filepath,
+            call.get("call_id", ""),
+            match["id"],
+        ):
+            if source_filepath.exists():
+                filepath = source_filepath
+            if call.get("_mcp_id") == match["id"]:
+                call.pop("_mcp_id", None)
+            print(
+                f"  ⚠ WARN: MCP-матч «{match['name']}» отклонён как чужая "
+                f"заметка, жду {MCP_RETRY_INTERVAL}с..."
+            )
+            time.sleep(MCP_RETRY_INTERVAL)
+            continue
+
+        if filepath_message:
+            print(filepath_message)
         inject_mcp_content(filepath, mcp_section)
+        set_transcript_source(filepath, "krisp-mcp")
         print(f"  [MCP] транскрипт вставлен из «{match['name']}»")
         return True, filepath
 
     # Все попытки исчерпаны
-    ensure_note_metadata(filepath, call.get("call_id", ""), call.get("_mcp_id", ""))
+    if not ensure_note_metadata(
+        filepath,
+        call.get("call_id", ""),
+        call.get("_mcp_id", ""),
+    ):
+        return False, filepath
     inject_mcp_content(
         filepath,
         f"## Транскрипт\n\n{TRANSCRIPT_MISSING_PLACEHOLDER}"
@@ -726,12 +844,18 @@ def main():
     note_index = build_note_index(VAULT_MEETINGS)
 
     for call in calls:
+        generic_fallback = False
         if should_skip(call["call_name"]):
             # Generic-имя: пробуем найти встречу в MCP по времени
             if call["date"] is not None:
                 if call["date_str"] not in mcp_cache:
                     mcp_cache[call["date_str"]] = mcp_search_meetings(call["date_str"])
-                mcp_match = best_match(call["date"], call["call_name"], mcp_cache[call["date_str"]])
+                mcp_match = best_match(
+                    call_start_for_matching(call),
+                    call["call_name"],
+                    mcp_cache[call["date_str"]],
+                    allow_name_fallback=False,
+                )
                 if mcp_match:
                     if mcp_match["id"] in processed_mcp_ids:
                         skipped += 1
@@ -740,7 +864,7 @@ def main():
                 elif generic_fallback_due(call):
                     # Облако Krisp ещё не отдало встречу — создаём заметку с generic-именем,
                     # дальше retry-конвейер сам вставит транскрипт и переименует.
-                    print(f"⚠ «{call['call_name']}»: не найдено в облаке Krisp — создаю заметку с generic-именем")
+                    generic_fallback = True
                 else:
                     skipped_auto += 1
                     continue
@@ -752,7 +876,12 @@ def main():
         if not call.get("_mcp_id") and call["date"] is not None:
             if call["date_str"] not in mcp_cache:
                 mcp_cache[call["date_str"]] = mcp_search_meetings(call["date_str"])
-            mcp_match = best_match(call["date"], call["call_name"], mcp_cache[call["date_str"]])
+            mcp_match = best_match(
+                call_start_for_matching(call),
+                call["call_name"],
+                mcp_cache[call["date_str"]],
+                allow_name_fallback=not should_skip(call["call_name"]),
+            )
             if mcp_match:
                 if mcp_match["id"] in processed_mcp_ids:
                     skipped += 1
@@ -767,18 +896,37 @@ def main():
         if filepath.exists():
             content = filepath.read_text(encoding="utf-8")
             if not note_is_pending(content):
+                if generic_fallback:
+                    print(
+                        f"ℹ «{call['call_name']}»: fallback-заметка не создана — "
+                        f"найдена уже завершённая заметка {filepath.name}"
+                    )
                 skipped += 1
                 continue
             if not should_retry_pending_note(filepath, content):
+                if generic_fallback:
+                    print(
+                        f"ℹ «{call['call_name']}»: fallback-заметка не создана — "
+                        f"найдена pending-заметка старше {STALE_PENDING_RETRY_DAYS} дней: {filepath.name}"
+                    )
                 skipped += 1
                 continue
             # Транскрипт ещё не получен — пробуем снова
-            print(f"↻ повтор MCP для: {filepath.name}")
+            if generic_fallback:
+                print(
+                    f"ℹ «{call['call_name']}»: fallback-заметка уже существует — "
+                    f"повтор MCP для {filepath.name}"
+                )
+            else:
+                print(f"↻ повтор MCP для: {filepath.name}")
         else:
             # 1. Создаём заметку сразу (с плейсхолдером транскрипта)
             filepath.write_text(build_note_text(call), encoding="utf-8")
             sync_note_timestamp(filepath, call["date_str"])
-            print(f"✓ создано: {filepath.name}")
+            if generic_fallback:
+                print(f"✓ fallback-заметка с generic-именем создана: {filepath.name}")
+            else:
+                print(f"✓ создано: {filepath.name}")
             created += 1
             note_index = build_note_index(VAULT_MEETINGS)
 

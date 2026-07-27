@@ -18,7 +18,6 @@ DAILY_DIR = VAULT / "infrastructure" / "daily focus"
 ENV_FILE = Path("/Users/anton/.config/second-brain/daily-focus.env")
 STATE_DIR = Path("/Users/anton/.config/second-brain")
 STATE_FILE = STATE_DIR / "telegram-codex-bot.offset"
-PLAN_PENDING_FILE = STATE_DIR / "telegram-codex-bot.plan-pending"
 CALENDAR_PENDING_FILE = STATE_DIR / "telegram-codex-bot.calendar-pending.json"
 CALENDAR_LEDGER_FILE = STATE_DIR / "telegram-codex-bot.calendar-ledger.json"
 STRATEGY_REVIEW_LOCK_FILE = STATE_DIR / "telegram-codex-bot.strategy-review.lock"
@@ -56,7 +55,6 @@ DEFAULT_FOCUS_EVENT_COLOR_ID = ACTIVITY_COLOR_IDS["Deep Work"]
 TODO_ONLY_MODE = os.environ.get("TELEGRAM_CODEX_TODO_ONLY", "1") != "0"
 AUTO_CODEX_FOR_QUESTIONS = os.environ.get("TELEGRAM_CODEX_ASK_AUTO", "0") == "1"
 TODO_ONLY_DISABLED_COMMANDS = {
-    "/focus",
     "/actions",
     "/actions_confirm",
     "/actions_reject",
@@ -77,7 +75,6 @@ TODO_ONLY_DISABLED_COMMANDS = {
     "/fullfocus",
     "/daily_rerun",
     "/ask",
-    "/done",
 }
 
 
@@ -203,22 +200,6 @@ def write_offset(offset: int) -> None:
     os.chmod(STATE_FILE, 0o600)
 
 
-def set_plan_pending(chat_id: str) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    PLAN_PENDING_FILE.write_text(str(chat_id), encoding="utf-8")
-    os.chmod(PLAN_PENDING_FILE, 0o600)
-
-
-def is_plan_pending(chat_id: str) -> bool:
-    if not PLAN_PENDING_FILE.exists():
-        return False
-    return PLAN_PENDING_FILE.read_text(encoding="utf-8").strip() == str(chat_id)
-
-
-def clear_plan_pending() -> None:
-    PLAN_PENDING_FILE.unlink(missing_ok=True)
-
-
 def write_calendar_pending(slots: list[dict[str, str]]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     CALENDAR_PENDING_FILE.write_text(json.dumps(slots, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -277,42 +258,6 @@ def completed_task_keys() -> set[str]:
 
 def task_is_completed(task_name: str) -> bool:
     return task_key(task_name) in completed_task_keys_effective()
-
-
-def mark_task_done(raw_text: str) -> tuple[bool, str]:
-    query = raw_text.strip()
-    if not query:
-        return False, "Напиши так: /done название задачи"
-    tasks = current_planning_tasks(include_completed=True)
-    query_key = task_key(query)
-    exact = [task for task in tasks if task_key(task.get("task", "")) == query_key]
-    if exact:
-        task_name = exact[0].get("task", "")
-    else:
-        contains = [
-            task for task in tasks
-            if query_key and (query_key in task_key(task.get("task", "")) or task_key(task.get("task", "")) in query_key)
-        ]
-        if len(contains) == 1:
-            task_name = contains[0].get("task", "")
-        elif len(contains) > 1:
-            options = "\n".join(f"- {task.get('task', '')}" for task in contains[:6])
-            return False, "Нашёл несколько похожих задач. Уточни название:\n" + options
-        else:
-            task_name = query
-
-    key = task_key(task_name)
-    entries = read_completed_tasks()
-    if any(entry.get("task_key") == key for entry in entries):
-        return True, f"Уже было отмечено как выполненное: {task_name}"
-    entries.append({
-        "task": task_name,
-        "task_key": key,
-        "completed_at": dt.datetime.now().isoformat(timespec="seconds"),
-        "source": "telegram_done",
-    })
-    write_completed_tasks(entries)
-    return True, f"Отметил выполненным: {task_name}"
 
 
 def google_calendar_service(interactive: bool = False):
@@ -663,18 +608,16 @@ def build_help_message() -> str:
         f"Daily Focus bot — mode: {mode}",
         "",
         "Быстро, без Codex:",
-        "/plan — добавить список дел в Planning Inbox",
-        "/focus — быстрый план по текущим задачам",
         "/actions — кандидаты задач из встреч на подтверждение",
         "/todo — мои задачи из встреч, кнопка ✔ закрывает",
         "/todo_add текст — добавить задачу вручную (несколько строк — несколько задач)",
         "/todo_done T1 T2 — закрыть текстом, /todo_drop T3 — убрать",
         "/todo_claim T16 — взять себе задачу без исполнителя (кнопка ➕ в саммари встречи)",
         "/meetings — список последних встреч",
+        "/summary — саммари встреч из тудулиста, кнопками",
         "/meeting N — детальное саммари встречи (без N — последняя)",
         "/calendar_status — что уже стоит в календаре",
         "/calendar_review — что закрыто/в процессе по Focus-слотам",
-        "/done задача — ручной override выполнения",
         "",
         "Календарь:",
         "/calendar_new — предложить слоты только для новых задач",
@@ -714,60 +657,6 @@ def build_bot_status() -> str:
 
 def has_question_mark(text: str) -> bool:
     return "?" in text or "？" in text
-
-
-def is_planning_message(text: str) -> bool:
-    first_line = (text.strip().splitlines() or [""])[0].strip().lower()
-    return (
-        first_line.startswith("мои дела")
-        or first_line.startswith("план")
-        or first_line.startswith("/checkin")
-        or first_line.startswith("/plan")
-    )
-
-
-def is_plan_command(text: str) -> bool:
-    return text.strip().lower() in {"/plan", "/checkin"}
-
-
-def plan_command_payload(text: str) -> str:
-    stripped = text.strip()
-    lowered = stripped.lower()
-    for command in ("/plan", "/checkin"):
-        if lowered.startswith(command + " "):
-            return stripped[len(command):].strip()
-        if lowered.startswith(command + "\n"):
-            return stripped[len(command):].strip()
-    return ""
-
-
-def extract_task_items(text: str) -> list[dict[str, str]]:
-    tasks: list[dict[str, str]] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        lowered = line.lower()
-        if lowered in {"мои дела", "план", "/checkin", "/plan"}:
-            continue
-        line = re.sub(r"^\s*[-•]\s+", "", line)
-        line = re.sub(r"^\s*\d+[\.)]\s+", "", line)
-        importance = "low"
-        if line.startswith("**"):
-            importance = "very_important"
-            line = line[2:].strip()
-        elif line.startswith("*"):
-            importance = "important"
-            line = line[1:].strip()
-        line = re.sub(r"^\s*[-–—]\s+", "", line)
-        line = line.strip()
-        if line:
-            tasks.append({"task": line, "importance": importance})
-    return tasks
-
-
-def extract_task_lines(text: str) -> list[str]:
-    return [item["task"] for item in extract_task_items(text)]
 
 
 def task_key(task: str) -> str:
@@ -841,61 +730,6 @@ def estimate_minutes(estimate: str) -> int:
 
 def iso_minute(value: dt.datetime) -> str:
     return value.replace(second=0, microsecond=0).isoformat(timespec="minutes")
-
-
-def append_planning_inbox(text: str) -> tuple[Path, int, int]:
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    inbox_path = PLANNING_INBOX_DIR / f"{{planning}} inbox – {today}.md"
-    task_items = extract_task_items(text)
-    PLANNING_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-    if not inbox_path.exists():
-        inbox_path.write_text(
-            f"# Planning Inbox — {today}\n\n"
-            "Manual task notes for Daily Focus.\n\n"
-            "## Inbox\n\n",
-            encoding="utf-8",
-        )
-    existing = inbox_path.read_text(encoding="utf-8")
-    existing_keys = {task_key(task.get("task", "")) for task in parse_normalized_tasks(existing)}
-    new_tasks = [item for item in task_items if task_key(item["task"]) not in existing_keys]
-
-    with inbox_path.open("a", encoding="utf-8") as f:
-        f.write(f"\n## Telegram check-in — {now}\n\n")
-        f.write("Raw message:\n\n")
-        f.write("```text\n")
-        f.write(text.strip() + "\n")
-        f.write("```\n\n")
-        f.write("Normalized tasks:\n\n")
-        if new_tasks:
-            for item in new_tasks:
-                task = item["task"]
-                f.write(f"- task: {task}\n")
-                f.write("  type: manual\n")
-                f.write("  source: manual\n")
-                f.write(f"  importance: {item['importance']}\n")
-                f.write("  deadline: unknown\n")
-                f.write("  estimate: unknown\n")
-                f.write(f"  proposed_deadline: {proposed_deadline(task)}\n")
-                f.write(f"  proposed_estimate: {proposed_estimate(task)}\n")
-                f.write("  proposal_source: telegram_codex_bot heuristic\n")
-                f.write("  dependencies: unknown\n")
-                f.write("  status: candidate\n\n")
-        elif task_items:
-            f.write("All parsed tasks were already present in this inbox file.\n\n")
-        else:
-            f.write("- task: needs clarification\n")
-            f.write("  type: manual\n")
-            f.write("  source: manual\n")
-            f.write("  importance: low\n")
-            f.write("  deadline: unknown\n")
-            f.write("  estimate: unknown\n")
-            f.write(f"  proposed_deadline: {dt.date.today().isoformat()}\n")
-            f.write("  proposed_estimate: unknown\n")
-            f.write("  proposal_source: telegram_codex_bot heuristic\n")
-            f.write("  dependencies: unknown\n")
-            f.write("  status: needs clarification\n\n")
-    return inbox_path, len(task_items), len(new_tasks)
 
 
 def append_confirmed_meeting_actions(candidates: list[dict[str, str]]) -> tuple[Path, int]:
@@ -1387,8 +1221,6 @@ def build_actions_message() -> str:
     for candidate in pending[:8]:
         candidate_id = candidate.get("id", "?")
         task = candidate.get("task", "unknown").strip()
-        if len(task) > 105:
-            task = task[:102].rstrip() + "..."
         source = candidate.get("source meeting", "unknown").strip()
         source = re.sub(r"\s+", " ", source)
         source = re.sub(r"\s+—\s+\d{4}-\d{2}-\d{2}$", "", source)
@@ -1532,13 +1364,9 @@ def build_todo_message() -> str:
     lines = [f"Meeting TODO — открыто: {len(todos)}", ""]
     for source, items in by_meeting.items():
         display = re.sub(r"\s+", " ", source)
-        if len(display) > 60:
-            display = display[:57].rstrip() + "..."
         lines.append(f"{display}:")
         for todo in items:
             task = todo.get("task", "unknown").strip()
-            if len(task) > 90:
-                task = task[:87].rstrip() + "..."
             entry = f"{todo.get('id', '?')}. {task}"
             who = todo.get("who", "").strip()
             if who and who != "unknown":
@@ -1606,14 +1434,121 @@ def build_meetings_message() -> str:
     return "\n".join(lines)
 
 
-def meeting_detail_text(index: int) -> str:
-    meetings = read_meeting_notes_state()
-    if not meetings:
-        return "Встреч в Meeting Notes пока нет."
-    if index < 1 or index > len(meetings):
-        return f"Есть встречи 1–{min(len(meetings), 7)}, см. /meetings"
-    meeting = meetings[index - 1]
-    command = [sys.executable or "/usr/bin/python3", str(MEETING_NOTES_SCRIPT), "--detail", meeting["key"]]
+def build_summary_keyboard(meetings: list[dict[str, str]]) -> dict | None:
+    rows = []
+    for meeting in meetings:
+        key = meeting["key"]
+        callback_data = f"msum:{key}"
+        if len(callback_data.encode("utf-8")) > 64:
+            continue
+        title = meeting["title"][:40]
+        rows.append([{
+            "text": f"{title} — {format_meeting_date(meeting['date'])}",
+            "callback_data": callback_data,
+        }])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def normalize_meeting_title(title: str) -> str:
+    return re.sub(r"\s+", " ", title).strip().casefold()
+
+
+def split_source_meeting(source: str) -> tuple[str, str]:
+    normalized = re.sub(r"\s+", " ", source).strip()
+    match = re.match(r"^(.*?)\s+[-–—]\s+(\d{4}-\d{2}-\d{2})$", normalized)
+    if not match:
+        return normalized, ""
+    return match.group(1).strip(), match.group(2)
+
+
+def summary_meetings_from_todos(todos: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[str]]:
+    try:
+        data = json.loads(MEETING_NOTES_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    state_entries = []
+    for key, entry in (data.get("meetings") or {}).items():
+        summary_title = str((entry.get("summary") or {}).get("title") or "")
+        state_entries.append({
+            "key": key,
+            "title": str(entry.get("title") or "unknown"),
+            "summary_title": summary_title,
+            "date": str(entry.get("date") or ""),
+        })
+
+    sources: list[tuple[str, dict[str, str]]] = []
+    seen_sources: set[str] = set()
+    for todo in todos:
+        source = todo.get("source_meeting", "").strip()
+        if not source or normalize_meeting_title(source) == normalize_meeting_title("Добавлено вручную"):
+            continue
+        source_identity = normalize_meeting_title(source)
+        if source_identity in seen_sources:
+            continue
+        seen_sources.add(source_identity)
+        sources.append((source, todo))
+
+    mapped: list[dict[str, str]] = []
+    unavailable: list[str] = []
+    seen_keys: set[str] = set()
+    for source, todo in sources:
+        source_title, source_date = split_source_meeting(source)
+        explicit_key = next((
+            todo.get(field, "").strip()
+            for field in ("meeting_key", "source_meeting_key", "meeting_notes_key")
+            if todo.get(field, "").strip()
+        ), "")
+        if explicit_key:
+            candidates = [entry for entry in state_entries if entry["key"] == explicit_key]
+        else:
+            normalized_title = normalize_meeting_title(source_title)
+            candidates = [
+                entry for entry in state_entries
+                if normalized_title in {
+                    normalize_meeting_title(entry["title"]),
+                    normalize_meeting_title(entry["summary_title"]),
+                }
+            ]
+        if source_date and len(candidates) > 1:
+            try:
+                target_date = dt.date.fromisoformat(source_date)
+                candidates.sort(key=lambda entry: abs((dt.date.fromisoformat(entry["date"]) - target_date).days))
+            except ValueError:
+                candidates.sort(key=lambda entry: entry["date"], reverse=True)
+        elif len(candidates) > 1:
+            candidates.sort(key=lambda entry: entry["date"], reverse=True)
+        if not candidates:
+            unavailable.append(source_title)
+            continue
+        match = candidates[0]
+        if match["key"] in seen_keys:
+            continue
+        seen_keys.add(match["key"])
+        mapped.append({
+            "key": match["key"],
+            "title": source_title,
+            "date": match["date"] or source_date,
+        })
+    mapped.sort(key=lambda meeting: meeting["date"], reverse=True)
+    return mapped, unavailable
+
+
+def meeting_detail_by_key(key: str) -> str:
+    try:
+        data = json.loads(MEETING_NOTES_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    entry = (data.get("meetings") or {}).get(key)
+    if not entry:
+        return "Встреча не найдена — отправь /summary ещё раз"
+    summary = entry.get("summary") or {}
+    detailed_lines = summary.get("detailed_lines") or []
+    if detailed_lines:
+        title = summary.get("title", entry.get("title", "Встреча"))
+        lines = [f"📋 {title} — {format_meeting_date(entry.get('date', ''))}", ""]
+        lines.extend(detailed_lines)
+        return "\n".join(lines)
+    command = [sys.executable or "/usr/bin/python3", str(MEETING_NOTES_SCRIPT), "--detail", key]
     try:
         proc = subprocess.run(command, capture_output=True, text=True, timeout=300)
     except subprocess.TimeoutExpired:
@@ -1623,6 +1558,15 @@ def meeting_detail_text(index: int) -> str:
         log(f"meeting detail failed rc={proc.returncode}: {(proc.stderr or output)[:200]}")
         return "Не получилось собрать детали встречи. Лог: ~/Library/Logs/meeting-notes.log"
     return output
+
+
+def meeting_detail_text(index: int) -> str:
+    meetings = read_meeting_notes_state()[:7]
+    if not meetings:
+        return "Встреч в Meeting Notes пока нет."
+    if index < 1 or index > len(meetings):
+        return f"Есть встречи 1–{len(meetings)}, см. /meetings"
+    return meeting_detail_by_key(meetings[index - 1]["key"])
 
 
 def read_calendar_events(days: int = CALENDAR_PLANNING_DAYS, start_date: dt.date | None = None) -> list[dict[str, str]]:
@@ -1899,18 +1843,6 @@ def waiting_label(task: dict[str, str]) -> str:
     return "без внешнего адресата"
 
 
-def block_label(block: str) -> str:
-    labels = {
-        "Admin": "Admin",
-        "Deep Work": "Deep Work",
-        "Outreach": "Outreach",
-        "Health": "Health",
-        "Education": "Education",
-        "Infrastructure": "Infrastructure",
-    }
-    return labels.get(block, block)
-
-
 def activity_color_id(task: dict[str, str]) -> str:
     return ACTIVITY_COLOR_IDS.get(task_block(task), DEFAULT_FOCUS_EVENT_COLOR_ID)
 
@@ -2022,146 +1954,6 @@ def pending_calendar_task_keys() -> set[str]:
         if name:
             keys.add(task_key(name))
     return keys
-
-
-def task_deadline_date(task: dict[str, str]) -> dt.date:
-    raw = task.get("deadline", "")
-    if not raw or raw == "unknown":
-        raw = task.get("proposed_deadline", "")
-    try:
-        return dt.date.fromisoformat(raw[:10])
-    except Exception:
-        return dt.date.today() + dt.timedelta(days=7)
-
-
-def task_estimate_label(task: dict[str, str]) -> str:
-    name = task.get("task", "")
-    estimate = task.get("estimate", "")
-    proposed = False
-    if not estimate or estimate == "unknown":
-        estimate = task.get("proposed_estimate") or proposed_estimate(name)
-        proposed = True
-    return f"{estimate}{' proposed' if proposed else ''}"
-
-
-def next_action(task: dict[str, str]) -> str:
-    name = task.get("task", "")
-    lowered = name.lower()
-    if "счета" in lowered:
-        return "собрать счета/документы и начать подачу."
-    if "тг" in lowered or "дейли фокус" in lowered:
-        return "проверить /plan, /focus и /calendar в Telegram."
-    if "mvp" in lowered or "icom" in lowered:
-        return "выбрать ближайший недоделанный сценарий и закрыть его."
-    if "агентств" in lowered:
-        return "собрать список 5-7 агентств и написать первый outreach."
-    if "лекци" in lowered and "партнер" in lowered:
-        return "собрать структуру лекции и 3-5 примеров."
-    if "зал" in lowered:
-        return "выбрать ближайший дневной слот."
-    if "medical agent" in lowered or "выписки" in lowered:
-        return "создать место для агента и загрузить первые выписки."
-    if "репозитор" in lowered or "скил" in lowered:
-        return "собрать ссылки и коротко отметить, что полезно."
-    return "сделать первый конкретный шаг и зафиксировать результат."
-
-
-def append_focus_group(lines: list[str], title: str, tasks: list[dict[str, str]]) -> None:
-    lines.extend(["", f"{title}:"])
-    if not tasks:
-        lines.append("- нет задач")
-        return
-    for task in tasks:
-        name = task.get("task", "")
-        lines.append(f"[{task_estimate_label(task)}] {name}")
-        lines.append(f"Next action: {next_action(task)}")
-
-
-def focus_questions(tasks: list[dict[str, str]]) -> list[str]:
-    questions: list[str] = []
-
-    for task in tasks:
-        dependencies = task.get("dependencies", "unknown")
-        status = task.get("status", "")
-        if status == "blocked" or dependencies not in {"", "unknown"}:
-            questions.append(f"Что блокирует «{task.get('task', '')}»: {dependencies}?")
-            break
-
-    for task in tasks:
-        name = task.get("task", "")
-        lowered = name.lower()
-        if any(marker in lowered for marker in ["mvp", "лекци", "medical agent", "интеграцию"]):
-            questions.append(f"Какой done criteria у «{name}»?")
-            break
-
-    for task in tasks:
-        name = task.get("task", "")
-        lowered = name.lower()
-        if any(marker in lowered for marker in ["агентств", "клиент", "партнер"]):
-            questions.append(f"Кому именно адресована задача «{name}»?")
-            break
-
-    if len(questions) < 3:
-        missing_deadline = [task for task in tasks if task.get("deadline", "unknown") == "unknown"]
-        if missing_deadline:
-            questions.append("Есть ли жёсткий deadline у чего-то из этого списка, кроме proposed сроков?")
-
-    deduped: list[str] = []
-    for question in questions:
-        if question and question not in deduped:
-            deduped.append(question)
-    return deduped[:3]
-
-
-def build_fast_focus() -> str:
-    today_date = dt.date.today()
-    tomorrow = today_date + dt.timedelta(days=1)
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    tasks = current_planning_tasks()
-
-    tasks = sorted(tasks, key=lambda task: (task_deadline_date(task), task_block(task), task.get("task", "")))
-
-    for task in tasks:
-        name = task.get("task", "")
-        if not task.get("proposed_deadline"):
-            task["proposed_deadline"] = proposed_deadline(name)
-        if not task.get("proposed_estimate"):
-            task["proposed_estimate"] = proposed_estimate(name)
-
-    lines = [f"Focus — {today}", ""]
-    if not tasks:
-        return "\n".join(lines + ["В Planning Inbox / Memory нет активных задач."])
-
-    track_counts: dict[str, int] = {}
-    for task in tasks:
-        label = block_label(task_block(task))
-        track_counts[label] = track_counts.get(label, 0) + 1
-    tracks = ", ".join(f"{name} {count}" for name, count in sorted(track_counts.items(), key=lambda item: item[1], reverse=True)[:3])
-    proposed_count = sum(1 for task in tasks if task.get("deadline", "unknown") == "unknown" or task.get("estimate", "unknown") == "unknown")
-    blockers_count = sum(1 for task in tasks if task.get("status") in {"blocked", "needs clarification"} or task.get("dependencies", "unknown") not in {"", "unknown"})
-
-    lines.extend([
-        "Картина:",
-        f"{len(tasks)} задач. Треки: {tracks}.",
-        f"Неопределённость: {proposed_count} задач с proposed сроком/оценкой; блокеров явно: {blockers_count}.",
-    ])
-
-    today_tasks = [task for task in tasks if task_deadline_date(task) <= today_date]
-    tomorrow_tasks = [task for task in tasks if task_deadline_date(task) == tomorrow]
-    later_tasks = [task for task in tasks if task_deadline_date(task) > tomorrow]
-
-    append_focus_group(lines, "Сегодня", today_tasks)
-    append_focus_group(lines, "Завтра", tomorrow_tasks)
-    append_focus_group(lines, "Позже / на неделе", later_tasks)
-
-    questions = focus_questions(tasks)
-    lines.extend(["", "Нужно уточнить:"])
-    if questions:
-        for index, question in enumerate(questions, start=1):
-            lines.append(f"{index}. {question}")
-    else:
-        lines.append("1. Нет явных блокеров.")
-    return "\n".join(lines)
 
 
 def build_calendar_slots(tasks: list[dict[str, str]], calendar_events: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -2464,7 +2256,7 @@ def build_calendar_review() -> str:
         f"Выполнено блоков по календарю: {len(executed_blocks)}",
         f"Полностью закрыто задач: {len(fully_completed_keys)}",
         f"Задач в процессе: {len(in_progress_names)}",
-        f"Legacy /done overrides: {len(legacy_completed_keys)}",
+        f"Legacy completion overrides: {len(legacy_completed_keys)}",
         f"Будущих слотов под полностью закрытые/override задачи: {len(future_completed_events)}",
         f"Осталось сегодня в календаре: {len(remaining_today)}",
         f"Активных задач без слота/pending: {len(unscheduled)}",
@@ -2620,18 +2412,24 @@ def is_todo_only_disabled_command(text: str) -> bool:
     return command.startswith("/actions_") or command.startswith("/calendar_")
 
 
-def save_to_planning_backlog(token: str, chat_id: str, text: str, detail: str) -> None:
-    try:
-        inbox_path, parsed_count, new_count = append_planning_inbox(text)
-        log_route("inbox", codex=False, detail=f"{detail} parsed={parsed_count}; new={new_count}")
-        send_message(
-            token,
-            chat_id,
-            f"Записал в backlog / Planning Inbox.\nРаспознано: {parsed_count}. Новых: {new_count}.\nCodex не запускал.\n{inbox_path}",
-        )
-    except Exception as exc:
-        log(f"planning inbox error: {exc}")
-        send_message(token, chat_id, f"Не смог сохранить Planning Inbox: {exc}")
+def handle_todo_add(token: str, chat_id: str, text: str) -> None:
+    texts = [line for line in text.splitlines() if line.strip()]
+    if not texts:
+        send_message(token, chat_id, "Укажи задачу: /todo_add текст задачи (несколько строк — несколько задач)")
+        return
+    added, duplicates = add_manual_todos(texts)
+    log_route("todo_add", codex=False, detail=",".join(i["id"] for i in added) or "none")
+    parts = []
+    if added:
+        parts.append("Добавил в /todo:\n" + "\n".join(f"• {i['id']} — {i['task']}" for i in added))
+    if duplicates:
+        parts.append("Уже в списке: " + ", ".join(f"{i.get('id', '?')}" for i in duplicates))
+    reply = "\n\n".join(parts) if parts else "Ничего не добавил (пустые строки)."
+    keyboard = None
+    if added:
+        buttons = [{"text": f"✔ {i['id']}", "callback_data": f"mnote_done:{i['id']}"} for i in added[:30]]
+        keyboard = {"inline_keyboard": [buttons[i:i + 3] for i in range(0, len(buttons), 3)]}
+    send_message(token, chat_id, reply, reply_markup=keyboard)
 
 
 def handle_text(token: str, chat_id: str, text: str) -> None:
@@ -2656,6 +2454,27 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         log_route("meetings", codex=False)
         send_message(token, chat_id, build_meetings_message())
         return
+    if normalized in {"/summary", "summary"}:
+        todos = open_meeting_todos()
+        log_route("summary", codex=False)
+        if not todos:
+            meetings = read_meeting_notes_state()[:7]
+            text = "Открытых задач нет — вот последние встречи"
+            if not meetings:
+                text += "\n\n" + build_meetings_message()
+            send_message(token, chat_id, text, reply_markup=build_summary_keyboard(meetings))
+        else:
+            meetings, unavailable = summary_meetings_from_todos(todos)
+            lines = ["Последние встречи из тудулиста — нажми, чтобы получить саммари"]
+            if unavailable:
+                lines.append(f"Саммари недоступно: {', '.join(unavailable)}")
+            send_message(
+                token,
+                chat_id,
+                "\n".join(lines),
+                reply_markup=build_summary_keyboard(meetings),
+            )
+        return
     if normalized == "/meeting" or normalized.startswith("/meeting "):
         arg = normalized[len("/meeting"):].strip()
         index = int(arg) if arg.isdigit() else 1
@@ -2665,23 +2484,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         return
     if normalized.startswith("/todo_add"):
         payload = normalized[len("/todo_add"):].strip()
-        texts = [line for line in payload.splitlines() if line.strip()]
-        if not texts:
-            send_message(token, chat_id, "Укажи задачу: /todo_add текст задачи (несколько строк — несколько задач)")
-            return
-        added, duplicates = add_manual_todos(texts)
-        log_route("todo_add", codex=False, detail=",".join(i["id"] for i in added) or "none")
-        parts = []
-        if added:
-            parts.append("Добавил в /todo:\n" + "\n".join(f"• {i['id']} — {i['task']}" for i in added))
-        if duplicates:
-            parts.append("Уже в списке: " + ", ".join(f"{i.get('id', '?')}" for i in duplicates))
-        reply = "\n\n".join(parts) if parts else "Ничего не добавил (пустые строки)."
-        keyboard = None
-        if added:
-            buttons = [{"text": f"✔ {i['id']}", "callback_data": f"mnote_done:{i['id']}"} for i in added[:30]]
-            keyboard = {"inline_keyboard": [buttons[i:i + 3] for i in range(0, len(buttons), 3)]}
-        send_message(token, chat_id, reply, reply_markup=keyboard)
+        handle_todo_add(token, chat_id, payload)
         return
     if normalized.startswith("/todo_claim"):
         ids = re.findall(r"\bT\d+\b", normalized, flags=re.IGNORECASE)
@@ -2725,46 +2528,24 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         if normalized in {"спасибо", "спс"}:
             send_message(token, chat_id, "ок")
         return
-    if is_plan_command(normalized):
-        log_route("inbox", codex=False, detail="plan pending")
-        set_plan_pending(chat_id)
-        send_message(token, chat_id, "Ок, пришли список дел следующим сообщением. Я сохраню его в backlog / Planning Inbox.")
-        return
-    payload = plan_command_payload(normalized)
-    if payload:
-        save_to_planning_backlog(token, chat_id, payload, "plan payload")
-        return
-    if is_plan_pending(chat_id):
-        save_to_planning_backlog(token, chat_id, normalized, "pending")
-        clear_plan_pending()
-        return
     if TODO_ONLY_MODE and is_todo_only_disabled_command(normalized):
         log_route("todo_only_disabled", codex=False, detail=todo_only_command_key(normalized))
-        send_message(token, chat_id, "Этот режим сейчас отключён. Telegram работает как to-do inbox: пришли задачу обычным текстом или через /plan.")
+        send_message(token, chat_id, "Этот режим сейчас отключён. Telegram работает как to-do inbox: пришли задачу обычным текстом или через /todo_add.")
         return
     if TODO_ONLY_MODE and normalized.startswith("/"):
         log_route("todo_only_unknown_command", codex=False, detail=todo_only_command_key(normalized))
-        send_message(token, chat_id, "Команда не активна в to-do режиме. Пришли задачу обычным текстом, я сохраню её в backlog.")
+        send_message(token, chat_id, "Команда не активна в to-do режиме. Пришли задачу обычным текстом, я добавлю её в /todo.")
         return
     if has_question_mark(normalized) and not normalized.lower().startswith("/ask"):
         if AUTO_CODEX_FOR_QUESTIONS and not TODO_ONLY_MODE:
             answer_with_codex(token, chat_id, normalized, route_detail="question_mark")
-        elif is_planning_message(normalized):
-            save_to_planning_backlog(token, chat_id, normalized, "question planning message")
         else:
             log_route("question_no_auto_codex", codex=False)
             send_message(
                 token,
                 chat_id,
-                "Вопрос увидел, Codex не запускал. Если хочешь ответ по vault, напиши: /ask твой вопрос. Если это задача, пришли через /plan или обычным списком.",
+                "Вопрос увидел, Codex не запускал. Если хочешь ответ по vault, напиши: /ask твой вопрос. Если это задача, пришли обычным списком или через /todo_add.",
             )
-        return
-    if is_planning_message(normalized):
-        save_to_planning_backlog(token, chat_id, normalized, "planning message")
-        return
-    if normalized == "/focus":
-        log_route("focus_fast", codex=False)
-        send_message(token, chat_id, build_fast_focus())
         return
     if normalized == "/actions":
         log_route("actions_review", codex=False)
@@ -2860,12 +2641,6 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
     if normalized == "/calendar_review":
         log_route("calendar_review", codex=False)
         send_message(token, chat_id, build_calendar_review())
-        return
-    if normalized.startswith("/done"):
-        log_route("done", codex=False)
-        payload = normalized[5:].strip()
-        ok, message = mark_task_done(payload)
-        send_message(token, chat_id, message + ("\nОсновная логика выполнения теперь берётся из прошлых Focus-слотов календаря; /done оставлен как ручной override." if ok else ""))
         return
     if normalized == "/calendar_clear_done":
         log_route("calendar_clear_done", codex=False)
@@ -2969,7 +2744,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         answer_with_codex(token, chat_id, question, route_detail="ask_command")
         return
 
-    save_to_planning_backlog(token, chat_id, normalized, "ordinary")
+    handle_todo_add(token, chat_id, normalized)
     return
 
 
@@ -2983,6 +2758,12 @@ def handle_callback(token: str, allowed_chat_id: str, callback: dict) -> None:
         log(f"ignored callback from chat_id={chat_id}")
         return
     data = str(callback.get("data", ""))
+    if data.startswith("msum:"):
+        key = data[len("msum:"):]
+        answer_callback_query(token, callback_id)
+        send_typing(token, chat_id)
+        send_message(token, chat_id, meeting_detail_by_key(key))
+        return
     match = re.match(r"^(todo_done|mnote_done|todo_claim):(T\d+)$", data)
     if not match:
         answer_callback_query(token, callback_id)

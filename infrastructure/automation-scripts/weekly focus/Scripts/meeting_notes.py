@@ -229,7 +229,7 @@ def run_claude(prompt: str) -> Optional[dict]:
         "--model", MODEL,
         "--output-format", "json",
         "--json-schema", json.dumps(SUMMARY_SCHEMA, ensure_ascii=False),
-        "--max-turns", "1",
+        "--max-turns", "4",
         "--no-session-persistence",
         "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep",
     ]
