@@ -8,7 +8,7 @@ model: inherit
 
 Это master skill для factual research.
 
-> **Executor policy (обновлено 2026-07-13):** токеноёмкие стадии — **discovery (поиск URL через curl: DuckDuckGo lite / Google News RSS)**, массовое чтение источников и сборка финального HTML-отчёта — выполняются GPT 5.6 через Codex CLI (с `network_access=true`), чтобы не жечь лимиты Claude. Мозг (главная сессия): brief, source plan, точечная верификация (≤3 WebFetch), синтез — WebSearch/WebFetch массово не вызывает. Fallback discovery при блокировке curl — Haiku/Sonnet-субагент (только URL-список, без чтения страниц). Квота GPT выбита → сообщить Антону; Opus — только по явной команде. Шаблоны вызова — `system/skills/route/SKILL.md`, секция «Контент-deliverables»; полная политика — `infrastructure/Research Dept/CLAUDE.md`, Executor Policy.
+> **Executor policy (обновлено 2026-08-01):** поисковый движок департамента — **Perplexity Sonar API**: `python3 "infrastructure/Research Dept/scripts/perplexity_research.py" "вопрос" --model sonar|sonar-pro` (ключ — `~/.config/second-brain/perplexity.env`). Один вызов = синтезированный ответ + URL-источники; он заменяет прежнюю связку curl-discovery (DDG lite / Google News RSS) → чтение страниц. Серии запросов, structured notes и сборку HTML-отчёта гоняет исполнитель (штатно GPT 5.6 через Codex CLI; ⏸ временно — Opus-субагент), не главная сессия. Мозг (главная сессия): brief, source plan, точечная верификация (≤3 WebFetch по citations Perplexity), синтез — WebSearch/WebFetch массово не вызывает. Fallback при недоступном Perplexity — старая curl-схема или Haiku/Sonnet-субагент (только URL-список). Полная политика — `infrastructure/Research Dept/CLAUDE.md`, Executor Policy.
 
 Канонический department теперь живёт в `infrastructure/Research Dept/`.
 

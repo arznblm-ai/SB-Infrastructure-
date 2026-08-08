@@ -15,12 +15,12 @@
   "log_file": "~/Library/Logs/link-inbox.log",
   "youtube": {
     "enabled": true,
-    "model": "tiny",
+    "model": "parakeet",
     "language": null
   },
   "ugc": {
     "enabled": true,
-    "whisper_model": "tiny",
+    "whisper_model": "parakeet",
     "language": null,
     "max_frames": 4,
     "skip_second_brain_summary": true,

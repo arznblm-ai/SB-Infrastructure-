@@ -1,6 +1,6 @@
 ---
 name: video-transcribe
-description: Transcribe local video files into Markdown notes with faster-whisper. Save course/meeting raw transcripts into `transcripts/` for transcript-summarizer, but save short external videos, reels, X/Twitter videos, TikToks, YouTube Shorts, and similar internet clips into `transcripts/external resources/` unless the user asks otherwise.
+description: Transcribe local video files into Markdown notes with parakeet (GPU, default) or faster-whisper. Save course/meeting raw transcripts into `transcripts/` for transcript-summarizer, but save short external videos, reels, X/Twitter videos, TikToks, YouTube Shorts, and similar internet clips into `transcripts/external resources/` unless the user asks otherwise.
 model: haiku
 ---
 
@@ -71,11 +71,13 @@ python3 "/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/video-transcrib
 
 ## Quality Defaults
 
-Use the default `tiny` model for fast, zero-API local transcripts.
+Default is `--model parakeet` (`mlx-community/parakeet-tdt-0.6b-v3`, Apple Silicon GPU, multilingual ru/en). It is both faster and cleaner than whisper: on a real 65-minute Russian Zoom recording parakeet took 377 s (~10× real time) versus ~12 minutes for whisper `small`, with equal words and better punctuation.
 
-Use `--model small` when the user explicitly wants better quality and is okay with a slower run.
+Use `--model small` (or `tiny`/`medium`/`large-v3`) only when whisper is explicitly wanted — every whisper value keeps working exactly as before. Whisper `small` is also the automatic fallback if parakeet fails for any reason (the script prints `[warn] parakeet failed …` and finishes the file on whisper).
 
-Keep `--beam-size 1` unless there is a quality reason to increase it.
+Keep `--beam-size 1` unless there is a quality reason to increase it. `--beam-size` and `--language` apply to whisper only: parakeet v3 detects language itself and ignores both. `--clip-start` / `--clip-end` work with both engines.
+
+Long files are handled by slicing the decoded audio into 120-second chunks with 12-second overlap and merging on sentence boundaries — parakeet's own `transcribe(chunk_duration=…)` is unusable here because it shells out to ffmpeg, which is not installed.
 
 ## Validation
 
@@ -94,4 +96,4 @@ After transcription:
 
 `scripts/transcribe_video.py`
 
-Run the local faster-whisper transcription workflow, emit progress logs, and save a Markdown transcript with timestamps.
+Run the local transcription workflow (parakeet by default, whisper fallback), emit progress logs, and save a Markdown transcript with timestamps.

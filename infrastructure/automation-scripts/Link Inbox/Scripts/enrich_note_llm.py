@@ -80,7 +80,10 @@ def extract_json(text: str) -> dict:
 
 def call_claude(prompt: str, model: str) -> dict:
     res = subprocess.run(
-        [CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--model", model],
+        [CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--model", model,
+         # транскрипт — недоверенный внешний текст: никаких инструментов (см. digest_builder.py)
+         "--max-turns", "1", "--no-session-persistence",
+         "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep"],
         capture_output=True, text=True, timeout=180,
     )
     if res.returncode != 0:

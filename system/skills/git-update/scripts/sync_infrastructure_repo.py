@@ -38,6 +38,7 @@ FORBIDDEN_FILE_PATTERNS = [
     "*secret*",
     "import_finance_summary_*.ts",
     "seed.ts",
+    "apps_script_webhook.gs",
 ]
 
 SECRET_PATTERNS = [

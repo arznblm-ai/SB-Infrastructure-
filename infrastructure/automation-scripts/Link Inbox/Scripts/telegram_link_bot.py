@@ -90,7 +90,8 @@ def get_updates(token: str, offset: int | None, timeout: int = 50) -> list[dict]
 def allowed(config: dict, chat_id: str) -> bool:
     allowed_ids = [str(item).strip() for item in config["telegram"].get("allowed_chat_ids", []) if str(item).strip()]
     if not allowed_ids:
-        return True
+        # fail-closed: пустой allowlist = никому нельзя (аудит 2026-08-07)
+        return False
     return str(chat_id) in allowed_ids
 
 

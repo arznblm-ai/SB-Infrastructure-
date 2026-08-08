@@ -53,12 +53,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_file": str(DEFAULT_LOG_FILE),
     "youtube": {
         "enabled": True,
-        "model": "tiny",
+        "model": "small",
         "language": None,
     },
     "ugc": {
         "enabled": True,
-        "whisper_model": "tiny",
+        "whisper_model": "small",
         "language": None,
         "max_frames": 4,
         "skip_second_brain_summary": True,

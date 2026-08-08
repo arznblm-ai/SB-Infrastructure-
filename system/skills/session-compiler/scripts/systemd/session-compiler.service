@@ -1,0 +1,13 @@
+[Unit]
+Description=Session Compiler — сырые сессии в знания (sessions/compiled)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=IS_SANDBOX=1
+Environment=CLAUDE_BIN=/root/.local/bin/claude
+Environment=VAULT_ROOT=/root/second-brain
+ExecStart=/bin/bash /root/second-brain/system/skills/session-compiler/scripts/run_compiler.sh
+TimeoutStartSec=3900

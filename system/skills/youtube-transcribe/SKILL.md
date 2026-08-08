@@ -69,11 +69,13 @@ python3 "/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/youtube-transcr
 
 ## Quality Defaults
 
-Use the default `tiny` model for fast local transcripts.
+Default is `--model parakeet` (`mlx-community/parakeet-tdt-0.6b-v3`, Apple Silicon GPU, multilingual ru/en). It is both faster and cleaner than whisper: on a real 65-minute Russian recording parakeet took 377 s (~10× real time) versus ~12 minutes for whisper `small`, with equal words and better punctuation.
 
-Use `--model small` when the user explicitly wants better quality and accepts a slower run.
+Use `--model small` (or `tiny`/`medium`/`large-v3`) only when whisper is explicitly wanted — every whisper value keeps working exactly as before. Whisper `small` is also the automatic fallback if parakeet fails (the script prints `[warn] parakeet failed …` and finishes on whisper).
 
-Keep `--beam-size 1` unless there is a quality reason to change it.
+Keep `--beam-size 1` unless there is a quality reason to change it. `--beam-size` and `--language` apply to whisper only: parakeet v3 detects language itself and ignores both.
+
+Long videos are sliced into 120-second chunks with 12-second overlap and merged on sentence boundaries — parakeet's built-in chunking needs ffmpeg, which is not installed, so audio is decoded via `faster_whisper.audio.decode_audio` and passed to the model as an array.
 
 ## Summary Rules
 
@@ -106,4 +108,4 @@ After transcription and summary creation:
 
 `scripts/transcribe_youtube.py`
 
-Download the best available audio from a public YouTube URL, run local faster-whisper transcription, and save the result into the Vault as Markdown.
+Download the best available audio from a public YouTube URL, run local transcription (parakeet by default, whisper fallback), and save the result into the Vault as Markdown.

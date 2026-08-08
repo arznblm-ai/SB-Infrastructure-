@@ -106,7 +106,7 @@ def main() -> int:
     config = load_config(args.config)
     ugc_cfg = config.get("ugc", {})
     cookies = args.cookies_from_browser or ugc_cfg.get("cookies_from_browser") or ""
-    model = args.whisper_model or ugc_cfg.get("whisper_model") or "tiny"
+    model = args.whisper_model or ugc_cfg.get("whisper_model") or "small"
 
     urls: list[str] = list(args.urls)
     if args.url_file:

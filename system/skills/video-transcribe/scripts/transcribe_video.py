@@ -8,8 +8,10 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from faster_whisper import WhisperModel
-
+PARAKEET_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
+PARAKEET_SR = 16000
+PARAKEET_CHUNK_SEC = 120.0
+PARAKEET_OVERLAP_SEC = 12.0
 
 DEFAULT_OUTPUT_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
 NOTE_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
@@ -105,6 +107,88 @@ def run_transcript_summarizer(transcript_path: Path) -> Path | None:
     return None
 
 
+def parakeet_segments(
+    media_path: Path,
+    clip_start: float | None,
+    clip_end: float | None,
+) -> list[tuple[float, float, str]]:
+    """Предложения (start, end, text) от parakeet.
+
+    Файл декодируем сами: parakeet-mlx принимает путь, но распаковывает его
+    через ffmpeg, которого в системе нет. Длинные записи режем на чанки
+    с перекрытием и склеиваем по границам предложений.
+    """
+    import mlx.core as mx
+    from faster_whisper.audio import decode_audio
+    from parakeet_mlx import from_pretrained
+    from parakeet_mlx.audio import get_logmel
+
+    audio = decode_audio(str(media_path), sampling_rate=PARAKEET_SR)
+    shift = 0.0
+    if clip_start is not None or clip_end is not None:
+        begin = int((clip_start or 0.0) * PARAKEET_SR)
+        finish = int(clip_end * PARAKEET_SR) if clip_end is not None else len(audio)
+        audio = audio[begin:finish]
+        shift = clip_start or 0.0
+
+    model = from_pretrained(PARAKEET_REPO)
+    chunk = int(PARAKEET_CHUNK_SEC * PARAKEET_SR)
+    step = int((PARAKEET_CHUNK_SEC - PARAKEET_OVERLAP_SEC) * PARAKEET_SR)
+    total = len(audio)
+
+    segments: list[tuple[float, float, str]] = []
+    last_end = 0.0
+    for offset in range(0, max(total, 1), step):
+        piece = audio[offset : offset + chunk]
+        if len(piece) < PARAKEET_SR // 2:
+            break
+        is_last = offset + chunk >= total
+        base = offset / PARAKEET_SR
+        piece_end = base + len(piece) / PARAKEET_SR
+
+        result = model.generate(get_logmel(mx.array(piece), model.preprocessor_config))
+        for sentence in (result[0].sentences if result else []):
+            text = sentence.text.strip()
+            start, end = base + sentence.start, base + sentence.end
+            if not text:
+                continue
+            if not is_last and end > piece_end - 1.0:
+                continue
+            if start < last_end - 0.5:
+                continue
+            segments.append((start + shift, end + shift, text))
+            last_end = max(last_end, end)
+        print(
+            f"[progress] segments={len(segments)} up_to={format_ts(piece_end + shift)}",
+            flush=True,
+        )
+        if is_last:
+            break
+    return segments
+
+
+def transcribe_parakeet(
+    video_path: Path,
+    output_path: Path,
+    clip_start: float | None,
+    clip_end: float | None,
+) -> int:
+    segments = parakeet_segments(video_path, clip_start, clip_end)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"# {clean_title(output_path.stem)}\n\n")
+        handle.write(f"- Source: {video_path.name}\n")
+        handle.write(f"- Model: parakeet-tdt-0.6b-v3\n")
+        handle.write("- Language: auto (multilingual)\n\n")
+        handle.write("## Transcript\n\n")
+        for start, end, text in segments:
+            handle.write(f"**[{format_ts(start)} - {format_ts(end)}]** {text}\n\n")
+
+    sync_import_timestamp(output_path)
+    return len(segments)
+
+
 def transcribe(
     video_path: Path,
     output_path: Path,
@@ -114,6 +198,19 @@ def transcribe(
     clip_start: float | None,
     clip_end: float | None,
 ) -> int:
+    if model_name == "parakeet":
+        try:
+            return transcribe_parakeet(video_path, output_path, clip_start, clip_end)
+        except Exception as exc:
+            print(
+                f"[warn] parakeet failed ({type(exc).__name__}: {exc}); "
+                f"falling back to faster-whisper small",
+                flush=True,
+            )
+            model_name = "small"
+
+    from faster_whisper import WhisperModel
+
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
     transcribe_kwargs = {
@@ -182,8 +279,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="tiny",
-        help="faster-whisper model name. Use tiny for speed or small for better quality.",
+        default="parakeet",
+        help=(
+            "parakeet (default, GPU, multilingual) or a faster-whisper model name "
+            "(tiny/small/medium/large-v3). Whisper stays the fallback if parakeet fails."
+        ),
     )
     parser.add_argument("--beam-size", type=int, default=1, help="Whisper beam size")
     parser.add_argument("--language", help="Force a language code such as ru or en")

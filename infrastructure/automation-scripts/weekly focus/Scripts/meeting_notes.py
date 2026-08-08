@@ -3,12 +3,20 @@
 meeting_notes.py — Meeting Notes Assistant.
 
 Следит за transcripts/: когда Krisp-транскрипт встречи готов, делает короткое
-shareable summary (claude haiku), шлёт его в Telegram (Daily Focus бот) и
-складывает таски встречи в "meeting todo/" для команд /todo в боте.
+shareable summary (claude haiku), шлёт его в Telegram и складывает таски встречи
+в "meeting todo/" (для /todo в боте) и в Todoist.
 
-LaunchAgent: com.user.meeting-notes (WatchPaths на transcripts/ + StartInterval 600)
-Лог: ~/Library/Logs/meeting-notes.log
+Кроссплатформенно (мак + VPS): корень vault и пути берутся от расположения
+скрипта / $HOME, env `SECOND_BRAIN_VAULT` переопределяет корень.
+Мак: LaunchAgent com.user.meeting-notes (WatchPaths на transcripts/ + StartInterval 600).
+VPS: systemd meeting-notes.timer (deploy/meeting-notes.{service,timer}).
+
+Лог: ~/Library/Logs/meeting-notes.log (мак) / ~/.local/share/meeting-notes.log (Linux)
 State: ~/.config/second-brain/meeting-notes-state.json (ключ = krisp id, exactly-once)
+Доставка ноутса: ~/.config/second-brain/meeting-notes-delivery.env (топик Гермеса),
+при отсутствии/неполноте конфига — прежний канал daily-focus.env (личный чат).
+VPS sync: на маке в конце прогона state и todoist-todo-map best-effort пушатся на
+VPS, где их читает TG-бот (см. sync_state_to_vps; на самом VPS выключен).
 """
 
 import argparse
@@ -21,19 +29,69 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
+import todoist_client
 from task_owner import classify_owner
 
-VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
+
+def _vault_root() -> Path:
+    """Корень vault: env-переопределение, иначе — от расположения скрипта.
+
+    Скрипт лежит в <vault>/infrastructure/daily focus/Scripts/, поэтому parents[3]
+    даёт корень и на маке, и на VPS (/root/second-brain), где vault зеркалится.
+    """
+    override = os.environ.get("SECOND_BRAIN_VAULT")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parents[3]
+
+
+def _log_path() -> Path:
+    """~/Library/Logs на маке, ~/.local/share на Linux (VPS)."""
+    mac_logs = Path.home() / "Library" / "Logs"
+    if mac_logs.is_dir():
+        return mac_logs / "meeting-notes.log"
+    linux_logs = Path.home() / ".local" / "share"
+    try:
+        linux_logs.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return Path("/tmp/meeting-notes.log")
+    return linux_logs / "meeting-notes.log"
+
+
+VAULT = _vault_root()
 TRANSCRIPTS_DIR = VAULT / "transcripts"
 DAILY_DIR = VAULT / "infrastructure" / "daily focus"
 TODO_DIR = DAILY_DIR / "meeting todo"
-ENV_FILE = Path("/Users/anton/.config/second-brain/daily-focus.env")
-STATE_FILE = Path("/Users/anton/.config/second-brain/meeting-notes-state.json")
-LOCK_FILE = Path("/Users/anton/.config/second-brain/meeting-notes.lock")
-LOG_FILE = Path("/Users/anton/Library/Logs/meeting-notes.log")
-CLAUDE_BIN = "/Users/anton/.local/bin/claude"
+STATE_DIR = Path.home() / ".config" / "second-brain"
+ENV_FILE = STATE_DIR / "daily-focus.env"
+TODOIST_LABEL_MAP_PATH = STATE_DIR / "todoist-label-map.json"
+STATE_FILE = STATE_DIR / "meeting-notes-state.json"
+LOCK_FILE = STATE_DIR / "meeting-notes.lock"
+LOG_FILE = _log_path()
+
+# ── Доставка ноутса встречи ───────────────────────────────────────────────
+# Ноутс уходит в топик Гермеса токеном его бота, если есть полный конфиг
+# meeting-notes-delivery.env; иначе — прежний канал (daily-focus.env, личный чат).
+# Маркер контракта грепает ранбук deploy/apply_meeting_notes_vps.sh — не удалять.
+DELIVERY_CONTRACT = "meeting-notes-delivery-v1"
+DELIVERY_ENV_FILE = STATE_DIR / "meeting-notes-delivery.env"
+TG_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
+
+# ── Синк state на VPS ─────────────────────────────────────────────────────
+# Кэш саммари (/meeting, /meetings, /summary) и mapping T<n> → Todoist id пишутся
+# здесь, а читаются TG-ботом на VPS — поэтому в конце прогона пушим оба файла.
+# На самом VPS синк не нужен: sync_state_to_vps выходит рано (см. running_on_vps).
+# Best-effort: любая ошибка → строка в лог, прогон не падает.
+VPS_SYNC_HOST = os.environ.get("VPS_SYNC_HOST", "root@163.5.29.10")
+VPS_SYNC_KEY = Path(os.environ.get("VPS_SYNC_KEY", str(Path.home() / ".ssh" / "id_ed25519_vps")))
+VPS_SYNC_REMOTE_DIR = os.environ.get("VPS_SYNC_REMOTE_DIR", "/root/.config/second-brain/")
+VPS_SYNC_REMOTE_VAULT = Path("/root/second-brain")
+VPS_SYNC_CONNECT_TIMEOUT = 5
+VPS_SYNC_TOTAL_TIMEOUT = 15
+
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", str(Path.home() / ".local" / "bin" / "claude"))
 MODEL = "haiku"
 MAX_AGE_DAYS = 3
 MAX_LLM_ATTEMPT_RUNS = 3
@@ -47,6 +105,33 @@ TRANSCRIPT_TAIL_CHARS = 10_000
 
 TRANSCRIPT_LOADING_PLACEHOLDER = "_Транскрипт загружается из Krisp..._"
 TRANSCRIPT_MISSING_PLACEHOLDER = "_Транскрипт не получен. Откройте Krisp и скопируйте вручную._"
+
+# ── Классификация задач (2026-08-05) ──────────────────────────────────────
+# Области — ровно те, что заведены как area_labels в todoist-ids.json.
+# Модель НЕ придумывает новые: только выбор из списка или NO_AREA.
+NO_AREA = "без области"
+AREA_CHOICES = [
+    "AI-видеопродакшн",
+    "UGC/SMM контент-завод",
+    "Yandex.Scale CGI Promo",
+    "Карьера",
+    "Кино и экранизации",
+    "Консалтинг Creative Industry",
+    "Перекрёсток",
+    NO_AREA,
+]
+# Короткие префиксы для title_short (формула «Область · действие — с кем»)
+AREA_SHORT = {
+    "AI-видеопродакшн": "AI-видео",
+    "UGC/SMM контент-завод": "UGC",
+    "Yandex.Scale CGI Promo": "Яндекс.Скейл",
+    "Карьера": "Карьера",
+    "Кино и экранизации": "Кино",
+    "Консалтинг Creative Industry": "Хаб",
+    "Перекрёсток": "Перекрёсток",
+}
+TITLE_SHORT_MAX = 70
+DUE_MAX_DAYS_AHEAD = 90
 
 SUMMARY_SCHEMA = {
     "type": "object",
@@ -67,8 +152,13 @@ SUMMARY_SCHEMA = {
                     "who": {"type": "string"},
                     "what": {"type": "string"},
                     "deadline": {"type": "string"},
+                    "type": {"type": "string", "enum": ["task", "fact"]},
+                    "area": {"type": "string", "enum": AREA_CHOICES},
+                    "counterparty": {"type": ["string", "null"]},
+                    "title_short": {"type": "string", "maxLength": TITLE_SHORT_MAX},
+                    "due_suggested": {"type": ["string", "null"]},
                 },
-                "required": ["who", "what"],
+                "required": ["who", "what", "type", "area", "title_short"],
             },
         },
         "detailed_lines": {
@@ -88,12 +178,17 @@ PROMPT_TEMPLATE = """Ты готовишь короткую заметку по 
 - Строго по транскрипту: ничего не выдумывай, не додумывай имена, даты и договорённости.
 - summary_lines: 3-6 коротких строк (каждая до 90 символов) — суть обсуждения, решения и договорённости. Без воды, без вступлений вроде "на встрече обсудили".
 - НИКАКОЙ личной информации об Антоне: ни финансов, ни здоровья, ни планов, ни других его проектов и бизнесов, если они не были предметом именно этой встречи.
-- tasks: только явные договорённости и обещания из встречи. who — имя исполнителя из транскрипта. Владелец этих заметок — Антон Розенблюм: если исполнитель — участник, подписанный как Speaker_N, но по контексту транскрипта понятно, кто это (например, к нему обращаются по имени), пиши реальное имя. Если транскрипт без меток спикеров (диктофонная запись) и обещание сформулировано от первого лица («я сделаю», «я напишу»), исполнитель — Антон. "unknown" — только если исполнителя действительно нельзя определить. what — короткая формулировка задачи. deadline — только если срок явно назван (формат как в транскрипте), иначе пустая строка.
+- tasks: только actionable поручения — конкретное действие, которое конкретный человек обязался или должен сделать после встречи (глагол действия + исполнитель). who — имя исполнителя из транскрипта. Владелец этих заметок — Антон Розенблюм: если исполнитель — участник, подписанный как Speaker_N, но по контексту транскрипта понятно, кто это (например, к нему обращаются по имени), пиши реальное имя. Если транскрипт без меток спикеров (диктофонная запись) и обещание сформулировано от первого лица («я сделаю», «я напишу»), исполнитель — Антон. "unknown" — только если исполнителя действительно нельзя определить. what — короткая формулировка задачи. deadline — только если срок явно назван (формат как в транскрипте), иначе пустая строка.
+- type у каждого элемента tasks: "task" — поручение или обещание (кто-то что-то сделает после встречи); "fact" — констатация, решение, итог, вывод или цель встречи, которые НЕ являются действием. Это факты, а не задачи: «Цель встречи — обсудить X», «Брендирование подтверждено», «YouTube оказался единственной площадкой». Факты и решения относятся в summary_lines/detailed_lines, в tasks их включать не нужно. Если сомневаешься — ставь type: "fact".
+- area у каждого элемента tasks: к какой рабочей области относится задача. Выбирай СТРОГО одно значение из списка: {areas}. Новые области придумывать нельзя. Если по содержанию встречи область не определяется однозначно — ставь "{no_area}".
+- counterparty у каждого элемента tasks: имя человека из встречи, с кем связана задача (кому отправить, с кем согласовать, от кого ждём). Если такого человека нет — null.
+- title_short у каждого элемента tasks: короткая формулировка задачи для трекера, максимум 70 символов, по формуле «Область · действие — с кем». Короткие префиксы областей: {area_prefixes}. Если область "{no_area}" — префикс не ставь, пиши только действие. Примеры: «Хаб · отправить Юрчику резюме», «Карьера · пересобрать профиль LinkedIn с нуля», «UGC · матрица форматов UGC/AIGC (10+) — для Ильдара». Не копируй дословную фразу из транскрипта — переформулируй в осмысленное действие.
+- due_suggested у каждого элемента tasks: срок в формате YYYY-MM-DD, и ТОЛЬКО если срок реально прозвучал в разговоре. Относительные формулировки («в понедельник», «завтра», «до конца недели», «через две недели») пересчитывай в абсолютную дату относительно даты встречи, указанной ниже. Если срок не назывался — null. Выдумывать сроки запрещено.
 - title: короткое название встречи по её содержанию (2-5 слов).
 - detailed_lines: развёрнутое саммари, 10-25 строк (каждая до 200 символов) — тоже безопасное для пересылки коллегам, те же запреты на личную информацию. Покрой: контекст и цель встречи; участники и их роли; ход обсуждения с позициями и аргументами сторон; названные цифры, факты, названия; принятые решения; договорённости; открытые вопросы и на чём остановились. Пиши плотно и конкретно, без воды, каждая строка — законченная мысль.
 
 Название файла встречи: {title}
-Дата встречи: {date}
+Дата встречи: {date} — считай эту дату «сегодня» при пересчёте относительных сроков в due_suggested.
 
 Материалы встречи:
 
@@ -125,7 +220,7 @@ def load_env_file(path: Path) -> dict[str, str]:
     return env
 
 
-def send_message(token: str, chat_id: str, text: str, reply_markup: Optional[dict] = None) -> None:
+def send_message(token: str, chat_id: str, text: str, thread_id: Optional[str] = None) -> None:
     remaining = text.strip() or "(empty message)"
     while remaining:
         chunk, remaining = remaining[:3500], remaining[3500:]
@@ -135,10 +230,83 @@ def send_message(token: str, chat_id: str, text: str, reply_markup: Optional[dic
             "--data-urlencode", f"text={chunk}",
             "--data-urlencode", "disable_web_page_preview=true",
         ]
-        if reply_markup and not remaining:  # клавиатура только на последнем чанке
-            command.extend(["--data-urlencode", f"reply_markup={json.dumps(reply_markup, ensure_ascii=False)}"])
+        if thread_id:
+            command.extend(["--data-urlencode", f"message_thread_id={thread_id}"])
         command.append(f"https://api.telegram.org/bot{token}/sendMessage")
         subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+
+
+# ── Каналы доставки ───────────────────────────────────────────────────────
+
+class Channel(NamedTuple):
+    """Куда слать: токен бота, чат и (опционально) топик форума."""
+    token: str
+    chat_id: str
+    thread_id: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+
+def send_to(channel: Channel, text: str) -> None:
+    send_message(channel.token, channel.chat_id, text, thread_id=channel.thread_id)
+
+
+def read_token_file(path: Path) -> str:
+    """Токен из отдельного файла: строка вида KEY=значение или голая строка."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        log(f"delivery: не читается token file {path}: {type(exc).__name__}: {exc}")
+        return ""
+    fallback = ""
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        value = line.split("=", 1)[1] if "=" in line else line
+        value = value.strip().strip('"').strip("'").strip()
+        if not value:
+            continue
+        if TG_TOKEN_RE.match(value):  # похоже на телеграм-токен — берём сразу
+            return value
+        fallback = fallback or value
+    return fallback
+
+
+def load_delivery_channel() -> Optional[Channel]:
+    """Канал доставки ноутса из meeting-notes-delivery.env, либо None.
+
+    None означает «конфига нет или он неполон» — вызывающий код падает на
+    прежний канал (daily-focus.env, личный чат) и пишет строку в лог.
+    """
+    if not DELIVERY_ENV_FILE.exists():
+        log(f"delivery: конфига {DELIVERY_ENV_FILE} нет → прежний канал (daily-focus.env)")
+        return None
+    try:
+        env = load_env_file(DELIVERY_ENV_FILE)
+    except Exception as exc:
+        log(f"delivery: {DELIVERY_ENV_FILE} не разобран ({type(exc).__name__}: {exc}) → прежний канал")
+        return None
+    token = env.get("MEETING_NOTES_TG_TOKEN", "").strip()
+    token_file = env.get("MEETING_NOTES_TG_TOKEN_FILE", "").strip()
+    if not token and token_file:
+        token = read_token_file(Path(token_file).expanduser())
+    chat_id = env.get("MEETING_NOTES_CHAT_ID", "").strip()
+    thread_id = env.get("MEETING_NOTES_THREAD_ID", "").strip()
+    missing = [
+        name for name, value in (
+            ("MEETING_NOTES_TG_TOKEN|_FILE", token),
+            ("MEETING_NOTES_CHAT_ID", chat_id),
+            ("MEETING_NOTES_THREAD_ID", thread_id),
+        ) if not value
+    ]
+    if missing:
+        log(f"delivery: в {DELIVERY_ENV_FILE.name} не хватает {', '.join(missing)} → прежний канал")
+        return None
+    log(f"delivery: ноутсы уходят в chat {chat_id}, топик {thread_id} ({DELIVERY_CONTRACT})")
+    return Channel(token=token, chat_id=chat_id, thread_id=thread_id)
 
 
 # ── Парсинг транскрипт-заметок (тот же формат, что пишет krisp_to_obsidian) ─
@@ -267,6 +435,46 @@ def run_claude(prompt: str) -> Optional[dict]:
     return None
 
 
+def clean_area(value: object) -> str:
+    """Область только из фиксированного списка; всё прочее → «без области»."""
+    text = str(value or "").strip()
+    if text in AREA_CHOICES and text != NO_AREA:
+        return text
+    return NO_AREA
+
+
+def clean_title_short(value: object, fallback: str) -> str:
+    """<=70 символов по границе слова; пустое → исходный текст задачи."""
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        text = re.sub(r"\s+", " ", str(fallback or "").strip())
+    if len(text) <= TITLE_SHORT_MAX:
+        return text
+    cut = text[:TITLE_SHORT_MAX]
+    space = cut.rfind(" ")
+    if space >= TITLE_SHORT_MAX // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:—-·")
+
+
+def clean_due(value: object, today: Optional[dt.date] = None) -> Optional[str]:
+    """YYYY-MM-DD в окне [сегодня; сегодня+90 дней], иначе None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", text)
+    if not m:
+        return None
+    try:
+        parsed = dt.datetime.strptime(m.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    base = today or dt.date.today()
+    if parsed < base or parsed > base + dt.timedelta(days=DUE_MAX_DAYS_AHEAD):
+        return None
+    return parsed.isoformat()
+
+
 def validate_summary(data: dict) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
@@ -287,16 +495,29 @@ def validate_summary(data: dict) -> Optional[dict]:
     if len(clean_lines) < 2:
         return None
     clean_tasks = []
+    dropped_facts = 0
     for task in tasks[:10]:
         if not isinstance(task, dict):
             continue
         what = str(task.get("what", "")).strip()
         if not what:
             continue
+        # classify-then-filter: модель сама помечает констатации как fact,
+        # отсутствующий/пустой type = "task" (fallback-движок и старый кэш state)
+        if str(task.get("type", "task")).strip().lower() == "fact":
+            dropped_facts += 1
+            continue
+        counterparty = task.get("counterparty")
+        counterparty = str(counterparty).strip() if counterparty else ""
         clean_tasks.append({
             "who": str(task.get("who", "")).strip() or "unknown",
             "what": what,
             "deadline": str(task.get("deadline", "")).strip(),
+            # haiku слабая — поля модели всегда проходят валидацию в коде
+            "area": clean_area(task.get("area")),
+            "counterparty": counterparty,
+            "title_short": clean_title_short(task.get("title_short"), what),
+            "due_suggested": clean_due(task.get("due_suggested")),
         })
     detailed = []
     for line in data.get("detailed_lines") or []:
@@ -306,6 +527,8 @@ def validate_summary(data: dict) -> Optional[dict]:
         if len(text) > 250:
             text = text[:247].rstrip() + "..."
         detailed.append(text)
+    if dropped_facts:
+        log(f"tasks: отброшено как факты (type=fact): {dropped_facts}")
     return {
         "title": title,
         "summary_lines": clean_lines[:8],
@@ -315,7 +538,14 @@ def validate_summary(data: dict) -> Optional[dict]:
 
 
 def summarize_llm(content: str, title: str, date: str) -> Optional[dict]:
-    prompt = PROMPT_TEMPLATE.format(title=title, date=date, body=build_llm_body(content))
+    prompt = PROMPT_TEMPLATE.format(
+        title=title,
+        date=date,
+        body=build_llm_body(content),
+        areas=" | ".join(AREA_CHOICES),
+        no_area=NO_AREA,
+        area_prefixes=", ".join(f"{short} (= {full})" for full, short in AREA_SHORT.items()),
+    )
     for attempt in (1, 2):
         data = run_claude(prompt)
         summary = validate_summary(data) if data else None
@@ -357,7 +587,17 @@ def summarize_fallback(content: str, title: str) -> Optional[dict]:
             text = text[:m.start()].rstrip(" .")
         if not text:
             continue
-        tasks.append({"who": who, "what": text[:200], "deadline": deadline})
+        # Детерминированный путь: область доопределяется label-map в append_todos,
+        # title_short = исходный текст, срок модель не пересчитывает.
+        tasks.append({
+            "who": who,
+            "what": text[:200],
+            "deadline": deadline,
+            "area": NO_AREA,
+            "counterparty": "",
+            "title_short": clean_title_short(text[:200], text[:200]),
+            "due_suggested": None,
+        })
         if len(tasks) >= 10:
             break
     if len(lines) < 2:
@@ -410,6 +650,23 @@ def append_todos(summary: dict, note_path: str, meeting_date: str, dry_run: bool
     items: list[dict] = []
     now_stamp = time.strftime("%Y-%m-%d %H:%M")
     source_meeting = f"{summary.get('title', 'встреча')} – {meeting_date}"
+    # Todoist: area-label встречи ищем один раз на всю встречу (все задачи — в Inbox,
+    # рабочая область помечается label-ом; best-effort, см. todoist_client)
+    try:
+        todoist_area_label = todoist_client.todoist_label_for_meeting(
+            source_meeting, TODOIST_LABEL_MAP_PATH, log_fn=log
+        )
+    except Exception as exc:
+        todoist_area_label = None
+        log(f"todoist: area label lookup failed for '{source_meeting}': {exc}")
+    # Секция «📥 Новое — без даты»: все задачи встреч приземляются туда (id из конфига)
+    intake_section = None
+    if not dry_run:
+        try:
+            intake_section = todoist_client.section_id("intake", log_fn=log)
+        except Exception as exc:
+            log(f"todoist: intake section lookup failed: {type(exc).__name__}: {exc}")
+    todoist_created: dict[str, str] = {}
     for task in tasks:
         key = task_key(task["what"])
         if not key or key in seen_keys:
@@ -419,6 +676,62 @@ def append_todos(summary: dict, note_path: str, meeting_date: str, dry_run: bool
         todo_id = f"T{max_id}"
         owner = classify_owner(task["who"])
         items.append({"id": todo_id, "what": task["what"], "who": task["who"], "owner": owner})
+        # Область: ручной override Антона (label-map) → поле area модели → без области
+        area = todoist_area_label or clean_area(task.get("area"))
+        area_label = area if area != NO_AREA else None
+        title_short = clean_title_short(task.get("title_short"), task["what"])
+        due_suggested = clean_due(task.get("due_suggested"))
+        if owner == "other":
+            # Чужие задачи в Todoist не переносятся (решение Антона 2026-07-31):
+            # они остаются в vault-сторе и в shareable-сообщении встречи.
+            (print if dry_run else log)(f"todoist: skip other-owned task {todo_id}")
+        elif dry_run:
+            print(
+                f"todoist: would create task for {todo_id} (owner={owner})\n"
+                f"    area:          {area}\n"
+                f"    title_short:   {title_short}\n"
+                f"    due_suggested: {due_suggested or 'нет'}\n"
+                f"    дедуп:         не проверялся (--dry-run в Todoist не ходит)"
+            )
+        else:
+            # Создание задачи не должно ломать запись в vault-стор ни при каком сбое
+            task_id = None
+            try:
+                duplicate_id = todoist_client.find_duplicate(
+                    title_short, area_label=area_label, vault_id=None, log_fn=log
+                )
+            except Exception as exc:
+                duplicate_id = None
+                log(f"todoist: duplicate lookup failed for {todo_id}: {type(exc).__name__}: {exc}")
+            if duplicate_id:
+                log(f"todoist: duplicate {duplicate_id} for {todo_id} '{title_short}', задача не создаётся")
+                try:
+                    todoist_client.append_description_line(
+                        duplicate_id,
+                        f"Также из встречи: {source_meeting} ({todo_id})",
+                        log_fn=log,
+                    )
+                except Exception as exc:
+                    log(f"todoist: description append failed for {duplicate_id}: {type(exc).__name__}: {exc}")
+            else:
+                try:
+                    task_id = todoist_client.create_task(
+                        title=title_short,
+                        vault_id=todo_id,
+                        source_meeting=source_meeting,
+                        who=task["who"],
+                        created=now_stamp,
+                        owner=owner,
+                        area_label=area_label,
+                        log_fn=log,
+                        section_id=intake_section,
+                        due_date=due_suggested,
+                    )
+                except Exception as exc:
+                    task_id = None
+                    log(f"todoist: create task failed for {todo_id}: {type(exc).__name__}: {exc}")
+            if task_id:
+                todoist_created[todo_id] = task_id
         blocks.append(
             f"- id: {todo_id}\n"
             f"  task: {task['what']}\n"
@@ -442,6 +755,14 @@ def append_todos(summary: dict, note_path: str, meeting_date: str, dry_run: bool
         if is_new:
             f.write(f"# Meeting TODO — {today}\n\n")
         f.write("\n".join(blocks) + "\n")
+    if todoist_created:
+        # Один merge-write на встречу: T<n> → task id (для быстрого закрытия по ✔)
+        try:
+            mapping = todoist_client.load_todo_task_map(log_fn=log)
+            mapping.update(todoist_created)
+            todoist_client.save_todo_task_map(mapping, log_fn=log)
+        except Exception as exc:
+            log(f"todoist: cannot persist todo map: {type(exc).__name__}: {exc}")
     return items
 
 
@@ -466,54 +787,6 @@ def format_shareable_message(summary: dict, meeting_date: str) -> str:
                 item += f" ({prefix}{deadline})"
             lines.append(item)
     return "\n".join(lines)
-
-
-def _short_task(text: str, limit: int = 60) -> str:
-    text = text.strip()
-    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
-
-
-def format_private_message(items: list[dict], engine: str) -> str:
-    mine = [i for i in items if i["owner"] == "me"]
-    others = [i for i in items if i["owner"] == "other"]
-    unclear = [i for i in items if i["owner"] == "unknown"]
-    sections: list[str] = []
-    if mine:
-        lines = ["Мои задачи → /todo:"]
-        lines += [f"• {i['id']} — {_short_task(i['what'])}" for i in mine]
-        sections.append("\n".join(lines))
-    if others:
-        lines = ["Задачи других:"]
-        lines += [f"• {i['id']} — {i['who']}: {_short_task(i['what'])}" for i in others]
-        sections.append("\n".join(lines))
-    if unclear:
-        lines = ["Без исполнителя (➕ — взять себе):"]
-        lines += [f"• {i['id']} — {_short_task(i['what'])}" for i in unclear]
-        sections.append("\n".join(lines))
-    if sections:
-        text = "\n\n".join(sections) + "\n\nСписок: /todo, детали встречи: /meeting"
-    else:
-        text = "Новых задач из встречи не добавил (нет явных договорённостей или дубли)."
-    if engine == "fallback":
-        text += "\n(авто-выжимка без LLM)"
-    return text
-
-
-def todo_keyboard(items: list[dict]) -> Optional[dict]:
-    """Inline-кнопки: ✔ для задач Антона, ➕ (взять себе) для unknown;
-    callback обрабатывает telegram_codex_bot."""
-    buttons = [
-        {"text": f"✔ {i['id']}", "callback_data": f"mnote_done:{i['id']}"}
-        for i in items if i["owner"] == "me"
-    ] + [
-        {"text": f"➕ {i['id']}", "callback_data": f"todo_claim:{i['id']}"}
-        for i in items if i["owner"] == "unknown"
-    ]
-    if not buttons:
-        return None
-    buttons = buttons[:30]
-    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
-    return {"inline_keyboard": rows}
 
 
 def format_detail_message(summary: dict, meeting_date: str) -> str:
@@ -545,6 +818,62 @@ def save_state(state: dict) -> None:
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, STATE_FILE)
+
+
+def running_on_vps() -> bool:
+    """Скрипт уже крутится на VPS (vault смонтирован как /root/second-brain)."""
+    try:
+        return VAULT.resolve() == VPS_SYNC_REMOTE_VAULT
+    except Exception:
+        return False
+
+
+def sync_state_to_vps() -> None:
+    """Best-effort push кэша встреч и todo-map на VPS (там их читает TG-бот).
+
+    Никогда не бросает исключений: любая проблема (нет ключа, нет сети, VPS лежит)
+    пишется одной строкой в лог с префиксом "vps-sync:" и прогон продолжается.
+    Отключается через VPS_SYNC_DISABLE=1; на самом VPS выключается автоматически
+    (пушить некуда — state уже локальный).
+    """
+    if os.environ.get("VPS_SYNC_DISABLE") == "1":
+        log("vps-sync: skipped (VPS_SYNC_DISABLE=1)")
+        return
+    if running_on_vps():
+        log(f"vps-sync: skipped (уже на VPS, vault={VAULT})")
+        return
+    try:
+        candidates = [STATE_FILE, todoist_client.TODO_TASK_MAP_FILE]
+        files = [p for p in candidates if p.exists()]
+        if not files:
+            log("vps-sync: nothing to push (state files not found)")
+            return
+        if not VPS_SYNC_KEY.exists():
+            log(f"vps-sync: ssh key not found: {VPS_SYNC_KEY}")
+            return
+        cmd = [
+            "scp", "-q",
+            "-i", str(VPS_SYNC_KEY),
+            "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={VPS_SYNC_CONNECT_TIMEOUT}",
+            "-o", "StrictHostKeyChecking=accept-new",
+            *[str(p) for p in files],
+            f"{VPS_SYNC_HOST}:{VPS_SYNC_REMOTE_DIR}",
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=VPS_SYNC_TOTAL_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            detail = " ".join((proc.stderr or proc.stdout or "").split())[:200]
+            log(f"vps-sync: scp exit {proc.returncode}: {detail}")
+            return
+        names = ", ".join(p.name for p in files)
+        log(f"vps-sync: pushed {names} → {VPS_SYNC_HOST}:{VPS_SYNC_REMOTE_DIR}")
+    except subprocess.TimeoutExpired:
+        log(f"vps-sync: timeout after {VPS_SYNC_TOTAL_TIMEOUT}s")
+    except Exception as exc:
+        log(f"vps-sync: {type(exc).__name__}: {exc}")
 
 
 def acquire_lock() -> bool:
@@ -599,10 +928,12 @@ def process_meeting(
     path: Path,
     content: str,
     date: dt.date,
-    token: str,
-    chat_id: str,
+    note_channel: Channel,
+    alert_channel: Channel,
     dry_run: bool,
 ) -> None:
+    """note_channel — shareable-ноутс (топик Гермеса или прежний канал),
+    alert_channel — технические алерты (⏳/❌), всегда прежний личный чат."""
     title = note_title(content, path)
     entry["note_path"] = str(path)
     entry["title"] = title
@@ -619,8 +950,8 @@ def process_meeting(
                 log(f"abandoned (no transcript >24h): {path.name}")
                 if not dry_run:
                     try:
-                        send_message(
-                            token, chat_id,
+                        send_to(
+                            alert_channel,
                             f"❌ «{title}» ({date.isoformat()}): Krisp так и не выгрузил транскрипт за 24 ч. "
                             f"Открой Krisp и вставь транскрипт в заметку вручную — тогда пришлю саммари.",
                         )
@@ -641,8 +972,8 @@ def process_meeting(
                 if (now - since).total_seconds() / 3600 > WARN_PENDING_AFTER_HOURS and not dry_run:
                     entry["pending_warned"] = True
                     try:
-                        send_message(
-                            token, chat_id,
+                        send_to(
+                            alert_channel,
                             f"⏳ «{title}» ({date.isoformat()}): жду транскрипт из облака Krisp дольше обычного "
                             f"(>{WARN_PENDING_AFTER_HOURS} ч). Продолжаю проверять; если за 24 ч не появится — пришлю alert.",
                         )
@@ -684,20 +1015,16 @@ def process_meeting(
             entry["todo_ids"] = [i["id"] for i in entry["todo_items"]]
 
     shareable = format_shareable_message(summary, entry["date"])
-    private = f"Встреча: {title}\n\n" + format_private_message(entry["todo_items"], summary.get("engine", "llm"))
 
     if dry_run:
-        print("--- message 1 (shareable) ---")
+        print("--- message (shareable note) ---")
         print(shareable)
-        print("--- message 2 (private) ---")
-        print(private)
         print("--- detail (/meeting) ---")
         print(format_detail_message(summary, entry["date"]))
         return
 
     try:
-        send_message(token, chat_id, shareable)
-        send_message(token, chat_id, private, reply_markup=todo_keyboard(entry["todo_items"]))
+        send_to(note_channel, shareable)
     except Exception as exc:
         log(f"telegram send failed (will retry): {path.name}: {exc}")
         return
@@ -726,7 +1053,7 @@ def run_detail(key: str) -> int:
     log(f"detail: generating for {note_path.name}")
     fresh = summarize_llm(content, title, entry.get("date", ""))
     if not fresh or not fresh.get("detailed_lines"):
-        print("Не удалось сгенерировать детальное саммари (ошибка LLM). Лог: ~/Library/Logs/meeting-notes.log")
+        print(f"Не удалось сгенерировать детальное саммари (ошибка LLM). Лог: {LOG_FILE}")
         return 1
     if summary:
         summary["detailed_lines"] = fresh["detailed_lines"]
@@ -785,16 +1112,30 @@ def main() -> int:
                     })
                     log(f"bootstrap: marked sent: {path.name}")
             save_state(state)
+            sync_state_to_vps()
             return 0
 
-        token = chat_id = ""
+        # Каналы: ноутс — в топик Гермеса (если есть конфиг), алерты — прежний
+        # личный чат. Нет одного из каналов → его роль берёт на себя второй.
+        note_channel = alert_channel = Channel("", "")
         if not args.dry_run:
-            env = load_env_file(ENV_FILE)
-            token = env.get("TELEGRAM_BOT_TOKEN", "")
-            chat_id = env.get("TELEGRAM_CHAT_ID", "")
-            if not token or not chat_id:
-                log("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing in env file")
-                return 1
+            try:
+                env = load_env_file(ENV_FILE)
+            except Exception as exc:
+                env = {}
+                log(f"env: {exc}")
+            alert_channel = Channel(
+                token=env.get("TELEGRAM_BOT_TOKEN", ""),
+                chat_id=env.get("TELEGRAM_CHAT_ID", ""),
+            )
+            delivery = load_delivery_channel()
+            note_channel = delivery or alert_channel
+            if not alert_channel.ok:
+                if not note_channel.ok:
+                    log("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing in env file")
+                    return 1
+                log("env: daily-focus.env неполон — алерты уйдут в канал доставки ноутсов")
+                alert_channel = note_channel
 
         # защита: два файла с одним krisp/voice id — признак сбоя матчинга
         # (реальный транскрипт мог попасть в чужую заметку и остаться необработанным)
@@ -812,8 +1153,8 @@ def main() -> int:
             log(f"WARNING: duplicate key {key} in files: {names}")
             if not args.dry_run:
                 try:
-                    send_message(
-                        token, chat_id,
+                    send_to(
+                        alert_channel,
                         f"⚠️ Два транскрипта с одним Krisp ID ({key[:13]}…): {names}. "
                         f"Возможен сбой матчинга krisp-логгера — саммари одной из встреч могло не прийти. Проверь файлы.",
                     )
@@ -829,12 +1170,15 @@ def main() -> int:
                 if args.dry_run and entry.get("status") in {"sent", "failed", "abandoned"}:
                     continue
             try:
-                process_meeting(entry, path, content, date, token, chat_id, args.dry_run)
+                process_meeting(
+                    entry, path, content, date, note_channel, alert_channel, args.dry_run
+                )
             except Exception as exc:
                 log(f"error processing {path.name}: {exc}")
 
         if not args.dry_run:
             save_state(state)
+            sync_state_to_vps()
         return 0
     finally:
         release_lock()

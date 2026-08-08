@@ -10,8 +10,11 @@ from datetime import datetime
 from pathlib import Path
 
 import yt_dlp
-from faster_whisper import WhisperModel
 
+PARAKEET_REPO = "mlx-community/parakeet-tdt-0.6b-v3"
+PARAKEET_SR = 16000
+PARAKEET_CHUNK_SEC = 120.0
+PARAKEET_OVERLAP_SEC = 12.0
 
 DEFAULT_OUTPUT_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources")
 TRANSCRIPTS_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
@@ -121,6 +124,127 @@ def download_audio(url: str, temp_dir: Path) -> tuple[Path, dict]:
     return downloaded_path, info
 
 
+def parakeet_segments(
+    media_path: Path,
+    clip_start: float | None,
+    clip_end: float | None,
+) -> list[tuple[float, float, str]]:
+    """Предложения (start, end, text) от parakeet.
+
+    Файл декодируем сами: parakeet-mlx принимает путь, но распаковывает его
+    через ffmpeg, которого в системе нет. Длинные записи режем на чанки
+    с перекрытием и склеиваем по границам предложений.
+    """
+    import mlx.core as mx
+    from faster_whisper.audio import decode_audio
+    from parakeet_mlx import from_pretrained
+    from parakeet_mlx.audio import get_logmel
+
+    audio = decode_audio(str(media_path), sampling_rate=PARAKEET_SR)
+    shift = 0.0
+    if clip_start is not None or clip_end is not None:
+        begin = int((clip_start or 0.0) * PARAKEET_SR)
+        finish = int(clip_end * PARAKEET_SR) if clip_end is not None else len(audio)
+        audio = audio[begin:finish]
+        shift = clip_start or 0.0
+
+    model = from_pretrained(PARAKEET_REPO)
+    chunk = int(PARAKEET_CHUNK_SEC * PARAKEET_SR)
+    step = int((PARAKEET_CHUNK_SEC - PARAKEET_OVERLAP_SEC) * PARAKEET_SR)
+    total = len(audio)
+
+    segments: list[tuple[float, float, str]] = []
+    last_end = 0.0
+    for offset in range(0, max(total, 1), step):
+        piece = audio[offset : offset + chunk]
+        if len(piece) < PARAKEET_SR // 2:
+            break
+        is_last = offset + chunk >= total
+        base = offset / PARAKEET_SR
+        piece_end = base + len(piece) / PARAKEET_SR
+
+        result = model.generate(get_logmel(mx.array(piece), model.preprocessor_config))
+        for sentence in (result[0].sentences if result else []):
+            text = sentence.text.strip()
+            start, end = base + sentence.start, base + sentence.end
+            if not text:
+                continue
+            if not is_last and end > piece_end - 1.0:
+                continue
+            if start < last_end - 0.5:
+                continue
+            segments.append((start + shift, end + shift, text))
+            last_end = max(last_end, end)
+        print(
+            f"[progress] segments={len(segments)} up_to={format_ts(piece_end + shift)}",
+            flush=True,
+        )
+        if is_last:
+            break
+    return segments
+
+
+def write_note_header(
+    handle,
+    title: str,
+    audio_path: Path,
+    source_url: str,
+    channel: str | None,
+    upload_date: str,
+    model_line: str,
+    language_lines: list[str],
+) -> None:
+    handle.write("---\n")
+    handle.write("tags:\n")
+    handle.write("  - type/transcript\n")
+    handle.write("  - project/self\n")
+    handle.write("  - source/youtube\n")
+    handle.write(f"date: {upload_date}\n")
+    handle.write("status: active\n")
+    handle.write(f"url: {source_url}\n")
+    if channel:
+        handle.write(f"channel: {channel}\n")
+    handle.write("---\n\n")
+
+    handle.write(f"# {clean_title(title)}\n\n")
+    handle.write(f"- Source: {audio_path.name}\n")
+    handle.write(f"- Model: {model_line}\n")
+    for line in language_lines:
+        handle.write(f"{line}\n")
+    handle.write("\n## Transcript\n\n")
+
+
+def transcribe_parakeet(
+    audio_path: Path,
+    output_path: Path,
+    title: str,
+    clip_start: float | None,
+    clip_end: float | None,
+    source_url: str,
+    channel: str | None,
+    upload_date: str,
+) -> int:
+    segments = parakeet_segments(audio_path, clip_start, clip_end)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        write_note_header(
+            handle,
+            title,
+            audio_path,
+            source_url,
+            channel,
+            upload_date,
+            "parakeet-tdt-0.6b-v3",
+            ["- Language: auto (multilingual)"],
+        )
+        for start, end, text in segments:
+            handle.write(f"**[{format_ts(start)} - {format_ts(end)}]** {text}\n\n")
+
+    sync_import_timestamp(output_path)
+    return len(segments)
+
+
 def transcribe_audio(
     audio_path: Path,
     output_path: Path,
@@ -134,6 +258,28 @@ def transcribe_audio(
     channel: str | None,
     upload_date: str,
 ) -> int:
+    if model_name == "parakeet":
+        try:
+            return transcribe_parakeet(
+                audio_path=audio_path,
+                output_path=output_path,
+                title=title,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                source_url=source_url,
+                channel=channel,
+                upload_date=upload_date,
+            )
+        except Exception as exc:
+            print(
+                f"[warn] parakeet failed ({type(exc).__name__}: {exc}); "
+                f"falling back to faster-whisper small",
+                flush=True,
+            )
+            model_name = "small"
+
+    from faster_whisper import WhisperModel
+
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
     transcribe_kwargs = {
@@ -151,27 +297,21 @@ def transcribe_audio(
     segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    note_title = clean_title(title)
 
     with output_path.open("w", encoding="utf-8") as handle:
-        handle.write("---\n")
-        handle.write("tags:\n")
-        handle.write("  - type/transcript\n")
-        handle.write("  - project/self\n")
-        handle.write("  - source/youtube\n")
-        handle.write(f"date: {upload_date}\n")
-        handle.write("status: active\n")
-        handle.write(f"url: {source_url}\n")
-        if channel:
-            handle.write(f"channel: {channel}\n")
-        handle.write("---\n\n")
-
-        handle.write(f"# {note_title}\n\n")
-        handle.write(f"- Source: {audio_path.name}\n")
-        handle.write(f"- Model: {model_name}\n")
-        handle.write(f"- Language: {info.language}\n")
-        handle.write(f"- Language probability: {info.language_probability:.3f}\n\n")
-        handle.write("## Transcript\n\n")
+        write_note_header(
+            handle,
+            title,
+            audio_path,
+            source_url,
+            channel,
+            upload_date,
+            model_name,
+            [
+                f"- Language: {info.language}",
+                f"- Language probability: {info.language_probability:.3f}",
+            ],
+        )
 
         segment_count = 0
         for segment in segments:
@@ -213,8 +353,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="tiny",
-        help="faster-whisper model name. Use tiny for speed or small for better quality.",
+        default="parakeet",
+        help=(
+            "parakeet (default, GPU, multilingual) or a faster-whisper model name "
+            "(tiny/small/medium/large-v3). Whisper stays the fallback if parakeet fails."
+        ),
     )
     parser.add_argument("--beam-size", type=int, default=1, help="Whisper beam size")
     parser.add_argument("--language", help="Force a language code such as en or ru")

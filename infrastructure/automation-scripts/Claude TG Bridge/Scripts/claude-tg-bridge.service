@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude TG Bridge — Telegram bot bridging to claude CLI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/claude-workspace
+Environment=HOME=/root
+Environment=IS_SANDBOX=1
+EnvironmentFile=/root/.config/claude-tg-bridge/.env
+ExecStart=/opt/claude-tg-bridge/venv/bin/python /opt/claude-tg-bridge/claude_tg_bridge.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -156,7 +156,7 @@ def process_ugc_video(config: dict, record: dict, logger) -> None:
         "python3",
         str(UGC_SCRIPT),
         "--whisper-model",
-        str(ugc_cfg.get("whisper_model") or "tiny"),
+        str(ugc_cfg.get("whisper_model") or "small"),
         "--max-frames",
         str(int(ugc_cfg.get("max_frames", 4) or 0)),
     ]

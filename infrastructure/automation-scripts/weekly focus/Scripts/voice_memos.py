@@ -37,7 +37,14 @@ LOCK_FILE = Path("/Users/anton/.config/second-brain/voice-memos.lock")
 LOG_FILE = Path("/Users/anton/Library/Logs/voice-memos.log")
 
 AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".aiff", ".ogg", ".flac", ".mp4", ".mov"}
-WHISPER_MODEL = os.environ.get("VOICE_WHISPER_MODEL", "small")
+# По умолчанию parakeet на GPU (×10-12 реального времени против ×3-5 у whisper small).
+# VOICE_WHISPER_MODEL=small (или tiny/medium) форсирует старый путь через whisper.
+ASR_MODEL = os.environ.get("VOICE_WHISPER_MODEL", "parakeet")
+WHISPER_FALLBACK_MODEL = "small"
+PARAKEET_REPO = os.environ.get("PARAKEET_REPO", "mlx-community/parakeet-tdt-0.6b-v3")
+PARAKEET_SR = 16000
+PARAKEET_CHUNK_SEC = 120.0
+PARAKEET_OVERLAP_SEC = 12.0
 MIN_TRANSCRIPT_CHARS = 500  # порог is_ready() в meeting_notes.py
 SETTLE_SECONDS = 60         # файл моложе минуты — ещё может синкаться, ждём
 MAX_ATTEMPTS = 2
@@ -124,9 +131,67 @@ def request_icloud_downloads() -> None:
 
 
 def transcribe(path: Path) -> str:
+    """parakeet по умолчанию, whisper — запасной путь и явный выбор через env."""
+    if ASR_MODEL == "parakeet":
+        try:
+            return transcribe_parakeet(path)
+        except Exception as exc:
+            log(f"parakeet failed ({type(exc).__name__}: {exc}), "
+                f"falling back to whisper {WHISPER_FALLBACK_MODEL}")
+        return transcribe_whisper(path, WHISPER_FALLBACK_MODEL)
+    return transcribe_whisper(path, ASR_MODEL)
+
+
+def transcribe_parakeet(path: Path) -> str:
+    """Массив, а не путь: parakeet-mlx открывает файлы через ffmpeg, которого нет.
+
+    Длинные записи режем на чанки с перекрытием и склеиваем по границам предложений.
+    """
+    import mlx.core as mx
+    from faster_whisper.audio import decode_audio
+    from parakeet_mlx import from_pretrained
+    from parakeet_mlx.audio import get_logmel
+
+    audio = decode_audio(str(path), sampling_rate=PARAKEET_SR)
+    model = from_pretrained(PARAKEET_REPO)
+    chunk = int(PARAKEET_CHUNK_SEC * PARAKEET_SR)
+    step = int((PARAKEET_CHUNK_SEC - PARAKEET_OVERLAP_SEC) * PARAKEET_SR)
+    total = len(audio)
+
+    parts: list[str] = []
+    last_end = 0.0
+    for offset in range(0, max(total, 1), step):
+        piece = audio[offset : offset + chunk]
+        if len(piece) < PARAKEET_SR // 2:
+            break
+        is_last = offset + chunk >= total
+        base = offset / PARAKEET_SR
+        piece_end = base + len(piece) / PARAKEET_SR
+
+        result = model.generate(get_logmel(mx.array(piece), model.preprocessor_config))
+        for sentence in (result[0].sentences if result else []):
+            text = sentence.text.strip()
+            start, end = base + sentence.start, base + sentence.end
+            if not text:
+                continue
+            if not is_last and end > piece_end - 1.0:
+                continue  # обрезано границей чанка — приедет со следующим
+            if start < last_end - 0.5:
+                continue  # уже записано в зоне перекрытия
+            parts.append(text)
+            last_end = max(last_end, end)
+        log(f"progress: {len(parts)} sentences, up to {int(piece_end // 60)} min")
+        if is_last:
+            break
+
+    log(f"transcribed: {len(parts)} sentences, engine=parakeet")
+    return "\n\n".join(parts)
+
+
+def transcribe_whisper(path: Path, model_name: str) -> str:
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
     segments, info = model.transcribe(
         str(path), beam_size=1, vad_filter=True, condition_on_previous_text=False,
     )
@@ -193,7 +258,7 @@ def process_file(path: Path, state: dict, token: str, chat_id: str, dry_run: boo
     title = clean_title(path.stem)
     date_str = dt.date.fromtimestamp(path.stat().st_mtime).isoformat()
     minutes = audio_minutes(path)
-    log(f"transcribing: {path.name} (~{minutes or '?'} min, model={WHISPER_MODEL})")
+    log(f"transcribing: {path.name} (~{minutes or '?'} min, model={ASR_MODEL})")
 
     if not dry_run and entry["attempts"] == 1:
         try:

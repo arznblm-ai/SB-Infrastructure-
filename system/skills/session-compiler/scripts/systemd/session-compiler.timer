@@ -1,0 +1,10 @@
+[Unit]
+Description=Ежедневный запуск Session Compiler в 00:10 (после ночной выгрузки сырья и синка Syncthing)
+
+[Timer]
+OnCalendar=*-*-* 00:10:00
+Persistent=true
+Unit=session-compiler.service
+
+[Install]
+WantedBy=timers.target

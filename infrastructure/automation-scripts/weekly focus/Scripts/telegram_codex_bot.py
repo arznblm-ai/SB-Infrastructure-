@@ -7,16 +7,43 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
+import todoist_client
 from task_owner import classify_owner
 
-VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
+def _vault_root() -> Path:
+    """Корень vault: env-переопределение, иначе — от расположения скрипта.
+
+    Скрипт лежит в <vault>/infrastructure/daily focus/Scripts/, поэтому parents[3]
+    даёт корень и на маке, и на VPS (/root/second-brain), где vault зеркалится.
+    """
+    override = os.environ.get("SECOND_BRAIN_VAULT")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parents[3]
+
+
+def _log_path() -> Path:
+    """~/Library/Logs на маке, ~/.local/share на Linux (VPS)."""
+    mac_logs = Path.home() / "Library" / "Logs"
+    if mac_logs.is_dir():
+        return mac_logs / "telegram-codex-bot.log"
+    linux_logs = Path.home() / ".local" / "share"
+    try:
+        linux_logs.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return Path("/tmp/telegram-codex-bot.log")
+    return linux_logs / "telegram-codex-bot.log"
+
+
+VAULT = _vault_root()
 DAILY_DIR = VAULT / "infrastructure" / "daily focus"
-ENV_FILE = Path("/Users/anton/.config/second-brain/daily-focus.env")
-STATE_DIR = Path("/Users/anton/.config/second-brain")
+STATE_DIR = Path.home() / ".config" / "second-brain"
+ENV_FILE = STATE_DIR / "daily-focus.env"
 STATE_FILE = STATE_DIR / "telegram-codex-bot.offset"
 CALENDAR_PENDING_FILE = STATE_DIR / "telegram-codex-bot.calendar-pending.json"
 CALENDAR_LEDGER_FILE = STATE_DIR / "telegram-codex-bot.calendar-ledger.json"
@@ -24,9 +51,28 @@ STRATEGY_REVIEW_LOCK_FILE = STATE_DIR / "telegram-codex-bot.strategy-review.lock
 COMPLETED_TASKS_FILE = STATE_DIR / "telegram-codex-bot.completed-tasks.json"
 GOOGLE_CALENDAR_CREDENTIALS_FILE = STATE_DIR / "google-calendar-credentials.json"
 GOOGLE_CALENDAR_TOKEN_FILE = STATE_DIR / "google-calendar-token.json"
-LOG_FILE = Path("/Users/anton/Library/Logs/telegram-codex-bot.log")
-CODEX_BIN = Path(os.environ.get("CODEX_BIN", "/Applications/Codex.app/Contents/Resources/codex"))
-RUN_DAILY_FOCUS = DAILY_DIR / "Scripts" / "run_daily_focus.sh"
+LOG_FILE = _log_path()
+CLAUDE_BIN = Path(os.environ.get("CLAUDE_BIN", str(Path.home() / ".local" / "bin" / "claude")))
+# Model tiers (env-overridable, no hardcoded models below).
+DAILY_FOCUS_MODEL = os.environ.get("DAILY_FOCUS_MODEL", "sonnet")
+STRATEGIC_BOARD_MODEL = os.environ.get("STRATEGIC_BOARD_MODEL", "opus")
+# Permission profile: vault-reading + output-file writing only, no shell and no network.
+# --allowedTools pre-approves; --disallowedTools is what actually enforces the denial
+# (smoke test 2026-07-30: allowedTools alone does NOT block Bash in headless -p mode).
+CLAUDE_ALLOWED_TOOLS = "Read,Grep,Glob,Edit,Write"
+CLAUDE_DISALLOWED_TOOLS = "Bash,WebFetch,WebSearch"
+# Documented escape hatch, default off: full permission bypass (old Codex risk profile).
+CLAUDE_UNSAFE_PERMS = os.environ.get("DAILY_FOCUS_UNSAFE_PERMS", "0") == "1"
+# Слой «полный Daily Focus» выведен 2026-08-07 (ADR-011): run_daily_focus.sh и
+# daily_focus_catchup.sh лежат в ../archive/ с суффиксом .decommissioned-2026-08-07.
+# Голосовой чек-ин: транскрипция идёт подпроцессом, у бота нет parakeet/whisper.
+VOICE_TRANSCRIBE_SCRIPT = DAILY_DIR / "Scripts" / "voice_checkin_transcribe.py"
+VOICE_TRANSCRIBE_PYTHON = os.environ.get(
+    "VOICE_TRANSCRIBE_PYTHON",
+    "/usr/local/bin/python3" if sys.platform == "darwin" else "python3",
+)
+VOICE_TRANSCRIBE_TIMEOUT = 180
+VOICE_CHECKIN_MODEL = os.environ.get("VOICE_CHECKIN_MODEL", "haiku")
 DAILY_MESSAGES_DIR = DAILY_DIR / "daily focus messages"
 PLANNING_INBOX_DIR = DAILY_DIR / "planning inbox"
 PLANNING_MEMORY_DIR = DAILY_DIR / "planning memory"
@@ -35,7 +81,7 @@ MEETING_TODO_DIR = DAILY_DIR / "meeting todo"
 MEETING_NOTES_STATE_FILE = STATE_DIR / "meeting-notes-state.json"
 MEETING_NOTES_SCRIPT = DAILY_DIR / "Scripts" / "meeting_notes.py"
 STRATEGIC_REVIEW_DIR = DAILY_DIR / "strategic planning reviews"
-STRATEGIC_BOARD_SKILL = Path("/Users/anton/.codex/skills/strategic-board/SKILL.md")
+STRATEGIC_BOARD_SKILL = VAULT / "system" / "skills" / "strategic-board" / "SKILL.md"
 DEFAULT_CALENDAR_NAME = "a.rznblm@gmail.com"
 GOOGLE_WRITE_CALENDAR_ID = os.environ.get("GOOGLE_WRITE_CALENDAR_ID", "primary")
 BUSY_CALENDAR_NAMES = ["primary", "tony@portalcg.us"]
@@ -76,6 +122,40 @@ TODO_ONLY_DISABLED_COMMANDS = {
     "/daily_rerun",
     "/ask",
 }
+# Выведенные команды слоя «полный Daily Focus» (ADR-011, 2026-08-07) и
+# календарного слоя (2026-08-07): планирование календаря тоже ушло Гермесу.
+# Отвечают детерминированной заглушкой: без Claude, без чтения файлов, без подпроцессов.
+DECOMMISSIONED_MESSAGE = (
+    "Слой Daily Focus выведен 2026-08-07 (ADR-011). "
+    "Фокус дня — Гермес; задачи — /todo, /triage или голосовое."
+)
+CALENDAR_DECOMMISSIONED_MESSAGE = (
+    "Календарь ведёт Гермес (решение 2026-08-07). "
+    "Задачи — /todo, /triage или голосовое."
+)
+DECOMMISSIONED_COMMANDS = {
+    "/daily": DECOMMISSIONED_MESSAGE,
+    "/daily_focus": DECOMMISSIONED_MESSAGE,
+    "/daily_planning": DECOMMISSIONED_MESSAGE,
+    "/360brief": DECOMMISSIONED_MESSAGE,
+    "/fullfocus": DECOMMISSIONED_MESSAGE,
+    "/daily_rerun": DECOMMISSIONED_MESSAGE,
+    "/prioritize": DECOMMISSIONED_MESSAGE,
+    "/ask": DECOMMISSIONED_MESSAGE,
+    "/calendar": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_new": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_status": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_review": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_confirm": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_clear_done": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/calendar_clear": CALENDAR_DECOMMISSIONED_MESSAGE,
+    "/clear_calendar": CALENDAR_DECOMMISSIONED_MESSAGE,
+}
+# Бесслэшевый алиас /calendar_clear — иначе текст «clear calendar» доезжал бы
+# до ветки удаления событий календаря в обход заглушки.
+DECOMMISSIONED_TEXT_ALIASES = {
+    "clear calendar": CALENDAR_DECOMMISSIONED_MESSAGE,
+}
 
 
 def redact_secrets(message: str) -> str:
@@ -91,9 +171,10 @@ def log(message: str) -> None:
         f.write(f"[{stamp}] {redact_secrets(message)}\n")
 
 
-def log_route(route: str, codex: bool, detail: str = "") -> None:
+def log_route(route: str, engine: str = "none", detail: str = "") -> None:
+    """engine: which expensive LLM engine this route used ("claude" or "none")."""
     suffix = f"; {detail}" if detail else ""
-    log(f"route={route}; codex={'yes' if codex else 'no'}{suffix}")
+    log(f"route={route}; engine={engine}{suffix}")
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -447,9 +528,9 @@ def init_offset(token: str) -> None:
     print(next_offset)
 
 
-def run_codex(user_text: str) -> tuple[int, str]:
-    if not CODEX_BIN.exists():
-        return 127, f"Codex binary not found: {CODEX_BIN}"
+def run_claude(user_text: str, model: str = DAILY_FOCUS_MODEL) -> tuple[int, str]:
+    if not CLAUDE_BIN.exists():
+        return 127, f"Claude CLI not found: {CLAUDE_BIN}"
     prompt = f"""User sent this message via Telegram bot.
 
 Respond to Anton in Russian by default, unless he asks for another language.
@@ -460,17 +541,27 @@ Telegram message:
 {user_text}
 """
     command = [
-        str(CODEX_BIN),
-        "exec",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--dangerously-bypass-hook-trust",
-        "-C",
-        str(VAULT),
-        prompt,
+        str(CLAUDE_BIN),
+        "-p",
+        "--model",
+        model,
+        "--no-session-persistence",
     ]
+    if CLAUDE_UNSAFE_PERMS:
+        command.append("--dangerously-skip-permissions")
+    else:
+        command += [
+            "--allowedTools",
+            CLAUDE_ALLOWED_TOOLS,
+            "--disallowedTools",
+            CLAUDE_DISALLOWED_TOOLS,
+        ]
+    # Prompt goes through stdin: --allowedTools/--disallowedTools are variadic and would
+    # otherwise swallow a positional prompt argument.
     completed = subprocess.run(
         command,
         cwd=str(VAULT),
+        input=prompt,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -478,65 +569,22 @@ Telegram message:
     )
     output = completed.stdout.strip()
     if completed.returncode == 0:
-        output = extract_codex_answer(output)
+        output = extract_claude_answer(output)
     return completed.returncode, output
 
 
-def extract_codex_answer(output: str) -> str:
-    lines = output.splitlines()
-    answer_start = None
-    answer_end = None
-
-    for index, line in enumerate(lines):
-        if line.strip() == "codex":
-            answer_start = index + 1
-        elif answer_start is not None and line.strip() == "tokens used":
-            answer_end = index
-            break
-
-    if answer_start is not None:
-        answer_lines = lines[answer_start:answer_end]
-        answer = "\n".join(answer_lines).strip()
-        if answer:
-            return answer
-
-    # Fallback for quieter future Codex output: drop known CLI framing lines.
-    ignored_prefixes = (
-        "Reading additional input from stdin",
-        "OpenAI Codex",
-        "--------",
-        "workdir:",
-        "model:",
-        "provider:",
-        "approval:",
-        "sandbox:",
-        "reasoning ",
-        "session id:",
-        "user",
-        "warning:",
-        "tokens used",
-    )
-    filtered = [
-        line
-        for line in lines
-        if line.strip() and not line.startswith(ignored_prefixes)
-    ]
-    return "\n".join(filtered).strip() or output
+def extract_claude_answer(output: str) -> str:
+    # `claude -p` with the default text output format already returns the final
+    # answer text without CLI framing, so this is a passthrough.
+    return output.strip()
 
 
-def run_daily_focus() -> tuple[int, str]:
-    env = os.environ.copy()
-    env["DAILY_FOCUS_SKIP_TELEGRAM_DELIVERY"] = "1"
-    completed = subprocess.run(
-        [str(RUN_DAILY_FOCUS)],
-        cwd=str(VAULT),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=1200,
-    )
-    return completed.returncode, completed.stdout.strip()
+def decommissioned_message(text: str) -> str | None:
+    """Заглушка для выведенной команды, иначе None. Единственный гейт вывода слоёв."""
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return DECOMMISSIONED_TEXT_ALIASES.get(stripped.lower())
+    return DECOMMISSIONED_COMMANDS.get(stripped.split(maxsplit=1)[0].lower())
 
 
 def today_daily_briefs() -> list[Path]:
@@ -607,30 +655,23 @@ def build_help_message() -> str:
     return "\n".join([
         f"Daily Focus bot — mode: {mode}",
         "",
-        "Быстро, без Codex:",
+        "Быстро, без Claude:",
         "/actions — кандидаты задач из встреч на подтверждение",
         "/todo — мои задачи из встреч, кнопка ✔ закрывает",
         "/todo_add текст — добавить задачу вручную (несколько строк — несколько задач)",
         "/todo_done T1 T2 — закрыть текстом, /todo_drop T3 — убрать",
         "/todo_claim T16 — взять себе задачу без исполнителя (кнопка ➕ в саммари встречи)",
+        "/triage — разобрать входящие Todoist кнопками: 📅 неделя · 🕓 потом · ⏳ жду · ✖ снять",
+        "голосовое — чек-ин: расскажи, что сделал, уверенные совпадения закрою сам",
         "/meetings — список последних встреч",
         "/summary — саммари встреч из тудулиста, кнопками",
         "/meeting N — детальное саммари встречи (без N — последняя)",
-        "/calendar_status — что уже стоит в календаре",
-        "/calendar_review — что закрыто/в процессе по Focus-слотам",
         "",
-        "Календарь:",
-        "/calendar_new — предложить слоты только для новых задач",
-        "/calendar — предложить слоты для активных задач",
-        "/calendar_confirm — создать предложенные слоты",
-        "/calendar_clear_done — убрать будущие слоты закрытых задач",
+        "Выведены 2026-08-07 (ADR-011), отвечают заглушкой:",
+        "/daily, /daily_rerun, /360brief, /prioritize, /ask — фокус дня теперь в Гермесе",
+        "/calendar* (включая _new, _status, _review, _confirm, _clear, _clear_done) — календарь ведёт Гермес",
         "",
-        "Дорогие режимы, запускают Codex:",
-        "/daily_rerun — полный Daily Planning Brief",
-        "/prioritize — Strategic Board review",
-        "/ask вопрос — задать вопрос Codex по vault",
-        "",
-        f"Auto-Codex на вопросы без /ask: {auto_ask}. Обычные сообщения сохраняются как задачи.",
+        f"Auto-Claude на вопросы: {auto_ask}. Обычные сообщения сохраняются как задачи.",
     ])
 
 
@@ -642,7 +683,7 @@ def build_bot_status() -> str:
     lines = [
         "Daily Focus status",
         f"Mode: {'capture-only' if TODO_ONLY_MODE else 'planner'}",
-        f"Auto-Codex questions: {'on' if AUTO_CODEX_FOR_QUESTIONS else 'off'}",
+        f"Auto-Claude questions: {'on' if AUTO_CODEX_FOR_QUESTIONS else 'off'}",
         f"Active planning tasks: {len(tasks)}",
         f"Pending meeting actions: {len(pending_actions)}",
         f"Open meeting todos: {len(open_meeting_todos())}",
@@ -812,6 +853,74 @@ def merge_task(existing: dict[str, str], incoming: dict[str, str]) -> None:
             existing[key] = value
 
 
+def todoist_open_tasks_for_anton() -> list[dict[str, str]]:
+    """Открытые задачи Антона из Todoist в формате normalized planning task.
+
+    Аккаунт личный, поэтому «задачи Антона» = открытые задачи без labels
+    `other` / `unowned`. Scope берётся из `todoist-ids.json`
+    (`work_scope_project_ids`, в label-схеме это Inbox) — это аналог scope
+    команды ROZ в Linear; личные проекты (Films, Reading list…) в планирование
+    не попадают. Рабочая область задачи — area-label, а не проект.
+    Best-effort: при любой проблеме — [] и лог."""
+    try:
+        scope = todoist_client.work_scope_project_ids(log_fn=log)
+        raw_tasks = todoist_client.list_open_tasks(project_ids=scope, log_fn=log)
+        areas = todoist_client.area_label_names(log_fn=log)
+    except Exception as exc:
+        log(f"todoist: open tasks request failed: {type(exc).__name__}: {exc}")
+        return []
+    foreign_labels = {todoist_client.LABEL_OTHER, todoist_client.LABEL_UNOWNED}
+    areas_lower = {name.casefold(): name for name in areas}
+    tasks: list[dict[str, str]] = []
+    for node in raw_tasks:
+        title = (node.get("content") or "").strip()
+        if not title:
+            continue
+        raw_labels = [str(x).strip() for x in (node.get("labels") or []) if str(x).strip()]
+        labels = {x.lower() for x in raw_labels}
+        if labels & foreign_labels:
+            continue
+        area = next((areas_lower[x.casefold()] for x in raw_labels if x.casefold() in areas_lower), "")
+        source_label = f"Todoist · {area}" if area else "Todoist"
+        tasks.append({
+            "task": title,
+            "source": "meeting",
+            "deadline": "unknown",
+            "estimate": "unknown",
+            "status": "candidate",
+            "source_meeting": source_label,
+        })
+    log(f"todoist: {len(tasks)} open tasks for planning")
+    return tasks
+
+
+def _ingest_task(
+    task: dict[str, str],
+    tasks: list[dict[str, str]],
+    by_key: dict[str, dict[str, str]],
+    completed: set[str],
+) -> None:
+    """Общая ingest-логика planning task: skip completed/пустых, merge дублей,
+    дефолты proposed_deadline/estimate/importance."""
+    name = task.get("task", "").strip()
+    key = task_key(name)
+    if not name or name.lower() == "needs clarification":
+        return
+    if key in completed:
+        return
+    if key in by_key:
+        merge_task(by_key[key], task)
+        return
+    if not task.get("proposed_deadline"):
+        task["proposed_deadline"] = proposed_deadline(name)
+    if not task.get("proposed_estimate"):
+        task["proposed_estimate"] = proposed_estimate(name)
+    if not task.get("importance"):
+        task["importance"] = "low"
+    tasks.append(task)
+    by_key[key] = task
+
+
 def current_planning_tasks(include_completed: bool = False) -> list[dict[str, str]]:
     inbox_files = latest_files(PLANNING_INBOX_DIR, limit=3)
     memory_files = [
@@ -827,23 +936,10 @@ def current_planning_tasks(include_completed: bool = False) -> list[dict[str, st
         except Exception:
             continue
         for task in parse_normalized_tasks(text):
-            name = task.get("task", "").strip()
-            key = task_key(name)
-            if not name or name.lower() == "needs clarification":
-                continue
-            if key in completed:
-                continue
-            if key in by_key:
-                merge_task(by_key[key], task)
-                continue
-            if not task.get("proposed_deadline"):
-                task["proposed_deadline"] = proposed_deadline(name)
-            if not task.get("proposed_estimate"):
-                task["proposed_estimate"] = proposed_estimate(name)
-            if not task.get("importance"):
-                task["importance"] = "low"
-            tasks.append(task)
-            by_key[key] = task
+            _ingest_task(task, tasks, by_key, completed)
+    # Todoist как второй источник задач Антона (Planning Inbox/Memory остаются)
+    for task in todoist_open_tasks_for_anton():
+        _ingest_task(task, tasks, by_key, completed)
     return tasks
 
 
@@ -956,7 +1052,7 @@ Also include:
 After saving the file, reply ONLY with the contents of `## Telegram summary`.
 Do not output Task priority annotations, Source trail, file diffs, or technical patch text.
 """
-    code, output = run_codex(prompt)
+    code, output = run_claude(prompt, model=STRATEGIC_BOARD_MODEL)
     if code != 0:
         return False, output[-3000:], None
     if not review_path.exists():
@@ -1009,7 +1105,7 @@ def start_strategy_review_background(token: str, chat_id: str, reason: str) -> b
 
     def worker() -> None:
         try:
-            log_route("strategic_board", codex=True, detail=f"background {reason}")
+            log_route("strategic_board", engine="claude", detail=f"background {reason}")
             ok, summary, path = run_strategy_review()
             if ok:
                 send_message(
@@ -1203,6 +1299,29 @@ def update_candidates_status(candidates: list[dict[str, str]], new_status: str, 
     return update_candidates_field(candidates, "status", new_status, files=files)
 
 
+def close_todo_everywhere(found: list[dict[str, str]]) -> int:
+    """Закрывает задачи в vault-сторе и (best-effort) в Todoist.
+
+    Ответ пользователю зависит только от vault-записи: сбой Todoist-шага уходит
+    в лог, а не в Telegram. `/todo_drop` этой функцией не пользуется —
+    dropped не закрывает задачу в Todoist (см. план, Out of scope)."""
+    if not found:
+        return 0
+    changed = update_candidates_status(found, "done", files=todo_files())
+    for item in found:
+        vault_id = (item.get("id") or "").strip().upper()
+        if not vault_id:
+            continue
+        try:
+            task_id = todoist_client.resolve_task_id(vault_id, log_fn=log)
+            if not task_id:
+                continue
+            todoist_client.close_task(task_id, log_fn=log)
+        except Exception as exc:
+            log(f"todoist: close failed for {vault_id}: {type(exc).__name__}: {exc}")
+    return changed
+
+
 def clear_pending_meeting_actions() -> int:
     pending = pending_meeting_action_candidates()
     return update_candidates_status(pending, "cleared_by_anton")
@@ -1391,6 +1510,194 @@ def build_todo_keyboard(todos: list[dict[str, str]]) -> dict | None:
         return None
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     return {"inline_keyboard": rows}
+
+
+# ── Триаж intake-секции Inbox Todoist (/triage) ───────────────────────────
+
+TRIAGE_HEADER = "Триаж intake"
+TRIAGE_MAX_TASKS = 8
+# Порядок кнопок в ряду задачи: неделя / потом / жду / снять.
+TRIAGE_ACTIONS: list[tuple[str, str]] = [
+    ("w", "📅"),
+    ("l", "🕓"),
+    ("x", "⏳"),
+    ("d", "✖"),
+]
+TRIAGE_ACTION_SECTION = {"w": "week", "l": "later", "x": "waiting"}
+TRIAGE_ACTION_LABEL = {
+    "w": "на неделю",
+    "l": "потом",
+    "x": "жду ответа",
+    "d": "снял",
+}
+# tri:<action>:<ident>; ident — id задачи Todoist или vault-id T<n>.
+TRIAGE_CALLBACK_RE = re.compile(r"^tri:([wlxd]):([A-Za-z0-9_-]{1,50})$")
+VAULT_ID_RE = re.compile(r"^T\d+$", re.IGNORECASE)
+
+
+def next_workday(now: dt.datetime | None = None) -> str:
+    """Ближайший рабочий день: сегодня, если будни и ещё не вечер; иначе следующий будний."""
+    now = now or dt.datetime.now()
+    day = now.date()
+    if day.weekday() < 5 and now.hour < 18:
+        return day.isoformat()
+    day += dt.timedelta(days=1)
+    while day.weekday() >= 5:
+        day += dt.timedelta(days=1)
+    return day.isoformat()
+
+
+def triage_intake_tasks() -> list[dict]:
+    """Открытые задачи секции intake Inbox Todoist. Ошибка Todoist → пустой список."""
+    try:
+        intake = todoist_client.section_id("intake", log_fn=log)
+        if not intake:
+            log("triage: section_ids.intake не задан")
+            return []
+        project_id = todoist_client.inbox_project_id(log_fn=log)
+        tasks = todoist_client.list_open_tasks(
+            project_ids=[project_id] if project_id else None, log_fn=log
+        )
+    except Exception as exc:
+        log(f"triage: todoist list failed: {type(exc).__name__}: {exc}")
+        return []
+    intake_tasks = [t for t in tasks if str(t.get("section_id") or "") == str(intake)]
+    intake_tasks.sort(key=lambda t: str(t.get("created_at") or ""))
+    return intake_tasks
+
+
+def triage_task_due(task: dict) -> str:
+    due = task.get("due")
+    if isinstance(due, dict):
+        value = str(due.get("date") or "").strip()
+        # due.date у задач с временем приходит как YYYY-MM-DDTHH:MM:SS.
+        if value:
+            return value[:10]
+    return ""
+
+
+def build_triage_message(tasks: list[dict] | None = None) -> str:
+    tasks = triage_intake_tasks() if tasks is None else tasks
+    if not tasks:
+        return "Нечего разбирать: секция «📥 Новое — без даты» пуста."
+    shown = tasks[:TRIAGE_MAX_TASKS]
+    lines = [f"{TRIAGE_HEADER} — задач: {len(tasks)}", ""]
+    for index, task in enumerate(shown, start=1):
+        content = re.sub(r"\s+", " ", str(task.get("content") or "без текста")).strip()
+        if len(content) > 110:
+            content = content[:107].rstrip() + "..."
+        entry = f"{index}. {content}"
+        due = triage_task_due(task)
+        if due:
+            entry += f" (дата {due})"
+        lines.append(entry)
+    if len(tasks) > TRIAGE_MAX_TASKS:
+        lines.append("")
+        lines.append(f"Ещё {len(tasks) - TRIAGE_MAX_TASKS} покажу после разбора первых.")
+    lines.extend(["", "Кнопки: 📅 эта неделя · 🕓 потом · ⏳ жду ответа · ✖ снять"])
+    return "\n".join(lines)
+
+
+def triage_buttons(ident: str, prefix: str = "") -> list[dict]:
+    """Ряд из 4 кнопок триажа для одной задачи."""
+    return [
+        {"text": f"{prefix}{icon}".strip(), "callback_data": f"tri:{action}:{ident}"}
+        for action, icon in TRIAGE_ACTIONS
+    ]
+
+
+def build_triage_keyboard(tasks: list[dict]) -> dict | None:
+    rows = []
+    for index, task in enumerate(tasks[:TRIAGE_MAX_TASKS], start=1):
+        task_id = str(task.get("id") or "")
+        if not task_id:
+            continue
+        rows.append(triage_buttons(task_id, prefix=f"{index} "))
+    return {"inline_keyboard": rows} if rows else None
+
+
+def triage_vault_id_from_task(task_id: str) -> str:
+    """Vault ID: T<n> из description задачи Todoist; пустая строка, если не нашли."""
+    try:
+        task = todoist_client.get_task(task_id, log_fn=log)
+    except Exception as exc:
+        log(f"triage: get_task failed for {task_id}: {type(exc).__name__}: {exc}")
+        return ""
+    if not task:
+        return ""
+    match = re.search(r"Vault ID:\s*(T\d+)", str(task.get("description") or ""))
+    return match.group(1).upper() if match else ""
+
+
+def triage_resolve(ident: str) -> tuple[str, str]:
+    """ident → (todoist task_id, vault_id). Пустая строка там, где не разрешилось."""
+    if VAULT_ID_RE.match(ident):
+        vault_id = ident.upper()
+        try:
+            task_id = todoist_client.resolve_task_id(vault_id, log_fn=log) or ""
+        except Exception as exc:
+            log(f"triage: resolve_task_id failed for {vault_id}: {type(exc).__name__}: {exc}")
+            task_id = ""
+        return task_id, vault_id
+    return ident, ""
+
+
+def apply_triage(action: str, ident: str) -> str:
+    """Выполняет действие триажа. Возвращает короткий текст для answerCallbackQuery."""
+    task_id, vault_id = triage_resolve(ident)
+    if action == "d":
+        # Снятие: закрытие в Todoist (обратимо) + статус dropped в vault.
+        dropped = 0
+        if not vault_id and task_id:
+            vault_id = triage_vault_id_from_task(task_id)
+        if vault_id:
+            found, _missing = todo_by_id([vault_id])
+            if found:
+                dropped = update_candidates_status(found, "dropped", files=todo_files())
+        closed = False
+        if task_id:
+            try:
+                closed = todoist_client.close_task(task_id, log_fn=log)
+            except Exception as exc:
+                log(f"triage: close failed for {task_id}: {type(exc).__name__}: {exc}")
+        if not closed and not dropped:
+            return "не смог снять — смотри лог"
+        return "✖ снял" if closed else "✖ снял в vault, Todoist не ответил"
+
+    if not task_id:
+        return "задача не найдена в Todoist"
+    section_key = TRIAGE_ACTION_SECTION[action]
+    try:
+        section = todoist_client.section_id(section_key, log_fn=log)
+    except Exception as exc:
+        log(f"triage: section_id failed for {section_key}: {type(exc).__name__}: {exc}")
+        section = None
+    if not section:
+        return f"секция {section_key} не настроена"
+    try:
+        moved = todoist_client.move_task_to_section(task_id, section, log_fn=log)
+    except Exception as exc:
+        log(f"triage: move failed for {task_id}: {type(exc).__name__}: {exc}")
+        moved = False
+    if not moved:
+        return "Todoist не принял перенос — смотри лог"
+    note = TRIAGE_ACTION_LABEL[action]
+    if action == "w":
+        due = ""
+        try:
+            task = todoist_client.get_task(task_id, log_fn=log)
+            due = triage_task_due(task or {})
+        except Exception as exc:
+            log(f"triage: due lookup failed for {task_id}: {type(exc).__name__}: {exc}")
+        due = due or next_workday()
+        try:
+            if not todoist_client.set_due(task_id, due, log_fn=log):
+                return f"{note}, дату не проставил"
+        except Exception as exc:
+            log(f"triage: set_due failed for {task_id}: {type(exc).__name__}: {exc}")
+            return f"{note}, дату не проставил"
+        note += f" ({due})"
+    return note
 
 
 def read_meeting_notes_state() -> list[dict[str, str]]:
@@ -2380,22 +2687,22 @@ end run
     return completed.stdout.strip()
 
 
-def answer_with_codex(token: str, chat_id: str, question: str, route_detail: str = "") -> None:
-    log_route("ask_codex", codex=True, detail=route_detail)
+def answer_with_claude(token: str, chat_id: str, question: str, route_detail: str = "") -> None:
+    log_route("ask_claude", engine="claude", detail=route_detail)
     send_typing(token, chat_id)
     try:
-        code, output = run_codex(question)
+        code, output = run_claude(question, model=DAILY_FOCUS_MODEL)
     except subprocess.TimeoutExpired:
-        send_message(token, chat_id, "Codex не успел ответить за 15 минут. Лог: /Users/anton/Library/Logs/telegram-codex-bot.log")
-        log("codex timeout")
+        send_message(token, chat_id, "Claude не успел ответить за 15 минут. Лог: /Users/anton/Library/Logs/telegram-codex-bot.log")
+        log("claude timeout")
         return
     except Exception as exc:
-        send_message(token, chat_id, f"Ошибка запуска Codex: {exc}")
-        log(f"codex error: {exc}")
+        send_message(token, chat_id, f"Ошибка запуска Claude: {exc}")
+        log(f"claude error: {exc}")
         return
 
     if code != 0:
-        send_message(token, chat_id, f"Codex завершился с ошибкой {code}.\n\n{output[-3000:]}")
+        send_message(token, chat_id, f"Claude завершился с ошибкой {code}.\n\n{output[-3000:]}")
     else:
         send_message(token, chat_id, output[-12000:])
 
@@ -2418,7 +2725,7 @@ def handle_todo_add(token: str, chat_id: str, text: str) -> None:
         send_message(token, chat_id, "Укажи задачу: /todo_add текст задачи (несколько строк — несколько задач)")
         return
     added, duplicates = add_manual_todos(texts)
-    log_route("todo_add", codex=False, detail=",".join(i["id"] for i in added) or "none")
+    log_route("todo_add", engine="none", detail=",".join(i["id"] for i in added) or "none")
     parts = []
     if added:
         parts.append("Добавил в /todo:\n" + "\n".join(f"• {i['id']} — {i['task']}" for i in added))
@@ -2432,31 +2739,376 @@ def handle_todo_add(token: str, chat_id: str, text: str) -> None:
     send_message(token, chat_id, reply, reply_markup=keyboard)
 
 
+# ── Голосовой чек-ин по задачам (voice / audio message) ───────────────────
+
+VOICE_CHECKIN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "closed": {
+            "type": "array",
+            "maxItems": 25,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium"]},
+                },
+                "required": ["task_id", "confidence"],
+            },
+        },
+        "unmatched_claims": {
+            "type": "array",
+            "maxItems": 15,
+            "items": {"type": "string"},
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["closed", "unmatched_claims", "notes"],
+}
+
+VOICE_CHECKIN_PROMPT = """Ты разбираешь голосовой чек-ин Антона: он надиктовал, что успел сделать.
+Твоя работа — сопоставить сказанное с его открытыми задачами и вернуть JSON по схеме.
+
+Правила:
+- task_id бери ТОЛЬКО из списка ниже, дословно. Ничего не выдумывай.
+- confidence high — только если это однозначно та самая задача (совпадает предмет действия, а не общая тема).
+- confidence medium — похоже, но есть сомнение (расплывчатая формулировка, несколько похожих задач, другой объект).
+- Если про задачу в чек-ине ничего не сказано, её вообще не упоминай в ответе.
+- Сказанное, для чего в списке нет подходящей задачи, положи в unmatched_claims короткой фразой.
+- Транскрипт распознан автоматически: имена и термины могут быть искажены, учитывай это, но не притягивай совпадения.
+- notes — одна-две фразы о том, что было неочевидно; пусто, если всё однозначно.
+
+Транскрипт чек-ина:
+{transcript}
+
+Открытые задачи:
+{tasks}
+"""
+
+
+def download_telegram_file(token: str, file_id: str) -> Path:
+    """Скачивает файл Telegram во временный файл; путь возвращается вызывающему."""
+    payload = telegram_request(token, "getFile", data={"file_id": file_id}, timeout=30)
+    file_path = str((payload.get("result") or {}).get("file_path") or "").strip()
+    if not file_path:
+        raise RuntimeError("getFile не вернул file_path")
+    suffix = Path(file_path).suffix or ".oga"
+    handle, temp_name = tempfile.mkstemp(prefix="tg-voice-", suffix=suffix)
+    os.close(handle)
+    target = Path(temp_name)
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    try:
+        subprocess.check_output(
+            ["curl", "-fsS", "--max-time", "120", "-o", str(target), url],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def transcribe_voice_file(path: Path) -> str:
+    """Транскрипт подпроцессом (у бота нет parakeet/whisper в интерпретаторе)."""
+    completed = subprocess.run(
+        [VOICE_TRANSCRIBE_PYTHON, str(VOICE_TRANSCRIBE_SCRIPT), str(path)],
+        capture_output=True,
+        text=True,
+        timeout=VOICE_TRANSCRIBE_TIMEOUT,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()[-300:]
+        raise RuntimeError(f"транскрипция вернула {completed.returncode}: {detail}")
+    return (completed.stdout or "").strip()
+
+
+def todoist_available() -> bool:
+    """Дешёвая проверка живости API: отличает «нет задач» от «Todoist недоступен»."""
+    try:
+        return todoist_client.todoist_request(
+            "GET", "/projects", params={"limit": 1}, log_fn=log
+        ) is not None
+    except Exception as exc:
+        log(f"voice checkin: todoist probe failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def voice_checkin_open_tasks() -> list[dict[str, str]]:
+    """Открытые задачи рабочего scope Todoist (Inbox целиком, все секции)."""
+    try:
+        scope = todoist_client.work_scope_project_ids(log_fn=log)
+        raw_tasks = todoist_client.list_open_tasks(project_ids=scope, log_fn=log)
+        sections = todoist_client.load_section_ids(log_fn=log)
+    except Exception as exc:
+        log(f"voice checkin: todoist list failed: {type(exc).__name__}: {exc}")
+        return []
+    section_by_id = {str(value): key for key, value in sections.items() if value}
+    tasks: list[dict[str, str]] = []
+    for node in raw_tasks:
+        title = re.sub(r"\s+", " ", str(node.get("content") or "")).strip()
+        task_id = str(node.get("id") or "").strip()
+        if not title or not task_id:
+            continue
+        vault_match = re.search(r"Vault ID:\s*(T\d+)", str(node.get("description") or ""))
+        tasks.append({
+            "id": task_id,
+            "title": title,
+            "section": section_by_id.get(str(node.get("section_id") or ""), ""),
+            "vault_id": vault_match.group(1).upper() if vault_match else "",
+            "due": triage_task_due(node),
+        })
+    log(f"voice checkin: {len(tasks)} open todoist tasks")
+    return tasks
+
+
+def format_checkin_tasks(tasks: list[dict[str, str]]) -> str:
+    lines = []
+    for index, task in enumerate(tasks, start=1):
+        section = task.get("section") or "без секции"
+        due = task.get("due")
+        due_note = f", срок {due}" if due else ""
+        lines.append(f"{index}. task_id={task['id']} [{section}{due_note}] {task['title']}")
+    return "\n".join(lines)
+
+
+def run_voice_checkin_claude(prompt: str) -> dict | None:
+    """Один вызов haiku со строгой схемой; None при любой проблеме."""
+    if not CLAUDE_BIN.exists():
+        log(f"voice checkin: claude cli not found: {CLAUDE_BIN}")
+        return None
+    command = [
+        str(CLAUDE_BIN), "-p",
+        "--model", VOICE_CHECKIN_MODEL,
+        "--output-format", "json",
+        "--json-schema", json.dumps(VOICE_CHECKIN_SCHEMA, ensure_ascii=False),
+        "--max-turns", "1",
+        "--no-session-persistence",
+        "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep",
+    ]
+    try:
+        completed = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        log("voice checkin: claude timeout after 240s")
+        return None
+    except Exception as exc:
+        log(f"voice checkin: claude failed: {type(exc).__name__}: {exc}")
+        return None
+    if completed.returncode != 0:
+        log(f"voice checkin: claude exit {completed.returncode}: "
+            f"{(completed.stderr or completed.stdout or '')[:300]}")
+        return None
+    try:
+        envelope = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        log(f"voice checkin: claude stdout is not JSON: {completed.stdout[:200]}")
+        return None
+    if isinstance(envelope, dict):
+        if envelope.get("is_error"):
+            log(f"voice checkin: claude is_error=true: {str(envelope.get('result'))[:200]}")
+            return None
+        for field in ("structured_output", "result"):
+            payload = envelope.get(field)
+            if isinstance(payload, dict):
+                return payload
+            if isinstance(payload, str):
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+    log("voice checkin: could not extract structured payload")
+    return None
+
+
+def validate_voice_checkin(
+    payload: dict,
+    tasks: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str], str]:
+    """Оставляет только реальные task_id; закрываем исключительно confidence=high."""
+    by_id = {task["id"]: task for task in tasks}
+    confident: list[dict[str, str]] = []
+    uncertain: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in payload.get("closed") or []:
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("task_id") or "").strip()
+        task = by_id.get(task_id)
+        if not task:
+            log(f"voice checkin: ignoring unknown task_id {task_id!r}")
+            continue
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        if str(item.get("confidence") or "").strip().lower() == "high":
+            confident.append(task)
+        else:
+            uncertain.append(task)
+    claims = [
+        re.sub(r"\s+", " ", str(claim)).strip()
+        for claim in (payload.get("unmatched_claims") or [])
+        if str(claim).strip()
+    ][:10]
+    notes = re.sub(r"\s+", " ", str(payload.get("notes") or "")).strip()
+    return confident, uncertain, claims, notes
+
+
+def close_checkin_task(task: dict[str, str]) -> bool:
+    """Закрывает задачу: через vault-механизм по Vault ID, иначе — прямо в Todoist."""
+    vault_id = (task.get("vault_id") or "").strip().upper()
+    if vault_id:
+        found, _missing = todo_by_id([vault_id])
+        if found and close_todo_everywhere(found):
+            return True
+    task_id = (task.get("id") or "").strip()
+    if not task_id:
+        return False
+    try:
+        return todoist_client.close_task(task_id, log_fn=log)
+    except Exception as exc:
+        log(f"voice checkin: todoist close failed for {task_id}: {type(exc).__name__}: {exc}")
+        return False
+
+
+def build_voice_checkin_reply(
+    closed: list[dict[str, str]],
+    failed: list[dict[str, str]],
+    uncertain: list[dict[str, str]],
+    claims: list[str],
+    tasks: list[dict[str, str]],
+    transcript: str,
+) -> str:
+    closed_ids = {task["id"] for task in closed}
+    week_left = [
+        task for task in tasks
+        if task.get("section") == "week" and task["id"] not in closed_ids
+    ]
+    triage_left = len([
+        task for task in tasks
+        if task.get("section") == "intake" and task["id"] not in closed_ids
+    ])
+    lines: list[str] = []
+    if closed:
+        lines.append("✅ Закрыл: " + "; ".join(task["title"] for task in closed))
+    if failed:
+        lines.append("⚠️ Не смог закрыть (смотри лог): " + "; ".join(task["title"] for task in failed))
+    if uncertain:
+        lines.append("🤔 Похоже сделано, но не уверен (не закрывал): "
+                     + "; ".join(task["title"] for task in uncertain))
+    if claims:
+        lines.append("➖ Не нашёл в трекере: " + "; ".join(claims))
+    if week_left:
+        entries = []
+        for task in week_left[:12]:
+            due = task.get("due")
+            entries.append(f"{task['title']} (до {due})" if due else task["title"])
+        lines.append("🔥 Осталось на неделе: " + "; ".join(entries))
+    if triage_left:
+        lines.append(f"📥 Ждут триажа: {triage_left}")
+    if not lines:
+        return "Ничего не закрыл — совпадений с задачами не нашёл.\n\nУслышал: " + transcript[:1500]
+    return "\n".join(lines)
+
+
+def handle_voice_checkin(token: str, chat_id: str, message: dict) -> None:
+    """Голосовое → транскрипт → матч с задачами Todoist → закрытие уверенных."""
+    audio = message.get("voice") or message.get("audio") or {}
+    file_id = str(audio.get("file_id") or "").strip()
+    if not file_id:
+        send_message(token, chat_id, "Не смог получить аудио из сообщения.")
+        return
+    log_route("voice_checkin", engine="claude", detail=f"duration={audio.get('duration', '?')}")
+    send_message(token, chat_id, "🎙 Слушаю…")
+
+    audio_path: Path | None = None
+    try:
+        audio_path = download_telegram_file(token, file_id)
+        transcript = transcribe_voice_file(audio_path)
+    except subprocess.TimeoutExpired:
+        log(f"voice checkin: transcription timeout after {VOICE_TRANSCRIBE_TIMEOUT}s")
+        send_message(token, chat_id, "❌ Транскрипция не уложилась в 3 минуты — чекин не обработан.")
+        return
+    except Exception as exc:
+        log(f"voice checkin: transcription failed: {type(exc).__name__}: {exc}")
+        send_message(token, chat_id, f"❌ Не смог расшифровать голосовое: {exc}")
+        return
+    finally:
+        if audio_path is not None:
+            audio_path.unlink(missing_ok=True)
+
+    if not transcript:
+        send_message(token, chat_id, "🎙 Речь не распознал — попробуй записать ещё раз.")
+        return
+
+    tasks = voice_checkin_open_tasks()
+    if not tasks:
+        if not todoist_available():
+            send_message(token, chat_id, "Todoist недоступен, чекин не обработан.")
+        else:
+            send_message(token, chat_id, "Открытых задач в Todoist нет — закрывать нечего.\n\n"
+                                         f"Услышал: {transcript[:1500]}")
+        return
+
+    prompt = VOICE_CHECKIN_PROMPT.format(transcript=transcript, tasks=format_checkin_tasks(tasks))
+    payload = run_voice_checkin_claude(prompt)
+    if payload is None:
+        send_message(token, chat_id, "❌ Матчер не ответил — ничего не закрывал.\n\n"
+                                     f"Услышал: {transcript[:1500]}")
+        return
+
+    confident, uncertain, claims, notes = validate_voice_checkin(payload, tasks)
+    closed: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+    for task in confident:
+        (closed if close_checkin_task(task) else failed).append(task)
+    log(f"voice checkin: closed={len(closed)} failed={len(failed)} "
+        f"uncertain={len(uncertain)} unmatched={len(claims)}"
+        + (f"; notes={notes[:200]}" if notes else ""))
+    send_message(token, chat_id, build_voice_checkin_reply(
+        closed, failed, uncertain, claims, tasks, transcript,
+    ))
+
+
 def handle_text(token: str, chat_id: str, text: str) -> None:
     normalized = text.strip()
+    # ADR-011 (2026-08-07): слой «полный Daily Focus» выведен, следом (2026-08-07)
+    # выведен календарный слой. Заглушка стоит первой, чтобы выведенная команда
+    # не доехала ни до Claude, ни до перемещённых скриптов, ни до календарного кода.
+    stub = decommissioned_message(normalized)
+    if stub is not None:
+        log_route("decommissioned", engine="none", detail=normalized.split(maxsplit=1)[0].lower())
+        send_message(token, chat_id, stub)
+        return
     if normalized in {"/start", "/help", "help", "/menu"}:
-        log_route("help", codex=False)
+        log_route("help", engine="none")
         send_message(token, chat_id, build_help_message())
         return
     if normalized in {"/status", "status"}:
-        log_route("status", codex=False)
+        log_route("status", engine="none")
         send_message(token, chat_id, build_bot_status())
         return
     if normalized in {"/ping", "ping"}:
-        log_route("ping", codex=False)
+        log_route("ping", engine="none")
         send_message(token, chat_id, "pong")
         return
     if normalized in {"/todo", "todo"}:
-        log_route("todo", codex=False)
+        log_route("todo", engine="none")
         send_message(token, chat_id, build_todo_message(), reply_markup=build_todo_keyboard(open_meeting_todos()))
         return
+    if normalized in {"/triage", "triage"}:
+        log_route("triage_list", engine="none")
+        tasks = triage_intake_tasks()
+        send_message(token, chat_id, build_triage_message(tasks), reply_markup=build_triage_keyboard(tasks))
+        return
     if normalized in {"/meetings", "meetings"}:
-        log_route("meetings", codex=False)
+        log_route("meetings", engine="none")
         send_message(token, chat_id, build_meetings_message())
         return
     if normalized in {"/summary", "summary"}:
         todos = open_meeting_todos()
-        log_route("summary", codex=False)
+        log_route("summary", engine="none")
         if not todos:
             meetings = read_meeting_notes_state()[:7]
             text = "Открытых задач нет — вот последние встречи"
@@ -2478,7 +3130,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
     if normalized == "/meeting" or normalized.startswith("/meeting "):
         arg = normalized[len("/meeting"):].strip()
         index = int(arg) if arg.isdigit() else 1
-        log_route("meeting_detail", codex=False, detail=str(index))
+        log_route("meeting_detail", engine="none", detail=str(index))
         send_typing(token, chat_id)
         send_message(token, chat_id, meeting_detail_text(index))
         return
@@ -2495,7 +3147,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         to_claim = [item for item in found if todo_owner(item) != "me"]
         already = [item for item in found if todo_owner(item) == "me"]
         changed = update_candidates_field(to_claim, "owner", "me", files=todo_files()) if to_claim else 0
-        log_route("todo_claim", codex=False, detail=",".join(ids))
+        log_route("todo_claim", engine="none", detail=",".join(ids))
         parts = []
         if changed:
             parts.append(f"Взял себе: {', '.join(item.get('id', '?') for item in to_claim)}")
@@ -2513,8 +3165,11 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, f"Укажи id задач, например: {command} T1 T2")
             return
         found, missing = todo_by_id(ids)
-        changed = update_candidates_status(found, new_status, files=todo_files()) if found else 0
-        log_route(f"todo_{new_status}", codex=False, detail=",".join(ids))
+        if new_status == "done":
+            changed = close_todo_everywhere(found)
+        else:
+            changed = update_candidates_status(found, new_status, files=todo_files()) if found else 0
+        log_route(f"todo_{new_status}", engine="none", detail=",".join(ids))
         parts = []
         if changed:
             verb = "Закрыл" if new_status == "done" else "Убрал"
@@ -2524,35 +3179,35 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         send_message(token, chat_id, ". ".join(parts) if parts else "Ничего не изменил.")
         return
     if is_ignored_message(normalized):
-        log_route("ignored", codex=False, detail=normalized)
+        log_route("ignored", engine="none", detail=normalized)
         if normalized in {"спасибо", "спс"}:
             send_message(token, chat_id, "ок")
         return
     if TODO_ONLY_MODE and is_todo_only_disabled_command(normalized):
-        log_route("todo_only_disabled", codex=False, detail=todo_only_command_key(normalized))
+        log_route("todo_only_disabled", engine="none", detail=todo_only_command_key(normalized))
         send_message(token, chat_id, "Этот режим сейчас отключён. Telegram работает как to-do inbox: пришли задачу обычным текстом или через /todo_add.")
         return
     if TODO_ONLY_MODE and normalized.startswith("/"):
-        log_route("todo_only_unknown_command", codex=False, detail=todo_only_command_key(normalized))
+        log_route("todo_only_unknown_command", engine="none", detail=todo_only_command_key(normalized))
         send_message(token, chat_id, "Команда не активна в to-do режиме. Пришли задачу обычным текстом, я добавлю её в /todo.")
         return
     if has_question_mark(normalized) and not normalized.lower().startswith("/ask"):
         if AUTO_CODEX_FOR_QUESTIONS and not TODO_ONLY_MODE:
-            answer_with_codex(token, chat_id, normalized, route_detail="question_mark")
+            answer_with_claude(token, chat_id, normalized, route_detail="question_mark")
         else:
-            log_route("question_no_auto_codex", codex=False)
+            log_route("question_no_auto_claude", engine="none")
             send_message(
                 token,
                 chat_id,
-                "Вопрос увидел, Codex не запускал. Если хочешь ответ по vault, напиши: /ask твой вопрос. Если это задача, пришли обычным списком или через /todo_add.",
+                "Вопрос увидел, Claude не запускал. Вопросы по vault теперь в Гермесе (/ask выведен 2026-08-07). Если это задача, пришли обычным списком или через /todo_add.",
             )
         return
     if normalized == "/actions":
-        log_route("actions_review", codex=False)
+        log_route("actions_review", engine="none")
         send_message(token, chat_id, build_actions_message())
         return
     if normalized.startswith("/actions_confirm"):
-        log_route("actions_confirm", codex=False)
+        log_route("actions_confirm", engine="none")
         ids = [item.upper() for item in normalized.split()[1:]]
         if not ids:
             send_message(token, chat_id, "Укажи candidates: /actions_confirm M1 M3")
@@ -2575,7 +3230,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, f"Не смог подтвердить actions: {exc}")
         return
     if normalized.startswith("/actions_reject"):
-        log_route("actions_reject", codex=False)
+        log_route("actions_reject", engine="none")
         ids = [item.upper() for item in normalized.split()[1:]]
         if not ids:
             send_message(token, chat_id, "Укажи candidates: /actions_reject M2")
@@ -2587,19 +3242,18 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
         send_message(token, chat_id, f"Отклонено meeting action candidates: {changed}.{suffix}")
         return
     if normalized == "/actions_clear":
-        log_route("actions_clear", codex=False)
+        log_route("actions_clear", engine="none")
         changed = clear_pending_meeting_actions()
         send_message(token, chat_id, f"Pending meeting action candidates очищены: {changed}.")
         return
-    if normalized == "/prioritize":
-        log_route("strategic_board", codex=True, detail="manual requested")
-        if start_strategy_review_background(token, chat_id, "manual"):
-            send_message(token, chat_id, "Запустил Strategic Board review в фоне. Когда будет готово, пришлю summary. После этого можно вызвать /calendar.")
-        else:
-            send_message(token, chat_id, "Strategic Board review уже идёт. Дождись summary, потом вызови /calendar.")
-        return
+    # /prioritize выведен (ADR-011) — обрабатывается заглушкой в начале handle_text.
+    # Календарные команды выведены 2026-08-07 и тоже ловятся заглушкой в начале
+    # handle_text, поэтому ветки ниже недостижимы: код календаря и Strategic Board
+    # сохранён намеренно (решение Антона — не удалять, только отрезать входные точки).
+    # Вместе с ними стал недостижим и последний фоновый Claude-путь бота —
+    # start_strategy_review_background() → run_strategy_review() → run_claude().
     if normalized == "/calendar":
-        log_route("calendar_preview", codex=not strategy_review_is_fresh())
+        log_route("calendar_preview", engine="claude" if not strategy_review_is_fresh() else "none")
         try:
             if not strategy_review_is_fresh():
                 if start_strategy_review_background(token, chat_id, "calendar"):
@@ -2617,7 +3271,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, "Не смог прочитать календарь, поэтому слоты не предлагаю.")
         return
     if normalized == "/calendar_new":
-        log_route("calendar_new", codex=not strategy_review_is_fresh())
+        log_route("calendar_new", engine="claude" if not strategy_review_is_fresh() else "none")
         try:
             if not strategy_review_is_fresh():
                 if start_strategy_review_background(token, chat_id, "calendar_new"):
@@ -2635,15 +3289,15 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, "Не смог прочитать календарь, поэтому слоты не предлагаю.")
         return
     if normalized == "/calendar_status":
-        log_route("calendar_status", codex=False)
+        log_route("calendar_status", engine="none")
         send_message(token, chat_id, build_calendar_status())
         return
     if normalized == "/calendar_review":
-        log_route("calendar_review", codex=False)
+        log_route("calendar_review", engine="none")
         send_message(token, chat_id, build_calendar_review())
         return
     if normalized == "/calendar_clear_done":
-        log_route("calendar_clear_done", codex=False)
+        log_route("calendar_clear_done", engine="none")
         try:
             completion_start, completion_days = calendar_completion_window()
             calendar_events = read_calendar_events(days=completion_days, start_date=completion_start)
@@ -2654,7 +3308,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, f"Не смог очистить выполненные слоты: {exc}")
         return
     if normalized == "/calendar_confirm":
-        log_route("calendar_confirm", codex=False)
+        log_route("calendar_confirm", engine="none")
         slots = read_calendar_pending()
         if not slots:
             send_message(token, chat_id, "Нет pending calendar plan. Сначала напиши /calendar.")
@@ -2703,7 +3357,7 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             send_message(token, chat_id, f"Создал {created} слотов, потом ошибка: {exc}")
         return
     if normalized in {"/calendar_clear", "/clear_calendar", "/calendar clear", "clear calendar"}:
-        log_route("calendar_clear", codex=False)
+        log_route("calendar_clear", engine="none")
         try:
             clear_calendar_pending()
             deleted = delete_recent_bot_calendar_events(days=7)
@@ -2712,37 +3366,8 @@ def handle_text(token: str, chat_id: str, text: str) -> None:
             log(f"calendar clear error: {exc}")
             send_message(token, chat_id, f"Не смог очистить calendar events: {exc}")
         return
-    if normalized in {"/daily", "/daily_focus", "/daily_planning", "/360brief", "/fullfocus"}:
-        cached = today_daily_briefs()
-        if cached:
-            log_route("daily_cached", codex=False, detail=str(cached[0]))
-            send_message(token, chat_id, cached_daily_summary(cached[0])[-12000:])
-            return
-        log_route("daily_cached", codex=False, detail="no cache")
-        send_message(token, chat_id, "Daily Planning Brief за сегодня ещё не найден. Напиши /daily_rerun для нового полного прогона.")
-        return
-    if normalized == "/daily_rerun":
-        log_route("daily_rerun", codex=True)
-        send_message(token, chat_id, "Запускаю 360 Brief: полный Daily Planning Brief с meeting memory, transcripts/project sources и critic.")
-        code, output = run_daily_focus()
-        readable_output = extract_codex_answer(output)
-        if code == 0:
-            send_message(token, chat_id, readable_output[-12000:] or "360 Brief готов, но readable output пустой. Проверь /Users/anton/Library/Logs/daily-focus.last-message.md")
-        else:
-            send_message(token, chat_id, f"360 Brief завершился с ошибкой {code}.\n\n{output[-2500:]}")
-        return
-    if normalized == "/ask":
-        log_route("ask_codex", codex=False, detail="empty")
-        send_message(token, chat_id, "Напиши вопрос так: /ask твой вопрос")
-        return
-    if normalized.lower().startswith("/ask ") or normalized.lower().startswith("/ask\n"):
-        question = ask_payload(normalized)
-        if not question:
-            log_route("ask_codex", codex=False, detail="empty")
-            send_message(token, chat_id, "Напиши вопрос так: /ask твой вопрос")
-            return
-        answer_with_codex(token, chat_id, question, route_detail="ask_command")
-        return
+    # /daily, /daily_focus, /daily_planning, /360brief, /fullfocus, /daily_rerun и /ask
+    # выведены (ADR-011) — обрабатываются заглушкой в начале handle_text.
 
     handle_todo_add(token, chat_id, normalized)
     return
@@ -2764,6 +3389,55 @@ def handle_callback(token: str, allowed_chat_id: str, callback: dict) -> None:
         send_typing(token, chat_id)
         send_message(token, chat_id, meeting_detail_by_key(key))
         return
+    triage_match = TRIAGE_CALLBACK_RE.match(data)
+    if triage_match:
+        action, ident = triage_match.group(1), triage_match.group(2)
+        try:
+            note = apply_triage(action, ident)
+        except Exception as exc:
+            log(f"triage callback error: {type(exc).__name__}: {exc}")
+            note = "ошибка триажа — смотри лог"
+        answer_callback_query(token, callback_id, note)
+        log_route("triage", engine="none", detail=f"{action}:{ident}")
+        message_id = message.get("message_id")
+        if message_id is None:
+            return
+        if str(message.get("text") or "").startswith(TRIAGE_HEADER):
+            # /triage-список: перерисовать, чтобы разобранная задача исчезла
+            tasks = triage_intake_tasks()
+            try:
+                edit_message_text(
+                    token, chat_id, str(message_id), build_triage_message(tasks),
+                    reply_markup=build_triage_keyboard(tasks) or {"inline_keyboard": []},
+                )
+            except Exception as exc:
+                log(f"editMessageText warning: {exc}")
+            return
+        # per-meeting сообщение: убрать кнопки триажа этой задачи (и ✔, если сняли)
+        suffix = f":{ident}"
+        rows = ((message.get("reply_markup") or {}).get("inline_keyboard")) or []
+        new_rows = []
+        for row in rows:
+            kept = []
+            for button in row:
+                cb = str(button.get("callback_data") or "")
+                if cb.startswith("tri:") and cb.endswith(suffix):
+                    continue
+                if action == "d" and cb.endswith(suffix):
+                    continue
+                kept.append(button)
+            if kept:
+                new_rows.append(kept)
+        try:
+            telegram_request(token, "editMessageReplyMarkup", data={
+                "chat_id": chat_id,
+                "message_id": str(message_id),
+                "reply_markup": json.dumps({"inline_keyboard": new_rows}, ensure_ascii=False),
+            }, timeout=15)
+        except Exception as exc:
+            log(f"editMessageReplyMarkup warning: {exc}")
+        return
+
     match = re.match(r"^(todo_done|mnote_done|todo_claim):(T\d+)$", data)
     if not match:
         answer_callback_query(token, callback_id)
@@ -2781,7 +3455,7 @@ def handle_callback(token: str, allowed_chat_id: str, callback: dict) -> None:
         else:
             update_candidates_field(found, "owner", "me", files=todo_files())
             answer_callback_query(token, callback_id, f"➕ {todo_id} добавил в /todo")
-        log_route("todo_claim", codex=False, detail=todo_id)
+        log_route("todo_claim", engine="none", detail=todo_id)
         message_id = message.get("message_id")
         if message_id is None:
             return
@@ -2810,12 +3484,12 @@ def handle_callback(token: str, allowed_chat_id: str, callback: dict) -> None:
         answer_callback_query(token, callback_id, f"{todo_id} уже закрыт")
         changed = 0
     else:
-        changed = update_candidates_status(found, "done", files=todo_files()) if found else 0
+        changed = close_todo_everywhere(found)
         if changed:
             answer_callback_query(token, callback_id, f"✔ {todo_id} закрыт")
         else:
             answer_callback_query(token, callback_id, f"{todo_id} не найден")
-    log_route("todo_button", codex=False, detail=f"{origin}:{todo_id}:changed={changed}")
+    log_route("todo_button", engine="none", detail=f"{origin}:{todo_id}:changed={changed}")
 
     message_id = message.get("message_id")
     if message_id is None:
@@ -2880,9 +3554,21 @@ def run_loop(token: str, allowed_chat_id: str, once: bool = False) -> None:
             if chat_id != str(allowed_chat_id):
                 log(f"ignored message from chat_id={chat_id}")
                 continue
+            if message.get("voice") or message.get("audio"):
+                log(f"processing voice update_id={update_id}")
+                try:
+                    handle_voice_checkin(token, chat_id, message)
+                except Exception as exc:
+                    log(f"voice checkin error: {exc}")
+                    try:
+                        send_message(token, chat_id, f"❌ Чекин не обработан: {exc}")
+                    except Exception as send_exc:
+                        log(f"voice checkin: reply failed: {send_exc}")
+                continue
+
             text = message.get("text")
             if not text:
-                send_message(token, chat_id, "Пока умею отвечать только на текстовые сообщения.")
+                send_message(token, chat_id, "Пока умею отвечать только на текстовые и голосовые сообщения.")
                 continue
             log(f"processing update_id={update_id}")
             handle_text(token, chat_id, text)
@@ -2920,7 +3606,7 @@ def main() -> int:
         init_offset(token)
         return 0
     if args.send_test:
-        send_message(token, chat_id, "Telegram -> Codex bot настроен. Напиши /ping для проверки.")
+        send_message(token, chat_id, "Telegram -> Claude bot настроен. Напиши /ping для проверки.")
         return 0
     run_loop(token, chat_id, once=args.once)
     return 0

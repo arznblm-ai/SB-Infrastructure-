@@ -56,6 +56,17 @@ RECORDINGS_ARCHIVE_DIR = Path(
     os.environ.get("RECORDINGS_ARCHIVE_DIR", "/Users/anton/Krisp Recordings")
 ).expanduser().resolve()
 
+# ASR: по умолчанию parakeet на GPU (×12.6 реального времени против ×5 у whisper small),
+# whisper остаётся запасным путём. KRISP_ASR_ENGINE=whisper форсирует старое поведение.
+ASR_ENGINE = os.environ.get("KRISP_ASR_ENGINE", "parakeet")
+PARAKEET_REPO = os.environ.get("PARAKEET_REPO", "mlx-community/parakeet-tdt-0.6b-v3")
+WHISPER_FALLBACK_MODEL = os.environ.get("KRISP_WHISPER_MODEL", "small")
+PARAKEET_SR = 16000
+PARAKEET_CHUNK_SEC = 120.0
+PARAKEET_OVERLAP_SEC = 12.0
+
+_ASR: dict[str, Any] = {"parakeet": None, "whisper": None, "parakeet_failed": False}
+
 SETTLE_SECONDS = int(os.environ.get("SETTLE_SECONDS", "120"))
 CALLINFO_WAIT_SECONDS = int(os.environ.get("CALLINFO_WAIT_SECONDS", "3600"))
 MIN_TRANSCRIPT_CHARS = int(os.environ.get("MIN_TRANSCRIPT_CHARS", "500"))
@@ -275,7 +286,111 @@ def finish_paired_background(
     return True
 
 
-def transcribe_audio(model, audio_path: Path) -> tuple[str, int, str]:
+def stamp(seconds: float) -> str:
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def parakeet_sentences(audio_path: Path) -> list[tuple[float, float, str]]:
+    """Предложения (начало, конец, текст) от parakeet.
+
+    Файл декодируем сами: parakeet-mlx умеет принимать путь, но внутри у него
+    ffmpeg, которого в системе нет. Часовые записи режем на чанки с перекрытием —
+    целиком такая запись в модель не помещается.
+    """
+    import mlx.core as mx
+    from faster_whisper.audio import decode_audio
+    from parakeet_mlx.audio import get_logmel
+
+    model = load_parakeet()
+    audio = decode_audio(str(audio_path), sampling_rate=PARAKEET_SR)
+    chunk = int(PARAKEET_CHUNK_SEC * PARAKEET_SR)
+    step = int((PARAKEET_CHUNK_SEC - PARAKEET_OVERLAP_SEC) * PARAKEET_SR)
+    total = len(audio)
+
+    sentences: list[tuple[float, float, str]] = []
+    last_end = 0.0
+    for offset in range(0, max(total, 1), step):
+        piece = audio[offset : offset + chunk]
+        if len(piece) < PARAKEET_SR // 2:  # хвост короче 0.5с
+            break
+        is_last = offset + chunk >= total
+        base = offset / PARAKEET_SR
+        piece_end = base + len(piece) / PARAKEET_SR
+
+        result = model.generate(get_logmel(mx.array(piece), model.preprocessor_config))
+        for sentence in (result[0].sentences if result else []):
+            text = sentence.text.strip()
+            start, end = base + sentence.start, base + sentence.end
+            if not text:
+                continue
+            # предложение, обрезанное границей чанка, целиком приедет со следующим
+            if not is_last and end > piece_end - 1.0:
+                continue
+            # то, что уже записано предыдущим чанком в зоне перекрытия
+            if start < last_end - 0.5:
+                continue
+            sentences.append((start, end, text))
+            last_end = max(last_end, end)
+        if is_last:
+            break
+    return sentences
+
+
+def load_parakeet():
+    if _ASR["parakeet"] is None:
+        from parakeet_mlx import from_pretrained
+
+        log(f"Загружаю parakeet: {PARAKEET_REPO}")
+        _ASR["parakeet"] = from_pretrained(PARAKEET_REPO)
+    return _ASR["parakeet"]
+
+
+def load_whisper():
+    if _ASR["whisper"] is None:
+        from faster_whisper import WhisperModel
+
+        log(f"Загружаю faster-whisper: {WHISPER_FALLBACK_MODEL}")
+        _ASR["whisper"] = WhisperModel(
+            WHISPER_FALLBACK_MODEL, device="cpu", compute_type="int8"
+        )
+    return _ASR["whisper"]
+
+
+def transcribe_audio(audio_path: Path) -> tuple[str, int, str]:
+    """(транскрипт с метками [HH:MM:SS], число символов речи, язык)."""
+    if ASR_ENGINE == "parakeet" and not _ASR["parakeet_failed"]:
+        try:
+            return transcribe_with_parakeet(audio_path)
+        except Exception as exc:
+            _ASR["parakeet_failed"] = True
+            log(
+                f"⚠ parakeet не сработал ({type(exc).__name__}: {exc}); "
+                f"дальше этот проход идёт на whisper {WHISPER_FALLBACK_MODEL}"
+            )
+    return transcribe_with_whisper(audio_path)
+
+
+def transcribe_with_parakeet(audio_path: Path) -> tuple[str, int, str]:
+    started = time.monotonic()
+    log(f"Parakeet старт: {audio_path.name}")
+    sentences = parakeet_sentences(audio_path)
+    _ASR["last_engine"] = f"parakeet:{PARAKEET_REPO.split('/')[-1]}"
+    rendered = [f"[{stamp(start)}] {text}" for start, _, text in sentences]
+    spoken = [text for _, _, text in sentences]
+    elapsed = time.monotonic() - started
+    audio_seconds = sentences[-1][1] if sentences else 0.0
+    log(
+        f"Parakeet готов: {audio_path.name}, предложений={len(sentences)}, "
+        f"длительность обработки={elapsed:.1f}с (×{audio_seconds / max(elapsed, 0.1):.1f} реального времени)"
+    )
+    return "\n\n".join(rendered), len(" ".join(spoken)), "auto"
+
+
+def transcribe_with_whisper(audio_path: Path) -> tuple[str, int, str]:
+    model = load_whisper()
+    _ASR["last_engine"] = f"faster-whisper:{WHISPER_FALLBACK_MODEL}"
     started = time.monotonic()
     log(f"Whisper старт: {audio_path.name}")
     segments, info = model.transcribe(str(audio_path), vad_filter=True)
@@ -286,9 +401,7 @@ def transcribe_audio(model, audio_path: Path) -> tuple[str, int, str]:
         if not text:
             continue
         spoken.append(text)
-        hours, remainder = divmod(int(segment.start), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        rendered.append(f"[{hours:02d}:{minutes:02d}:{seconds:02d}] {text}")
+        rendered.append(f"[{stamp(segment.start)}] {text}")
 
     elapsed = time.monotonic() - started
     language = getattr(info, "language", "unknown")
@@ -376,8 +489,15 @@ def write_local_note(
 
     id_field = "krisp_stream_id" if use_stream_id else "krisp_call_id"
     id_value = stream_id if use_stream_id else call.get("call_id", "")
+    # ВАЖНО: значение "local-whisper-tiny" — это маркер «черновик, ждёт MCP-замену»,
+    # а не имя модели: ровно его сравнивает note_is_pending() в krisp_to_obsidian.py.
+    # Менять нельзя, иначе облачный транскрипт перестанет заменять локальный.
+    # Реальный движок пишем отдельным полем transcript_engine.
     content = helper.upsert_frontmatter_field(
         content, "transcript_source", "local-whisper-tiny"
+    )
+    content = helper.upsert_frontmatter_field(
+        content, "transcript_engine", _ASR.get("last_engine", ASR_ENGINE)
     )
     if id_value:
         content = helper.upsert_frontmatter_field(content, id_field, id_value)
@@ -388,7 +508,6 @@ def write_local_note(
 
 
 def process_staged_files(state: dict[str, dict[str, Any]], helper) -> None:
-    model = None
     helper.KRISP_CALLINFO = CALLINFO_PATH
     calls = helper.read_callinfo()
 
@@ -430,11 +549,7 @@ def process_staged_files(state: dict[str, dict[str, Any]], helper) -> None:
                 original = KRISP_RECORDINGS_DIR / staged.name
                 if not audio_is_ready(staged, entry, original, now):
                     continue
-                if model is None:
-                    from faster_whisper import WhisperModel
-
-                    model = WhisperModel("small", device="cpu", compute_type="int8")
-                transcript, char_count, language = transcribe_audio(model, staged)
+                transcript, char_count, language = transcribe_audio(staged)
                 entry.update(
                     {
                         "status": "transcribed",
