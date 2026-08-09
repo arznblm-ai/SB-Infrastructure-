@@ -5,6 +5,9 @@ meeting_notes.py — Meeting Notes Assistant.
 Следит за transcripts/: когда Krisp-транскрипт встречи готов, делает короткое
 shareable summary (claude haiku), шлёт его в Telegram и складывает таски встречи
 в "meeting todo/" (для /todo в боте) и в Todoist.
+Встреча умеет и закрывать задачи: если в разговоре прямо прозвучало, что обещанное
+сделано, соответствующая открытая задача Todoist закрывается, а в канал доставки
+уходит отдельная отчётная строка (см. resolve_completed_tasks).
 
 Кроссплатформенно (мак + VPS): корень vault и пути берутся от расположения
 скрипта / $HOME, env `SECOND_BRAIN_VAULT` переопределяет корень.
@@ -133,6 +136,18 @@ AREA_SHORT = {
 TITLE_SHORT_MAX = 70
 DUE_MAX_DAYS_AHEAD = 90
 
+# ── Закрытие задач по итогам встречи (2026-08-08) ─────────────────────────
+# Встреча не только заводит задачи, но и закрывает: если в разговоре прямо
+# прозвучало, что обещанное сделано («я принёс презентацию», собеседник
+# подтвердил получение). Список открытых задач кладём в тот же ЕДИНСТВЕННЫЙ
+# вызов haiku; модели не доверяем — закрываем только confidence=high и только
+# id из переданного списка (см. resolve_completed_tasks).
+COMPLETED_TASKS_LIMIT = 40   # сколько открытых задач максимум уходит в промпт
+COMPLETED_MAX_ITEMS = 10     # сколько закрытий максимум принимаем от модели
+EVIDENCE_MAX_CHARS = 160
+# Приоритет секций при обрезке списка: то, что в работе, важнее «потом»
+SECTION_PRIORITY = {"week": 0, "intake": 1, "waiting": 2, "later": 3}
+
 SUMMARY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -167,8 +182,21 @@ SUMMARY_SCHEMA = {
             "minItems": 8,
             "maxItems": 25,
         },
+        "completed_tasks": {
+            "type": "array",
+            "maxItems": COMPLETED_MAX_ITEMS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium"]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["task_id", "confidence", "evidence"],
+            },
+        },
     },
-    "required": ["title", "summary_lines", "tasks", "detailed_lines"],
+    "required": ["title", "summary_lines", "tasks", "detailed_lines", "completed_tasks"],
 }
 
 PROMPT_TEMPLATE = """Ты готовишь короткую заметку по итогам встречи. Участник встречи поделится этой заметкой с коллегами, поэтому она должна быть самодостаточной и безопасной для пересылки.
@@ -186,6 +214,7 @@ PROMPT_TEMPLATE = """Ты готовишь короткую заметку по 
 - due_suggested у каждого элемента tasks: срок в формате YYYY-MM-DD, и ТОЛЬКО если срок реально прозвучал в разговоре. Относительные формулировки («в понедельник», «завтра», «до конца недели», «через две недели») пересчитывай в абсолютную дату относительно даты встречи, указанной ниже. Если срок не назывался — null. Выдумывать сроки запрещено.
 - title: короткое название встречи по её содержанию (2-5 слов).
 - detailed_lines: развёрнутое саммари, 10-25 строк (каждая до 200 символов) — тоже безопасное для пересылки коллегам, те же запреты на личную информацию. Покрой: контекст и цель встречи; участники и их роли; ход обсуждения с позициями и аргументами сторон; названные цифры, факты, названия; принятые решения; договорённости; открытые вопросы и на чём остановились. Пиши плотно и конкретно, без воды, каждая строка — законченная мысль.
+{completed_block}
 
 Название файла встречи: {title}
 Дата встречи: {date} — считай эту дату «сегодня» при пересчёте относительных сроков в due_suggested.
@@ -193,6 +222,15 @@ PROMPT_TEMPLATE = """Ты готовишь короткую заметку по 
 Материалы встречи:
 
 {body}"""
+
+# Блок закрытий подставляется в {completed_block}: правила + пронумерованный
+# список открытых задач. Список не собрался (Todoist недоступен) — слой молча
+# выключается, модель обязана вернуть пустой массив.
+COMPLETED_RULES = """- completed_tasks: задачи ИЗ СПИСКА «Открытые задачи Антона» ниже, про которые в разговоре прямо прозвучало, что они УЖЕ ВЫПОЛНЕНЫ. task_id бери только из этого списка, дословно; выдумывать id запрещено. confidence "high" — только если выполнение названо прямо (Антон говорит от первого лица «принёс», «отправил», «сделал», либо собеседник подтверждает, что получил/увидел) И задача однозначно та самая (совпадает предмет действия, а не общая тема). confidence "medium" — похоже на выполнение, но однозначности нет: расплывчатая формулировка, несколько похожих задач, другой объект. Обещания на будущее («сделаю», «пришлю завтра», «до конца недели») выполнением НЕ считаются. evidence — короткая цитата или пересказ фразы (до 160 символов), из которой видно выполнение. Если таких утверждений в разговоре нет — верни пустой массив."""
+
+COMPLETED_RULES_EMPTY = """- completed_tasks: всегда пустой массив (список открытых задач сейчас недоступен)."""
+
+COMPLETED_TASKS_HEADER = "Открытые задачи Антона (task_id — задача — секция):"
 
 
 # ── Логирование ──────────────────────────────────────────────────────────
@@ -389,6 +427,122 @@ def build_llm_body(content: str) -> str:
     return "\n\n".join(parts)
 
 
+# ── Слой закрытий: открытые задачи Todoist ────────────────────────────────
+
+# Список открытых задач нужен и промпту, и валидатору, а прогон может тронуть
+# несколько встреч — поэтому тянем его максимум один раз за процесс.
+_OPEN_TASKS_CACHE: Optional[list[dict[str, str]]] = None
+
+
+def fetch_open_todoist_tasks() -> list[dict[str, str]]:
+    """Открытые задачи рабочего скоупа: [{id, title, section, vault_id}].
+
+    Best-effort: Todoist недоступен → пустой список, слой закрытий на этот
+    прогон просто выключается (всё остальное работает как раньше)."""
+    try:
+        scope = todoist_client.work_scope_project_ids(log_fn=log)
+        raw_tasks = todoist_client.list_open_tasks(project_ids=scope, log_fn=log)
+        sections = todoist_client.load_section_ids(log_fn=log)
+    except Exception as exc:
+        log(f"completed: список задач не получен ({type(exc).__name__}: {exc}) → слой закрытий выключен")
+        return []
+    section_by_id = {str(value): key for key, value in sections.items() if value}
+    tasks: list[dict[str, str]] = []
+    for node in raw_tasks:
+        task_id = str(node.get("id") or "").strip()
+        title = re.sub(r"\s+", " ", str(node.get("content") or "")).strip()
+        if not task_id or not title:
+            continue
+        vault_match = re.search(r"Vault ID:\s*(T\d+)", str(node.get("description") or ""))
+        tasks.append({
+            "id": task_id,
+            "title": title,
+            "section": section_by_id.get(str(node.get("section_id") or ""), ""),
+            "vault_id": vault_match.group(1).upper() if vault_match else "",
+        })
+    tasks.sort(key=lambda t: SECTION_PRIORITY.get(t["section"], 9))
+    if len(tasks) > COMPLETED_TASKS_LIMIT:
+        log(f"completed: открытых задач {len(tasks)}, в промпт уходят первые {COMPLETED_TASKS_LIMIT}")
+        tasks = tasks[:COMPLETED_TASKS_LIMIT]
+    log(f"completed: открытых задач для слоя закрытий: {len(tasks)}")
+    return tasks
+
+
+def open_todoist_tasks() -> list[dict[str, str]]:
+    """Кэшированный (на процесс) список открытых задач."""
+    global _OPEN_TASKS_CACHE
+    if _OPEN_TASKS_CACHE is None:
+        _OPEN_TASKS_CACHE = fetch_open_todoist_tasks()
+    return list(_OPEN_TASKS_CACHE)
+
+
+def build_completed_block(open_tasks: list[dict[str, str]]) -> str:
+    """Правила + пронумерованный список задач для {completed_block} промпта.
+
+    Список подставляется без .format(), чтобы фигурные скобки в заголовках
+    задач не ломали шаблон."""
+    if not open_tasks:
+        return COMPLETED_RULES_EMPTY
+    lines = []
+    for index, task in enumerate(open_tasks, start=1):
+        section = task.get("section") or "без секции"
+        lines.append(f"{index}. task_id={task['id']} — {task['title']} — {section}")
+    return f"{COMPLETED_RULES}\n\n{COMPLETED_TASKS_HEADER}\n" + "\n".join(lines)
+
+
+def resolve_completed_tasks(
+    summary: dict,
+    open_tasks: list[dict[str, str]],
+    dry_run: bool = False,
+) -> dict:
+    """Проверяет completed_tasks модели и закрывает то, что прошло проверку.
+
+    Модели не доверяем: id не из переданного списка отбрасываем с логом,
+    закрываем ТОЛЬКО confidence=high, medium уходит в отчёт без закрытия.
+    Возвращает {"closed": [], "uncertain": [], "failed": []} с элементами
+    {id, title, evidence}; всё пустое — значит, сообщать нечего."""
+    result: dict[str, list[dict[str, str]]] = {"closed": [], "uncertain": [], "failed": []}
+    items = summary.get("completed_tasks") or []
+    if not items or not open_tasks:
+        return result
+    by_id = {task["id"]: task for task in open_tasks}
+    seen: set[str] = set()
+    for item in items[:COMPLETED_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("task_id") or "").strip()
+        task = by_id.get(task_id)
+        if not task:
+            log(f"completed: игнорирую task_id {task_id!r} — его не было в переданном списке")
+            continue
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        record = {
+            "id": task_id,
+            "title": task["title"],
+            "evidence": clean_evidence(item.get("evidence")),
+        }
+        if str(item.get("confidence") or "").strip().lower() != "high":
+            result["uncertain"].append(record)
+            continue
+        if dry_run:
+            result["closed"].append(record)
+            continue
+        try:
+            closed = todoist_client.close_task(task_id, log_fn=log)
+        except Exception as exc:
+            closed = False
+            log(f"completed: close failed for {task_id}: {type(exc).__name__}: {exc}")
+        (result["closed"] if closed else result["failed"]).append(record)
+    if any(result.values()):
+        log(
+            f"completed: closed={len(result['closed'])} uncertain={len(result['uncertain'])} "
+            f"failed={len(result['failed'])}{' (dry-run)' if dry_run else ''}"
+        )
+    return result
+
+
 # ── Claude CLI ────────────────────────────────────────────────────────────
 
 def run_claude(prompt: str) -> Optional[dict]:
@@ -475,6 +629,18 @@ def clean_due(value: object, today: Optional[dt.date] = None) -> Optional[str]:
     return parsed.isoformat()
 
 
+def clean_evidence(value: object) -> str:
+    """Цитата для отчётной строки: одна строка, <=160 символов по границе слова."""
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= EVIDENCE_MAX_CHARS:
+        return text
+    cut = text[:EVIDENCE_MAX_CHARS]
+    space = cut.rfind(" ")
+    if space >= EVIDENCE_MAX_CHARS // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,.;:—-") + "…"
+
+
 def validate_summary(data: dict) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
@@ -527,6 +693,22 @@ def validate_summary(data: dict) -> Optional[dict]:
         if len(text) > 250:
             text = text[:247].rstrip() + "..."
         detailed.append(text)
+    completed = []
+    for item in data.get("completed_tasks") or []:
+        if not isinstance(item, dict):
+            continue
+        task_id = str(item.get("task_id", "")).strip()
+        if not task_id:
+            continue
+        # Сверка id со списком открытых задач — в resolve_completed_tasks;
+        # здесь только форма. Всё, что не строго "high", становится medium,
+        # то есть никогда не закрывается автоматически.
+        confidence = "high" if str(item.get("confidence", "")).strip().lower() == "high" else "medium"
+        completed.append({
+            "task_id": task_id,
+            "confidence": confidence,
+            "evidence": clean_evidence(item.get("evidence")),
+        })
     if dropped_facts:
         log(f"tasks: отброшено как факты (type=fact): {dropped_facts}")
     return {
@@ -534,10 +716,18 @@ def validate_summary(data: dict) -> Optional[dict]:
         "summary_lines": clean_lines[:8],
         "tasks": clean_tasks,
         "detailed_lines": detailed[:25],
+        "completed_tasks": completed[:COMPLETED_MAX_ITEMS],
     }
 
 
-def summarize_llm(content: str, title: str, date: str) -> Optional[dict]:
+def summarize_llm(
+    content: str,
+    title: str,
+    date: str,
+    open_tasks: Optional[list[dict[str, str]]] = None,
+) -> Optional[dict]:
+    """Один вызов haiku на встречу. `open_tasks` включает слой закрытий
+    (список уходит в тот же промпт); None/пусто — слой выключен."""
     prompt = PROMPT_TEMPLATE.format(
         title=title,
         date=date,
@@ -545,6 +735,7 @@ def summarize_llm(content: str, title: str, date: str) -> Optional[dict]:
         areas=" | ".join(AREA_CHOICES),
         no_area=NO_AREA,
         area_prefixes=", ".join(f"{short} (= {full})" for full, short in AREA_SHORT.items()),
+        completed_block=build_completed_block(open_tasks or []),
     )
     for attempt in (1, 2):
         data = run_claude(prompt)
@@ -789,6 +980,46 @@ def format_shareable_message(summary: dict, meeting_date: str) -> str:
     return "\n".join(lines)
 
 
+def format_completed_report(result: dict, meeting_title: str) -> str:
+    """Отчёт о закрытиях — ОТДЕЛЬНОЕ второе сообщение (shareable-ноутс уходит
+    коллегам, закрытия — личное). Пустая строка = сообщать нечего."""
+    closed = result.get("closed") or []
+    uncertain = result.get("uncertain") or []
+    failed = result.get("failed") or []
+    if not (closed or uncertain or failed):
+        return ""
+    blocks = []
+    if closed:
+        lines = [f"✅ Закрыто по итогам встречи «{meeting_title}»:"]
+        for task in closed:
+            evidence = task.get("evidence")
+            lines.append(f"• {task['title']}" + (f" — {evidence}" if evidence else ""))
+        blocks.append("\n".join(lines))
+    if uncertain:
+        lines = ["🤔 Похоже, сделано — подтверди Гермесу:"]
+        for task in uncertain:
+            evidence = task.get("evidence")
+            lines.append(f"• {task['title']}" + (f" — {evidence}" if evidence else ""))
+        blocks.append("\n".join(lines))
+    if failed:
+        lines = ["⚠️ Прозвучало как сделанное, но Todoist не закрыл:"]
+        lines.extend(f"• {task['title']}" for task in failed)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def format_completed_dry_run(result: dict) -> str:
+    """Разбор слоя закрытий для --dry-run: что было бы закрыто и почему."""
+    lines = []
+    for task in result.get("closed") or []:
+        lines.append(f"закрыл бы (high): {task['id']} — {task['title']} | {task.get('evidence') or '—'}")
+    for task in result.get("uncertain") or []:
+        lines.append(f"только пометил (medium): {task['id']} — {task['title']} | {task.get('evidence') or '—'}")
+    for task in result.get("failed") or []:
+        lines.append(f"не закрылось: {task['id']} — {task['title']}")
+    return "\n".join(lines) if lines else "(кандидатов на закрытие нет)"
+
+
 def format_detail_message(summary: dict, meeting_date: str) -> str:
     try:
         date_label = dt.datetime.strptime(meeting_date, "%Y-%m-%d").strftime("%d.%m")
@@ -986,7 +1217,9 @@ def process_meeting(
     summary = entry.get("summary")
     if not summary:
         log(f"summarizing: {path.name}")
-        summary = summarize_llm(content, title, date.isoformat())
+        # Открытые задачи уходят в тот же единственный вызов haiku (слой закрытий).
+        # Todoist недоступен → список пустой, слой молча выключается.
+        summary = summarize_llm(content, title, date.isoformat(), open_todoist_tasks())
         if not summary:
             summary = summarize_fallback(content, title)
             if summary:
@@ -1014,11 +1247,26 @@ def process_meeting(
             entry["todo_items"] = append_todos(summary, str(path), entry["date"], dry_run=dry_run)
             entry["todo_ids"] = [i["id"] for i in entry["todo_items"]]
 
+    # Закрытия по итогам встречи: ровно один раз на встречу (как и todo_items),
+    # чтобы ретрай доставки не закрывал задачи повторно.
+    if "completed_result" not in entry:
+        entry["completed_result"] = resolve_completed_tasks(
+            summary, open_todoist_tasks(), dry_run=dry_run
+        )
+    completed_report = format_completed_report(
+        entry["completed_result"], summary.get("title") or title
+    )
+
     shareable = format_shareable_message(summary, entry["date"])
 
     if dry_run:
         print("--- message (shareable note) ---")
         print(shareable)
+        print("--- закрытия по итогам встречи (Todoist не вызывался) ---")
+        print(format_completed_dry_run(entry["completed_result"]))
+        if completed_report:
+            print("--- отчёт о закрытиях (ушёл бы вторым сообщением) ---")
+            print(completed_report)
         print("--- detail (/meeting) ---")
         print(format_detail_message(summary, entry["date"]))
         return
@@ -1031,6 +1279,15 @@ def process_meeting(
     entry["status"] = "sent"
     entry["sent_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     log(f"sent: {path.name} ({len(entry['todo_ids'])} todos)")
+
+    # Отчёт о закрытиях — отдельным сообщением: shareable-ноутс форвардится
+    # коллегам, закрытия задач Антона туда попадать не должны.
+    if completed_report and not entry.get("completed_report_sent"):
+        try:
+            send_to(note_channel, completed_report)
+            entry["completed_report_sent"] = True
+        except Exception as exc:
+            log(f"completed: report send failed: {path.name}: {exc}")
 
 
 def run_detail(key: str) -> int:

@@ -48,8 +48,8 @@ def install(weekday: int, hour: int, minute: int) -> None:
             str(runner),
         ],
         "WorkingDirectory": str(PROJECT_DIR),
+        # 2026-08-08, решение Антона: пуш ежедневный, не еженедельный (Weekday убран)
         "StartCalendarInterval": {
-            "Weekday": weekday,
             "Hour": hour,
             "Minute": minute,
         },

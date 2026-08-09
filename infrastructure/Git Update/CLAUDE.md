@@ -2,9 +2,9 @@
 
 ## Контекст
 
-Git Update — weekly automation для безопасного обновления приватного GitHub repo `SB-Infrastructure-` из Second Brain infrastructure snapshot.
+Git Update — **ежедневная** automation (с 2026-08-08, решение Антона; до этого weekly) для безопасного обновления **публичного** GitHub repo `SB-Infrastructure-` из Second Brain infrastructure snapshot. Public — намеренно (решение Антона 2026-08-08): шарибельный слой скиллов/инфраструктуры для ревью живыми людьми.
 
-Цель: раз в неделю сохранить reusable infrastructure в GitHub без утечки meetings, transcripts, sessions, runtime state, logs, tokens и личных данных.
+Цель: раз в день (10:45, при спящем маке — при пробуждении) сохранять актуальную reusable infrastructure в GitHub без утечки meetings, transcripts, sessions, runtime state, logs, tokens и личных данных. При провале прогона (safety scan, push, краш) runner шлёт ❌-алерт в TG (токен из `daily-focus.env`); успех — молчание. Имена Label/файлов сохраняют слово «weekly» исторически — переименование не стоит риска сломать пути.
 
 ## Папки
 
@@ -26,6 +26,20 @@ Git Update — weekly automation для безопасного обновлен�
 5. Если есть изменения и scan clean — создаётся commit.
 6. Если terminal GitHub auth работает — commit пушится в `origin/main`.
 7. Если push не прошёл — commit остаётся локально, push можно сделать через GitHub Desktop.
+8. Если прогон завершился неуспехом — runner шлёт один ❌-алерт в Telegram (см. ниже). Успешный прогон молчит.
+
+## Failure Alerting (добавлено 2026-08-08)
+
+Причина: два еженедельных прогона подряд молча упали на `SAFETY SCAN FAILED` — Антон узнал случайно.
+
+- Алерт живёт в runner'е `Scripts/run_weekly_git_update.sh`, а не в sync-скрипте: ручной `$git-update` не должен слать сообщения в Telegram.
+- Триггер: ненулевой код возврата python-скрипта **или** `SAFETY SCAN FAILED` в выводе (страховка на случай, если код вернут 0).
+- Формат: `❌ Weekly git-update не прошёл: <причина>. Лог: ~/Library/Logs/weekly-git-update.log`
+- Причины: `SAFETY SCAN FAILED — <первая находка>` / `push в origin/main не прошёл` / `код возврата N — <последняя строка вывода>`.
+- Канал: `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` из `~/.config/second-brain/daily-focus.env` — тот же, что у остальных мак-алертов.
+- Best-effort: нет env-файла, нет сети или Telegram вернул 4xx (`curl --fail`) — пишется строка `[alert] ...` в лог, прогон не падает из-за алерта.
+- Exit code python-скрипта пробрасывается наружу (2 — safety scan, 3 — push), чтобы launchd тоже видел провал.
+- Успешный прогон и прогон без изменений (`No infrastructure changes to commit.`) сообщений не шлют.
 
 ## Safety Contract
 
