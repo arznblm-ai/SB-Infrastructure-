@@ -1,0 +1,13 @@
+[Unit]
+Description=Financial Coach sync — ежедневно в 08:30 по Москве
+
+[Timer]
+OnCalendar=*-*-* 08:30:00
+# Явная зона: не зависим от таймзоны сервера (нужен systemd >= 251, см. README)
+Timezone=Europe/Moscow
+Persistent=true
+RandomizedDelaySec=120
+Unit=financial-coach-sync.service
+
+[Install]
+WantedBy=timers.target

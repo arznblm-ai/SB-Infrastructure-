@@ -1,0 +1,19 @@
+[Unit]
+Description=Financial Coach: ежедневный синк ПланФакт/ZenMoney/CRM + рендер дашборда
+Documentation=file:///root/second-brain/infrastructure/Financial Coach/Scripts/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/second-brain/infrastructure/Financial Coach/Scripts
+EnvironmentFile=/root/.config/second-brain/finance.env
+ExecStart=/usr/bin/python3 sync_daily.py --live
+TimeoutStartSec=900
+# Логи смотреть через journalctl -u financial-coach-sync
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
