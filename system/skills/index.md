@@ -1,12 +1,13 @@
 # Index: skills
 
 > Автоматически сгенерировано Obsidian Manager.
-> Последнее обновление: 2026-08-17 10:17.
+> Последнее обновление: 2026-08-18 12:56.
 > Не редактировать вручную — будет перезаписан при следующей индексации.
 
 | Скил | Описание |
 |------|----------|
 | [[agent-evaluator]] | Review, evaluate, and improve AI agents, Codex skills, CLAUDE.md/AGENTS.md files, multi-agent departments, Telegram bots, scheduled automations, VPS orchestration, research departments, planning assistants, and prompt-based workflows. Use when the user asks to "проверь агента", "оцени департамент", "улучши скил", "проверь промпт", "почему агент работает плохо", "напиши промт с правками", "review automation", "evaluate agent", or wants objective QA of agent behavior, token cost, source quality, safety, routing, eval loops, confirmations, or operating procedures. |
+| [[alina]] | Продюсер Алина (vault-интерфейс): Антон даёт бриф проекта — Алина отдаёт полный брейкдаун по объёму работ, таймингу (этапы, критический путь, буфер, правки) и деньгам (смета: люди, инструменты и генерации, лицензии, непредвиденное, маржа → цена клиенту), с вариантами, рисками и одной рекомендацией; учится у Антона считать (правила и ставки записываются с датой) и готовит карточку проекта для TG-Алины. Та же Алина, что @Alina_portal_bot в Telegram — там наблюдение и уведомления, здесь планирование. Use when Anton gives a project brief and wants an estimate/breakdown, asks how long or how much a production will take/cost, wants to plan a project's stages and timing, teaches Alina a rate or estimation rule, or continues a previous breakdown. Trigger on '/alina', 'Алина', 'посчитай проект', 'просчитай', 'сколько будет стоить ролик', 'сколько займёт', 'брейкдаун', 'смета', 'тайминг проекта', 'разложи проект по этапам', 'бриф:', 'запомни ставку', 'estimate', 'breakdown', 'production budget', 'timing'. |
 | [[archive]] | archive |
 | [[contract-filler]] | Заполняет договор ИП Розенблюм для нового клиента по .docx-шаблону — реквизиты юрлица (из PDF/текста/фото), предмет под конкретную услугу, сроки, стоимость, порядок оплаты, Приложение №1 — и отдаёт готовый файл. Use when Антон просит "заполни договор", "подготовь договор для клиента", "сделай договор на <услугу>", "поправь формулировки в договоре", или кидает шаблон договора + реквизиты клиента. НЕ для NDA и confidential-документов (это Doc Manager). |
 | [[design department]] | Operating system for presentation design: use Design Department when a request should enter through `design-orchestrator`, be classified into the right workflow mode, routed through specialist roles, and return with explicit artifacts plus review status. |
@@ -35,4 +36,4 @@
 | [[video-transcribe]] | Transcribe local video files into Markdown notes with parakeet (GPU, default) or faster-whisper. Save course/meeting raw transcripts into `transcripts/` for transcript-summarizer, but save short external videos, reels, X/Twitter videos, TikToks, YouTube Shorts, and similar internet clips into `transcripts/external resources/` unless the user asks otherwise. |
 | [[youtube-transcribe]] | Transcribe public YouTube videos from a URL into Markdown notes, then optionally run `transcript-summarizer` and save the resulting summary into Second Brain. Use when the user pastes a YouTube link and wants the external-resource transcript stored in `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources` unless they explicitly route it to a course, meeting, or project folder. |
 
-**Статистика:** 28 скилов.
+**Статистика:** 29 скилов.
