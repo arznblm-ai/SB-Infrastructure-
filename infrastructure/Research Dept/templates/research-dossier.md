@@ -1,5 +1,7 @@
 # Research Dossier
 
+### [[2026-04-15]]
+
 Analytical core only. This is not the final CEO reading document.
 
 - Research mode:

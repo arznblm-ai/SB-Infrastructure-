@@ -6,6 +6,8 @@ model: inherit
 
 # Sema Router
 
+### [[2026-07-24]]
+
 Этот skill — канонический вход к карьерному стратегу Семе. Он не дублирует операционную систему агента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Career Strategist/CLAUDE.md`

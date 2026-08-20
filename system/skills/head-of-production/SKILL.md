@@ -6,6 +6,8 @@ model: inherit
 
 # Head of Production Router
 
+### [[2026-07-22]]
+
 Канонический entrypoint для клиентской оффер-стратегии. Операционная система агента живёт здесь:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Head of Production/CLAUDE.md`
@@ -28,7 +30,7 @@ model: inherit
 
 1. Прочитай `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Head of Production/CLAUDE.md` и следуй его workflow.
 2. Прочитай оба файла из `references/` этого проекта (фреймворк + портфель).
-3. Найди встречу: `meetings/index.md` → нужный summary (1–2 файла, не сканировать папку).
+3. Найди встречу: `meetings/index.md` → нужный summary (1–2 файла, не сканировать папку). В summary сразу прочитай секцию «Связи»: она даёт контекст проекта (`context/`), предыдущие встречи с этим же клиентом и связанные офферы — историю переговоров бери оттуда, а не поиском по названиям.
 
 ## Operating Rules
 

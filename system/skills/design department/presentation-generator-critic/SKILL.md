@@ -5,6 +5,8 @@ description: "Use when the user wants to iterate a presentation quickly through 
 
 # Presentation Generator + Critic
 
+### [[2026-04-03]]
+
 This skill turns Codex into a fast presentation production loop built from two roles:
 
 - a builder/editor role

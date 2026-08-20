@@ -8,6 +8,8 @@ model: sonnet
 
 # Meeting Insights Analyzer
 
+### [[2026-06-07]]
+
 Personal meeting-insights workflow for Anton. This is not a generic meeting summarizer. Use it to analyze patterns across meetings: communication, negotiation, leadership, follow-ups, risks, and what Anton should remember.
 
 ## Default Sources

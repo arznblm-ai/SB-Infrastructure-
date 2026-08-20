@@ -1,5 +1,7 @@
 # Router Logic
 
+### [[2026-04-15]]
+
 ## Core question
 
 Router chooses not an agent, but:

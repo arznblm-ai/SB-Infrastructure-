@@ -6,6 +6,8 @@ model: inherit
 
 # Research Department
 
+### [[2026-08-09]]
+
 Это master skill для factual research.
 
 > **Executor policy (обновлено 2026-08-01):** поисковый движок департамента — **Perplexity Sonar API**: `python3 "infrastructure/Research Dept/scripts/perplexity_research.py" "вопрос" --model sonar|sonar-pro` (ключ — `~/.config/second-brain/perplexity.env`). Один вызов = синтезированный ответ + URL-источники; он заменяет прежнюю связку curl-discovery (DDG lite / Google News RSS) → чтение страниц. Серии запросов, structured notes и сборку HTML-отчёта гоняет **исполнитель** (кто именно — реестр и правило выбора в `system/skills/route/SKILL.md`; требование к задаче: доступ в сеть, запись в рабочий каталог, расход не из квоты главной сессии), не главная сессия. Мозг (главная сессия): brief, source plan, точечная верификация (≤3 обращения к первоисточникам по citations Perplexity), синтез — массовый веб-поиск не гоняет. Fallback при недоступном Perplexity — curl-схема через исполнителя или дешёвый субагент, возвращающий только список URL и заголовков. Полная политика — `infrastructure/Research Dept/CLAUDE.md`, Executor Policy.

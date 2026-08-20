@@ -5,6 +5,8 @@ description: Use when the user wants presentations in the Portal design code wit
 
 # Portal Designer
 
+### [[2026-06-08]]
+
 This is the canonical designer role inside Design Department for decks in the Portal-inspired design code.
 
 ## Source Of Truth

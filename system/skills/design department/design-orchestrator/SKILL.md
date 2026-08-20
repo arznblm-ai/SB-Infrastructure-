@@ -5,6 +5,8 @@ description: "Use when the user wants Design Department to run as an operating s
 
 # Design Orchestrator
 
+### [[2026-04-16]]
+
 This skill is the canonical entrypoint for Design Department.
 
 It does not replace the specialist roles and it does not do the design itself. Its job is to turn the department into a runnable sequence of roles.

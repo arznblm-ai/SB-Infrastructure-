@@ -1,5 +1,7 @@
 # presentation-designer
 
+### [[2026-06-08]]
+
 Deprecated portable alias.
 
 Do not copy this as an active designer role.

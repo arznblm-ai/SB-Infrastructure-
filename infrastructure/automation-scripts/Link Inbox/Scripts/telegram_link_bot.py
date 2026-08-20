@@ -11,14 +11,20 @@ import time
 from pathlib import Path
 
 from link_inbox_common import (
+    canonicalize_url,
     configure_logging,
     extract_urls,
+    inbox_failed_dir,
+    inbox_processed_dir,
     link_kind,
     load_config,
+    load_hermes_delivery,
     load_state,
     now_iso,
     paths,
+    queued_inbox_files,
     save_state,
+    send_telegram_message,
     today,
     url_id,
     write_link_note,
@@ -28,6 +34,8 @@ from send_review import build_review
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROCESS_LOCK = Path.home() / ".config" / "link-inbox" / "process.lock"
+# Long-poll таймаут: очередь Гермеса опрашивается не реже раза в полминуты.
+GETUPDATES_TIMEOUT = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,22 +72,12 @@ def telegram_request(token: str, method: str, data: dict[str, str] | None = None
     return json.loads(payload)
 
 
-def send_message(token: str, chat_id: str, text: str) -> None:
-    chunks = [text[i : i + 3500] for i in range(0, len(text), 3500)] or ["(empty)"]
-    for chunk in chunks:
-        telegram_request(
-            token,
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": chunk,
-                "disable_web_page_preview": "true",
-            },
-            timeout=30,
-        )
+def send_message(token: str, chat_id: str, text: str, thread_id: str | None = None) -> None:
+    """Общая отправка живёт в link_inbox_common (чанкинг 3500, опциональный топик)."""
+    send_telegram_message(token, chat_id, text, thread_id=thread_id)
 
 
-def get_updates(token: str, offset: int | None, timeout: int = 50) -> list[dict]:
+def get_updates(token: str, offset: int | None, timeout: int = GETUPDATES_TIMEOUT) -> list[dict]:
     data = {"timeout": str(timeout)}
     if offset is not None:
         data["offset"] = str(offset)
@@ -196,14 +194,16 @@ def process_is_running() -> bool:
 
 def start_processing_background(limit: int = 3, chat_id: str | None = None, record_ids: list[str] | None = None) -> bool:
     log_path = Path.home() / "Library" / "Logs" / "link-inbox.processor.log"
-    if chat_id and record_ids:
+    if record_ids:
+        # chat_id может отсутствовать: при hermes-доставке адрес берётся из env доставки.
+        chat_arg = f"--chat-id {chat_id!r} " if chat_id else ""
         command = [
             "/bin/zsh",
             "-lc",
             (
                 f"source {str(Path.home() / '.config' / 'link-inbox' / 'env')!r} 2>/dev/null || true; "
                 f"python3 {str(SCRIPT_DIR / 'process_and_notify.py')!r} "
-                f"--chat-id {chat_id!r} --limit {int(limit)} "
+                f"{chat_arg}--limit {int(limit)} "
                 + " ".join(["--ids", *[repr(item) for item in record_ids]])
                 + f" >> {str(log_path)!r} 2>&1"
             ),
@@ -230,6 +230,116 @@ def start_processing_background(limit: int = 3, chat_id: str | None = None, reco
     return True
 
 
+# ── Очередь Гермеса (resources/link-inbox/inbox/) ─────────────────────────
+
+
+def move_queue_file(path: Path, target_dir: Path) -> Path:
+    """Переносим, не удаляем (правило vault). Коллизия имени → суффикс."""
+    target = target_dir / path.name
+    counter = 1
+    while target.exists():
+        target = target_dir / f"{path.stem}-{counter}{path.suffix}"
+        counter += 1
+    path.replace(target)
+    return target
+
+
+def send_hermes_digest(text: str, logger) -> bool:
+    """Дайджест/ответ в топик Saved токеном Гермеса. False = канала нет."""
+    channel = load_hermes_delivery()
+    if not channel or not channel.ok:
+        logger.warning("hermes queue: канала доставки нет, дубликат-дайджест не отправлен")
+        return False
+    try:
+        send_telegram_message(channel.token, channel.chat_id, text, thread_id=channel.thread_id)
+        return True
+    except Exception as exc:
+        logger.warning(f"hermes queue: не удалось отправить в топик Saved: {exc}")
+        return False
+
+
+def make_hermes_record(url: str, payload: dict) -> dict:
+    """make_record()-совместимая запись из файла очереди (schema 1)."""
+    record_date = today()
+    created_at = str(payload.get("created_at") or "").strip()
+    if created_at:
+        try:
+            import datetime as dt
+
+            record_date = dt.datetime.fromisoformat(created_at).date().isoformat()
+        except Exception:
+            pass
+    return {
+        "id": url_id(url),
+        "url": url,
+        "kind": link_kind(url),
+        "title": url,
+        "status": "new",
+        "date": record_date,
+        "created_at": created_at or now_iso(),
+        "message_id": 0,
+        "message_url": "",
+        "channel": "hermes",
+        "message_text": str(payload.get("comment") or "").strip(),
+        "ingest_source": "hermes_saved_topic",
+        "delivery": "hermes",
+    }
+
+
+def scan_inbox_queue(config: dict, state: dict, logger) -> int:
+    """Импортирует файлы очереди Гермеса в state. Единственный писатель state —
+    этот процесс, поэтому запись здесь безопасна. Возвращает число импортов."""
+    imported = 0
+    for path in queued_inbox_files(config):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"hermes queue: битый JSON {path.name} ({exc}) → failed/")
+            move_queue_file(path, inbox_failed_dir(config))
+            continue
+        raw_url = str(payload.get("url") or "").strip() if isinstance(payload, dict) else ""
+        if not raw_url or not raw_url.lower().startswith(("http://", "https://")):
+            logger.warning(f"hermes queue: нет валидного url в {path.name} → failed/")
+            move_queue_file(path, inbox_failed_dir(config))
+            continue
+
+        # id считаем сами: наша канонизация — истина, даже если дубль на VPS дрейфанул.
+        url = canonicalize_url(raw_url)
+        uid = url_id(url)
+        existing = state["links"].get(uid)
+
+        if existing and existing.get("status") == "processed":
+            existing["delivery"] = "hermes"
+            save_state(config, state)
+            logger.info(f"hermes queue: дубликат {url} → повторный дайджест в топик Saved")
+            send_hermes_digest(
+                "Ссылка уже была сохранена.\n\n" + build_record_digest(existing), logger
+            )
+            move_queue_file(path, inbox_processed_dir(config))
+            continue
+
+        if existing:
+            existing["delivery"] = "hermes"
+            save_state(config, state)
+            if existing.get("status") in {"failed", "needs_manual_processing"}:
+                logger.info(f"hermes queue: повторная обработка {url} (status={existing.get('status')})")
+                start_processing_background(limit=3, record_ids=[uid])
+            else:
+                logger.info(f"hermes queue: {url} уже в очереди обработки, пропускаю")
+            move_queue_file(path, inbox_processed_dir(config))
+            continue
+
+        record = make_hermes_record(url, payload if isinstance(payload, dict) else {})
+        state["links"][uid] = record  # ключ dict == record["id"] (так матчится --ids)
+        save_state(config, state)
+        write_link_note(config, record)
+        start_processing_background(limit=3, record_ids=[uid])
+        move_queue_file(path, inbox_processed_dir(config))
+        imported += 1
+        logger.info(f"hermes queue: импортировал {record['kind']}: {url}")
+    return imported
+
+
 def status_text(config: dict, state: dict) -> str:
     counts: dict[str, int] = {}
     for record in state.get("links", {}).values():
@@ -248,6 +358,7 @@ def status_text(config: dict, state: dict) -> str:
         f"Needs manual: {counts.get('needs_manual_processing', 0)}",
         f"Failed: {counts.get('failed', 0)}",
         f"Unreviewed: {unreviewed}",
+        f"Queued (hermes): {len(queued_inbox_files(config))}",
         f"Processor running: {'yes' if process_is_running() else 'no'}",
         "",
         f"Links folder: {config['output_root'] / 'links'}",
@@ -363,8 +474,13 @@ def run_loop(config: dict, *, once: bool = False, verbose: bool = False) -> None
     offset = state.get("telegram_bot", {}).get("offset")
     logger.info(f"Saved Links bot loop started; offset={offset}")
     while True:
+        # очередь Гермеса опрашивается на каждой итерации, в т.ч. по таймауту long-poll
         try:
-            updates = get_updates(token, offset=offset, timeout=50)
+            scan_inbox_queue(config, state, logger)
+        except Exception as exc:
+            logger.warning(f"hermes queue scan warning: {exc}")
+        try:
+            updates = get_updates(token, offset=offset, timeout=GETUPDATES_TIMEOUT)
         except Exception as exc:
             logger.warning(f"getUpdates warning: {exc}")
             if once:

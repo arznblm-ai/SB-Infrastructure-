@@ -5,6 +5,8 @@ description: "Старший editorial role: делает founder-readable factu
 
 # CEO Report Editor
 
+### [[2026-04-15]]
+
 ## Mission
 
 Сделать self-contained factual report, который Антон может спокойно читать без похода по raw links.

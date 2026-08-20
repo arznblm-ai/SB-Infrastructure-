@@ -5,6 +5,8 @@ description: Use when the user wants a presentation art director to review or en
 
 # Presentation Art Director
 
+### [[2026-04-06]]
+
 This skill turns Codex into a presentation art director focused on **similarity, discipline, and fidelity**.
 
 For decks made in the Portal design code, use the Portal brand bible as the primary design-code reference:

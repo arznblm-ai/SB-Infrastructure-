@@ -6,6 +6,8 @@ model: inherit
 
 # Strategic Board Router
 
+### [[2026-07-05]]
+
 This skill is the canonical entrypoint for strategic decision support in Anton's Second Brain.
 
 It does not duplicate the board operating system. The source of truth lives here:

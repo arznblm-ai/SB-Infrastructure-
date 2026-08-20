@@ -1,5 +1,7 @@
 # Quality Control System
 
+### [[2026-04-15]]
+
 ## Quality gate
 
 Research Critic issues:

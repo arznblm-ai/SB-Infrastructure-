@@ -1,5 +1,7 @@
 # Research Brief
 
+### [[2026-04-15]]
+
 - Request title:
 - Request type:
 - Business goal or research purpose:

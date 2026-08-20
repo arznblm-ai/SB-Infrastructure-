@@ -1,5 +1,7 @@
 # Launch Workflow
 
+### [[2026-04-13]]
+
 Этот файл задает новый чистый цикл запуска `Portal Designer`, `Generator` и `Critic`.
 
 ## Принцип

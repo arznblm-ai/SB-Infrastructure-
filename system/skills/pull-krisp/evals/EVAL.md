@@ -1,5 +1,7 @@
 # EVAL — pull-krisp
 
+### [[2026-07-06]]
+
 > **Thesis:** State-based eval для скилла `pull-krisp`: 4 сценария проверяют, что агент верифицирует реальное состояние файловой системы и вывод скрипта, а не рапортует выдуманный успех.
 
 **Скилл:** `/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/pull-krisp/SKILL.md`

@@ -1,5 +1,7 @@
 # Workflow Modes
 
+### [[2026-04-16]]
+
 This file defines the canonical workflow modes for `design-orchestrator`.
 
 If any launch template, role doc, or ad hoc prompt conflicts with this file, trust this file.

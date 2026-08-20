@@ -1,3 +1,5 @@
+### [[2026-04-04]]
+
 Прочитай skill-файл `/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md` и выполни его протокол.
 
 Режим выбирай по аргументу:

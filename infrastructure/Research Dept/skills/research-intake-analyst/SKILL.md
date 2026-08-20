@@ -5,6 +5,8 @@ description: "Превращает запрос в factual Research Brief: фи�
 
 # Research Intake Analyst
 
+### [[2026-04-15]]
+
 ## Mission
 
 Сделать из запроса корректный factual brief без strategy или hypothesis framing.

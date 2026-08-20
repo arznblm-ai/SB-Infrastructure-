@@ -1,5 +1,7 @@
 # Quality Gates
 
+### [[2026-04-16]]
+
 `design-orchestrator` is allowed to stop the workflow.
 
 The department should not always continue just because a role produced output.

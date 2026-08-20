@@ -1,5 +1,7 @@
 # Apple Presentation Designer Agent
 
+### [[2026-04-03]]
+
 > "Design is not just what it looks like and feels like. Design is how it works." — Steve Jobs
 
 ---

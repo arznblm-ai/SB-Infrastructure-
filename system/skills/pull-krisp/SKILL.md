@@ -6,6 +6,8 @@ model: haiku
 
 # Pull Krisp
 
+### [[2026-07-05]]
+
 On command, this skill pulls ready meeting transcripts from Krisp (MCP + `krisp_import_all.py`) into `transcripts/`, then runs the summarizer so structured summaries land in `meetings/` or `education/`.
 
 This skill is the manual command layer for the existing Krisp -> Second Brain pipeline.

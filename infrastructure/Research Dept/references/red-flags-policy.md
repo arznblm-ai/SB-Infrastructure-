@@ -1,5 +1,7 @@
 # Red Flags Policy
 
+### [[2026-04-14]]
+
 ## Mandatory red flags
 
 1. The research relies mainly on generic SEO content.

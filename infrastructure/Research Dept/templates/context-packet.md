@@ -1,5 +1,7 @@
 # Context Packet
 
+### [[2026-04-15]]
+
 Compressed operational layer for agents. Not a human deep-reading document.
 
 - Research mode:

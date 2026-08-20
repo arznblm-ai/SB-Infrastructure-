@@ -8,6 +8,8 @@ model: haiku
 
 # Git Update
 
+### [[2026-07-05]]
+
 Use this skill to snapshot Anton's reusable Second Brain infrastructure into the private Git repo:
 
 `/Users/anton/AI AGENT FOLDER/SB-Infrastructure-`

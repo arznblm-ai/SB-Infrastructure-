@@ -1,5 +1,7 @@
 # Link Inbox
 
+### [[2026-08-19]]
+
 > Разделение ответственности со смежными системами (UGC Downloader, transcribe-скиллы, instagram-reel-analyzer): `system/rules/{POS} {rule} external resources pipeline – 2026-07-05.md`. Link Inbox — владелец pipeline и единственный, кто пересобирает `transcripts/external resources/index.md`.
 
 ## Контекст
@@ -15,6 +17,9 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 | Проект | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/` |
 | Скрипты | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/` |
 | Source cards (URL/статус/TG msg) | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/links/` |
+| Очередь Гермеса (вход с VPS) | `/Users/anton/AI AGENT FOLDER/Second Brain/resources/link-inbox/inbox/` (+ `processed/`, `failed/`) |
+| Env доставки Гермеса (Saved-топик) | `~/.config/second-brain/hermes-saved-delivery.env` |
+| Деплой-артефакты VPS (MCP-сервер, ранбук) | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/deploy/` |
 | Единые заметки ресурсов (одна на ресурс) | `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/` |
 | Индекс внешних ресурсов | `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources/index.md` |
 | Общий builder заметки (auto + enrich) | `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/external_resource_note.py` |
@@ -30,6 +35,7 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 
 ## Workflow
 
+0. **Вход через Гермеса (с 2026-08-19, ADR-023).** Гермес (VPS, MCP `link_intake.save_link`) кладёт JSON в очередь `resources/link-inbox/inbox/`; мак-процесс `telegram_link_bot.py::scan_inbox_queue()` — единственный писатель `state.json` — импортирует записи и гонит их через штатный конвейер, дайджест уходит токеном Гермеса в топик Saved. Старый бот @Saved Links остаётся fallback. Детали — `ARCHITECTURE.md` (§2b, §3) и `deploy/README.md`.
 1. `telegram_link_bot.py` слушает личные сообщения в Telegram bot через Bot API.
 2. Из каждого сообщения достаёт URL и сохраняет link card в `resources/link-inbox/links/`.
 3. После сохранения запускает `process_and_notify.py` в фоне, чтобы бот быстро ответил и не зависал на транскрипте.

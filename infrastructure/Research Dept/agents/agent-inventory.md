@@ -1,5 +1,7 @@
 # Agent Inventory
 
+### [[2026-04-15]]
+
 ## Research Router Agent
 
 - Role in department: department dispatcher and workflow governor

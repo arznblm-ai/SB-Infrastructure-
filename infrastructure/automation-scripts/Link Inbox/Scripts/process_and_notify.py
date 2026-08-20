@@ -10,7 +10,13 @@ import time
 from pathlib import Path
 
 from link_digest import build_record_digest
-from link_inbox_common import load_config, load_state
+from link_inbox_common import (
+    configure_logging,
+    load_config,
+    load_hermes_delivery,
+    load_state,
+    send_telegram_message,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOCK_FILE = Path.home() / ".config" / "link-inbox" / "process.lock"
@@ -20,7 +26,7 @@ LOCK_POLL_SECONDS = 1
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Process specific Link Inbox records and notify Telegram.")
     parser.add_argument("--config", default=None)
-    parser.add_argument("--chat-id", required=True)
+    parser.add_argument("--chat-id", default=None)
     parser.add_argument("--ids", nargs="+", required=True)
     parser.add_argument("--limit", type=int, default=5)
     return parser.parse_args()
@@ -34,14 +40,39 @@ def bot_token(config: dict) -> str:
     return token
 
 
-def send_message(token: str, chat_id: str, text: str) -> None:
-    chunks = [text[i : i + 3500] for i in range(0, len(text), 3500)] or ["(empty)"]
-    for chunk in chunks:
-        command = ["curl", "-fsS", "--max-time", "30"]
-        for key, value in {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": "true"}.items():
-            command.extend(["--data-urlencode", f"{key}={value}"])
-        command.append(f"https://api.telegram.org/bot{token}/sendMessage")
-        subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+def send_message(token: str, chat_id: str, text: str, thread_id: str | None = None) -> None:
+    send_telegram_message(token, chat_id, text, thread_id=thread_id)
+
+
+def wants_hermes_delivery(config: dict, ids: list[str]) -> bool:
+    """Хоть одна из записей пришла из топика Saved → доставка токеном Гермеса."""
+    try:
+        links = load_state(config).get("links", {})
+    except Exception:
+        return False
+    return any((links.get(uid) or {}).get("delivery") == "hermes" for uid in ids)
+
+
+def make_notifier(config: dict, args: argparse.Namespace, logger):
+    """Возвращает send(text): hermes-топик, иначе старый путь (бот-токен + --chat-id)."""
+    channel = load_hermes_delivery() if wants_hermes_delivery(config, args.ids) else None
+
+    def notify(text: str) -> None:
+        if channel and channel.ok:
+            try:
+                send_telegram_message(channel.token, channel.chat_id, text, thread_id=channel.thread_id)
+                return
+            except Exception as exc:
+                logger.warning(f"hermes delivery failed ({exc}) → пробую старый канал")
+        if not args.chat_id:
+            logger.warning("нет ни hermes-канала, ни --chat-id: дайджест никуда не отправлен")
+            return
+        try:
+            send_message(bot_token(config), str(args.chat_id), text)
+        except Exception as exc:
+            logger.warning(f"старый канал доставки тоже не сработал: {exc}")
+
+    return notify
 
 
 def acquire_lock(timeout_seconds: int = 1800):
@@ -68,10 +99,11 @@ def acquire_lock(timeout_seconds: int = 1800):
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
-    token = bot_token(config)
+    logger = configure_logging(config)
+    notify = make_notifier(config, args, logger)
     lock_fd = acquire_lock()
     if lock_fd is None:
-        send_message(token, args.chat_id, "Ссылка сохранена, но обработка занята слишком долго. Напиши /process позже.")
+        notify("Ссылка сохранена, но обработка занята слишком долго. Напиши /process позже.")
         return 1
 
     try:
@@ -87,7 +119,7 @@ def main() -> int:
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip().splitlines()
             last = tail[-1] if tail else "unknown error"
-            send_message(token, args.chat_id, f"⚠️ Не удалось обработать ссылку автоматически: {last}\nЧто удалось сохранить — ниже.")
+            notify(f"⚠️ Не удалось обработать ссылку автоматически: {last}\nЧто удалось сохранить — ниже.")
 
         state = load_state(config)
         digests = []
@@ -96,7 +128,7 @@ def main() -> int:
             if record:
                 digests.append(build_record_digest(record))
         if digests:
-            send_message(token, args.chat_id, "\n\n---\n\n".join(digests))
+            notify("\n\n---\n\n".join(digests))
     finally:
         try:
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)

@@ -1,5 +1,7 @@
 # Workflow Scenarios
 
+### [[2026-04-15]]
+
 ## 1. Market Intelligence
 
 Use when:

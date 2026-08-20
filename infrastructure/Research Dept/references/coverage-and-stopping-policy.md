@@ -1,5 +1,7 @@
 # Coverage and Stopping Policy
 
+### [[2026-04-14]]
+
 ## Coverage sufficiency rule
 
 Research is not complete because the document is long. Research is complete only when coverage is materially sufficient for the request.

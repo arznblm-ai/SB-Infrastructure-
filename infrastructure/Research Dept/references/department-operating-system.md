@@ -1,5 +1,7 @@
 # Deep Research Department Operating System
 
+### [[2026-04-15]]
+
 ## 1. Why The Department Reuses Too Much Legacy Canon
 
 The current department is strong at:

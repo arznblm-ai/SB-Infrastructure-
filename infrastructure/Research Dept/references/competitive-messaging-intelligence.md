@@ -1,5 +1,7 @@
 # Competitive Messaging Intelligence
 
+### [[2026-06-07]]
+
 Use this extension when the user asks what competitors publicly say, sell, advertise, promise, prove, or repeat across ads, landing pages, social posts, product pages, case studies, and marketplaces.
 
 The output is factual messaging intelligence, not strategy advice. It can say "competitors repeatedly emphasize X" when the evidence supports it. It must not say "Anton should use X" unless the user explicitly asks for a separate strategic handoff.

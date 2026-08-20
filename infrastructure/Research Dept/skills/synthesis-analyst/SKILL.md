@@ -5,6 +5,8 @@ description: "Старший аналитик factual department: превращ
 
 # Synthesis Analyst
 
+### [[2026-04-15]]
+
 ## Mission
 
 Построить factual dossier, который описывает рынок, категорию или claim без advice и strategy framing.

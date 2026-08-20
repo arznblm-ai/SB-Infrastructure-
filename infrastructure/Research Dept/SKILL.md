@@ -5,6 +5,8 @@ description: "Операционная система для factual Research De
 
 # Deep Research Department
 
+### [[2026-04-14]]
+
 Этот skill является department-level router и operating system.
 
 Он не делает весь ресёрч сам. Его задача:

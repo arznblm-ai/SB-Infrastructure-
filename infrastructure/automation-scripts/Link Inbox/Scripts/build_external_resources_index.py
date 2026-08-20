@@ -133,6 +133,8 @@ def build_index(config: dict, state: dict) -> str:
     lines = [
         "# Saved Links External Resources Index",
         "",
+        f"### [[{generated_at[:10]}]]",
+        "",
         "> **Thesis:** first-read map for agents that need context from links Anton saved via the Telegram bot. One rich note per resource lives here; start with this index, then open the single note.",
         "",
         f"Generated: `{generated_at}`",

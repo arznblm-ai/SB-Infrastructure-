@@ -1,5 +1,7 @@
 # Launch Workflow
 
+### [[2026-04-03]]
+
 Этот файл задает новый чистый цикл запуска `Portal Designer`, `Generator`, `Critic` и `presentation-art-director`.
 
 ## Принцип

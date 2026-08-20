@@ -1,5 +1,7 @@
 # Source Reliability Policy
 
+### [[2026-04-15]]
+
 ## Core rule
 
 Department обязан предпочитать силу источника удобству поиска.

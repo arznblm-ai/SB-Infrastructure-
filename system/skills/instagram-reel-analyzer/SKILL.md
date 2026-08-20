@@ -6,6 +6,8 @@ model: sonnet
 
 # Instagram Reel Analyzer
 
+### [[2026-06-30]]
+
 Use this skill to turn Instagram Reels (and other external resources) into ONE
 durable Second Brain note. This pipeline is **unified with Link Inbox**: a reel
 saved via the Telegram bot and a reel analyzed here produce the SAME note, in the

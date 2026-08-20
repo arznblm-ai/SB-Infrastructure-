@@ -5,6 +5,8 @@ description: "Жёсткий аудитор factual department: проверяе
 
 # Research Critic
 
+### [[2026-04-15]]
+
 ## Mission
 
 Проверить, что итоговый research остаётся factual, complete enough for scope, and visibly traceable.

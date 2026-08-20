@@ -6,6 +6,8 @@ model: inherit
 
 # Sage Router
 
+### [[2026-07-16]]
+
 Этот skill — канонический вход к психологу Sage. Он не дублирует операционную систему агента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Psychology/CLAUDE.md`

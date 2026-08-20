@@ -1,5 +1,7 @@
 # Normalized Source Card
 
+### [[2026-04-15]]
+
 - Source ID:
 - Canonical title:
 - Source type:

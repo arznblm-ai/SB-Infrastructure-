@@ -7,10 +7,11 @@ import json
 import logging
 import os
 import re
+import subprocess
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
@@ -20,6 +21,12 @@ DEFAULT_STATE_FILE = CONFIG_DIR / "state.json"
 DEFAULT_LOG_FILE = Path.home() / "Library" / "Logs" / "link-inbox.log"
 DEFAULT_OUTPUT_DIR = "resources/link-inbox"
 EXTERNAL_TRANSCRIPTS_DIR = VAULT / "transcripts" / "external resources"
+
+# Очередь-шов между VPS (Гермес пишет JSON) и маком (бот импортирует).
+# Контракт: tasks/Link Inbox/{automation} {plan} Saved-топик Гермеса вход в Link Inbox – 2026-08-19.md
+INBOX_QUEUE_DIRNAME = "inbox"
+HERMES_DELIVERY_ENV_FILE = Path.home() / ".config" / "second-brain" / "hermes-saved-delivery.env"
+TELEGRAM_CHUNK_SIZE = 3500
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
 BAD_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\n\r\t]+')
@@ -253,6 +260,144 @@ def paths(config: dict[str, Any]) -> dict[str, Path]:
     }
 
 
+# ── Очередь Гермеса: inbox/ + processed/ + failed/ ────────────────────────
+
+
+def inbox_queue_dir(config: dict[str, Any]) -> Path:
+    """`<vault>/resources/link-inbox/inbox/`; создаёт inbox + processed + failed."""
+    queue = ensure_dir(config["output_root"] / INBOX_QUEUE_DIRNAME)
+    ensure_dir(queue / "processed")
+    ensure_dir(queue / "failed")
+    return queue
+
+
+def inbox_processed_dir(config: dict[str, Any]) -> Path:
+    return ensure_dir(inbox_queue_dir(config) / "processed")
+
+
+def inbox_failed_dir(config: dict[str, Any]) -> Path:
+    return ensure_dir(inbox_queue_dir(config) / "failed")
+
+
+def queued_inbox_files(config: dict[str, Any]) -> list[Path]:
+    """Необработанные файлы очереди (без processed/ и failed/), в порядке имени."""
+    return sorted(p for p in inbox_queue_dir(config).glob("*.json") if p.is_file())
+
+
+# ── Доставка: универсальный sendMessage (+ топик форума) ──────────────────
+
+
+def send_telegram_message(token: str, chat_id: str, text: str, thread_id: str | None = None) -> None:
+    """sendMessage с чанкингом 3500; `message_thread_id` — только если задан топик."""
+    body = text if text else "(empty)"
+    chunks = [body[i : i + TELEGRAM_CHUNK_SIZE] for i in range(0, len(body), TELEGRAM_CHUNK_SIZE)] or ["(empty)"]
+    for chunk in chunks:
+        command = ["curl", "-fsS", "--max-time", "30"]
+        for key, value in (
+            ("chat_id", str(chat_id)),
+            ("text", chunk),
+            ("disable_web_page_preview", "true"),
+        ):
+            command.extend(["--data-urlencode", f"{key}={value}"])
+        if thread_id:
+            command.extend(["--data-urlencode", f"message_thread_id={thread_id}"])
+        command.append(f"https://api.telegram.org/bot{token}/sendMessage")
+        try:
+            subprocess.check_output(command, text=True, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as exc:
+            output = (exc.output or "").strip()
+            if token:
+                output = output.replace(token, "<redacted-token>")
+            detail = f": {output[-500:]}" if output else ""
+            raise RuntimeError(f"Telegram sendMessage failed with curl exit {exc.returncode}{detail}") from exc
+
+
+class DeliveryChannel(NamedTuple):
+    """Куда слать дайджест: токен, чат и (опционально) топик форума."""
+
+    token: str
+    chat_id: str
+    thread_id: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.token and self.chat_id)
+
+
+def load_env_file(path: Path) -> dict[str, str]:
+    """KEY=VALUE, комментарии `#`, значения могут быть в кавычках."""
+    env: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if value[:1] == value[-1:] and value[:1] in {'"', "'"} and len(value) >= 2:
+            value = value[1:-1]
+        env[key.strip().removeprefix("export ").strip()] = value.strip()
+    return env
+
+
+def _read_token_file(path: Path, logger: logging.Logger) -> str:
+    """Токен из отдельного файла: строка `KEY=значение` или голый токен."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"hermes delivery: не читается token file {path}: {type(exc).__name__}: {exc}")
+        return ""
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        value = line.split("=", 1)[1] if "=" in line else line
+        value = value.strip().strip('"').strip("'").strip()
+        if value:
+            return value
+    return ""
+
+
+def load_hermes_delivery() -> DeliveryChannel | None:
+    """Канал доставки в топик Saved (токен Гермеса) или None → старый путь.
+
+    None означает «конфига нет или он неполон»: вызывающий код должен упасть на
+    прежний канал (бот-токен + личка) и написать строку в лог.
+    Только sendMessage: getUpdates этим токеном на маке запрещён (конфликт с VPS).
+    """
+    logger = logging.getLogger("link_inbox")
+    path = HERMES_DELIVERY_ENV_FILE
+    if not path.exists():
+        logger.info(f"hermes delivery: конфига {path} нет → старый канал (бот-токен, личка)")
+        return None
+    try:
+        env = load_env_file(path)
+    except OSError as exc:
+        logger.warning(f"hermes delivery: {path} не разобран ({type(exc).__name__}: {exc}) → старый канал")
+        return None
+    token = env.get("HERMES_SAVED_TG_TOKEN", "").strip()
+    token_file = env.get("HERMES_SAVED_TG_TOKEN_FILE", "").strip()
+    if not token and token_file:
+        token = _read_token_file(Path(token_file).expanduser(), logger)
+    chat_id = env.get("HERMES_SAVED_CHAT_ID", "").strip()
+    thread_id = env.get("HERMES_SAVED_THREAD_ID", "").strip() or None
+    missing = [
+        name
+        for name, value in (
+            ("HERMES_SAVED_TG_TOKEN|_FILE", token),
+            ("HERMES_SAVED_CHAT_ID", chat_id),
+        )
+        if not value
+    ]
+    if missing:
+        logger.warning(f"hermes delivery: в {path.name} не хватает {', '.join(missing)} → старый канал")
+        return None
+    if not thread_id:
+        logger.warning(f"hermes delivery: HERMES_SAVED_THREAD_ID пуст → шлю в чат {chat_id} без топика")
+    else:
+        logger.info(f"hermes delivery: дайджесты уходят в chat {chat_id}, топик {thread_id}")
+    return DeliveryChannel(token=token, chat_id=chat_id, thread_id=thread_id)
+
+
 def link_note_path(config: dict[str, Any], record: dict[str, Any]) -> Path:
     title = clean_filename_part(record.get("title") or record.get("url"))
     base = paths(config)["links"] / f"{{link}} {title} – {record['date']}.md"
@@ -279,6 +424,8 @@ def write_link_note(config: dict[str, Any], record: dict[str, Any]) -> Path:
         "---",
         "",
         f"# {record.get('title') or record['url']}",
+        "",
+        f"### [[{record['date']}]]",
         "",
         f"- URL: {record['url']}",
         f"- Kind: `{record.get('kind', 'web')}`",

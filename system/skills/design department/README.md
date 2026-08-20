@@ -1,5 +1,7 @@
 # Design Department
 
+### [[2026-04-13]]
+
 `design department/` — это операционный хаб для дизайна презентаций внутри Second Brain.
 
 Здесь собраны:

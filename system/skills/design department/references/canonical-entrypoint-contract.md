@@ -1,5 +1,7 @@
 # Canonical Entry Point Contract
 
+### [[2026-04-16]]
+
 The canonical entrypoint for Design Department is:
 
 - [design-orchestrator](../design-orchestrator/SKILL.md)

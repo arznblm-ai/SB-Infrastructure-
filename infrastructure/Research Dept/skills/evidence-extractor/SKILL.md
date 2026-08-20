@@ -5,6 +5,8 @@ description: "Извлекает factual evidence layer: company facts, public n
 
 # Evidence Extractor
 
+### [[2026-04-15]]
+
 ## Mission
 
 Собрать evidence layer, который показывает, что известно, что оценочно, что противоречиво и что неизвестно.

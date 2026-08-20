@@ -708,6 +708,7 @@ def build_note_text(call: dict) -> str:
         "\n".join(frontmatter)
         + "\n\n"
         f"# {call['call_name']}\n\n"
+        f"### [[{date_str}]]\n\n"
         + "\n".join(meta)
         + f"\n\n## Транскрипт\n\n{TRANSCRIPT_LOADING_PLACEHOLDER}\n"
     )

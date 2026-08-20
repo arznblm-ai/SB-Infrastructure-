@@ -1,5 +1,7 @@
 # EVAL — model-pipeline
 
+### [[2026-07-06]]
+
 > **Thesis:** Eval на роутинг и качество планирования скилла `model-pipeline`: 5 кейсов проверяют, что конвейер Sonnet → Fable → Opus разворачивается только на настоящих implementation-интентах, план ложится в `tasks/<проект>/` с проверяемыми задачами, а главная модель не читает кодовую базу целиком.
 
 **Скилл:** `/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/model-pipeline/SKILL.md`

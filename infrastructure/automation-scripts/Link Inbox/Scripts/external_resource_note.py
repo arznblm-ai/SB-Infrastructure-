@@ -202,7 +202,10 @@ def build_frontmatter(
 
 
 def render_note(title: str, frontmatter: str, sections: dict[str, str]) -> str:
-    parts = [frontmatter, "", f"# {title}", ""]
+    # Правило vault «≥1 [[ссылка]]»: заголовок-дата под H1 (дата публикации/сохранения, иначе сегодня).
+    dm = re.search(r'^published_at:\s*"?(\d{4}-\d{2}-\d{2})', frontmatter, re.M)
+    day = dm.group(1) if dm else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    parts = [frontmatter, "", f"# {title}", "", f"### [[{day}]]", ""]
     for heading in SECTION_ORDER:
         parts.append(f"## {heading}")
         parts.append("")

@@ -1,5 +1,7 @@
 # Git Update Automation
 
+### [[2026-08-08]]
+
 ## Контекст
 
 Git Update — **ежедневная** automation (с 2026-08-08, решение Антона; до этого weekly) для безопасного обновления **публичного** GitHub repo `SB-Infrastructure-` из Second Brain infrastructure snapshot. Public — намеренно (решение Антона 2026-08-08): шарибельный слой скиллов/инфраструктуры для ревью живыми людьми.

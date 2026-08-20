@@ -6,6 +6,8 @@ model: haiku
 
 # YouTube Transcribe
 
+### [[2026-08-03]]
+
 Use the bundled script for every YouTube transcription instead of manually downloading media or re-writing Whisper code inline.
 
 ## What this skill is for

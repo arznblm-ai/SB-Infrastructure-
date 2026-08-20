@@ -51,6 +51,13 @@ UGC_AUTH_ERRORS = (
     "this content isn't available",
     "use --cookies",
 )
+# Подмножество auth-ошибок, где сессия ЗАВЕДОМО исправна: UGC Downloader уже
+# распознал ситуацию «cookies переданы, но Instagram не отдал медиа» и вернул
+# понятный текст с маркером. Cookies в этом случае менять не нужно.
+UGC_SESSION_OK_MARKERS = (
+    "[yt-dlp: empty media response]",
+    "пост недоступен на стороне instagram",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -189,11 +196,20 @@ def process_ugc_video(config: dict, record: dict, logger) -> None:
         combined = f"{result.stdout}\n{result.stderr}".lower()
         if any(marker in combined for marker in UGC_AUTH_ERRORS):
             record["status"] = "needs_manual_processing"
-            record["excerpt"] = (
-                "Instagram не отдал видео — нужна авторизация (cookies) или пост недоступен/приватный. "
-                "Проверь ugc.cookies_from_browser в ~/.config/link-inbox/config.json и что пост публичный."
-            )
-            logger.warning(f"UGC needs auth or unavailable: {record['url']}")
+            if any(marker in combined for marker in UGC_SESSION_OK_MARKERS):
+                record["excerpt"] = (
+                    "Пост недоступен на стороне Instagram (удалён, приватный, ограничен автором "
+                    "или гео/age-гейт). Сессия передана — cookies менять не нужно, проверь ссылку в браузере."
+                )
+                logger.warning(
+                    f"UGC unavailable (пост недоступен, сессия исправна): {record['url']}"
+                )
+            else:
+                record["excerpt"] = (
+                    "Instagram не отдал видео — нужна авторизация (cookies) или пост недоступен/приватный. "
+                    "Проверь ugc.cookies_from_browser в ~/.config/link-inbox/config.json и что пост публичный."
+                )
+                logger.warning(f"UGC needs auth or unavailable: {record['url']}")
             return
         raise RuntimeError(f"ugc downloader failed with code {result.returncode}")
 

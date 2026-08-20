@@ -1,5 +1,7 @@
 # Account / ICP Intelligence
 
+### [[2026-06-07]]
+
 Use this extension when the user asks for factual lead, account, persona, or ICP research. The goal is to map who appears to fit and why, using public evidence. It is not a replacement for CRM data, private enrichment, or outreach strategy.
 
 ## Trigger phrases

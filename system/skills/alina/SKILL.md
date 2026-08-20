@@ -6,6 +6,8 @@ model: inherit
 
 # Alina Router (vault, планировщик)
 
+### [[2026-08-18]]
+
 Этот skill — канонический вход к продюсеру Алине в vault. Он не дублирует операционную систему агента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Alina/CLAUDE.md`

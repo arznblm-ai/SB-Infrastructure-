@@ -1,5 +1,7 @@
 # Artifact Contracts
 
+### [[2026-04-15]]
+
 ## Contract rules
 
 - Every artifact has an owner role.

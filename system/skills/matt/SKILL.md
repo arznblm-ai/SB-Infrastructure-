@@ -6,6 +6,8 @@ model: inherit
 
 # Matt Router
 
+### [[2026-08-08]]
+
 Этот skill — канонический вход к личному CTO Мэту. Он не дублирует операционную систему агента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/CTO/CLAUDE.md`

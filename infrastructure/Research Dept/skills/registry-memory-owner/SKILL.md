@@ -5,6 +5,8 @@ description: "Оператор long-memory layer: обновляет topic regis
 
 # Registry / Memory Owner
 
+### [[2026-04-14]]
+
 ## Mission
 
 Перевести completed research run в operational memory.

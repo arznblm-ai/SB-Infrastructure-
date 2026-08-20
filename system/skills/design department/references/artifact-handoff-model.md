@@ -1,5 +1,7 @@
 # Artifact Handoff Model
 
+### [[2026-04-16]]
+
 Design Department is artifact-driven.
 
 Roles should not rely on vague prompt memory when a concrete handoff artifact can be passed forward.

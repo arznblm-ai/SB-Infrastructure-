@@ -5,6 +5,8 @@ description: Compatibility alias for the old `$presentation-designer` role. Use 
 
 # Presentation Designer Alias
 
+### [[2026-06-08]]
+
 `presentation-designer` is deprecated inside Design Department.
 
 For deck redesign, slide hierarchy, typography, rhythm, and presentation craft, use:

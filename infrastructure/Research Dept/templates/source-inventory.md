@@ -1,5 +1,7 @@
 # Source Inventory
 
+### [[2026-04-14]]
+
 | Source ID | Title | Type | Tier | Location | Relevance | Rough Trust Rationale | Scouting Note | Duplicate Mark | Coverage Role |
 |---|---|---|---|---|---|---|---|---|---|
 | SRC-001 |  |  |  |  | high/medium/low |  |  | unique/duplicate/candidate-update |  |

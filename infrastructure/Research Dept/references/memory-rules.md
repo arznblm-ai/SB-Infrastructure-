@@ -1,5 +1,7 @@
 # Memory / Retrieval Rules
 
+### [[2026-04-15]]
+
 ## Retrieval-first discipline
 
 Before new search, the department must check:

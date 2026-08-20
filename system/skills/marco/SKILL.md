@@ -6,6 +6,8 @@ model: inherit
 
 # Marco Router
 
+### [[2026-08-15]]
+
 Этот skill — канонический вход к тревел-агенту Марко. Он не дублирует операционную систему агента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Travel Agent/CLAUDE.md`

@@ -6,6 +6,8 @@ model: inherit
 
 # Tom Router
 
+### [[2026-08-14]]
+
 Этот skill — канонический вход к финансовому коучу Тому. Он не дублирует операционную систему департамента. Источник истины:
 
 `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Financial Coach/CLAUDE.md`

@@ -5,6 +5,8 @@ description: "Master skill factual department: выбирает factual режи
 
 # Router
 
+### [[2026-04-15]]
+
 ## Mission
 
 Выбрать корректный factual workflow и не дать department превратиться в recommendation engine.

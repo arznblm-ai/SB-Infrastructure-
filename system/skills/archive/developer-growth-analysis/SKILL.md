@@ -8,6 +8,8 @@ model: sonnet
 
 # Developer Growth Analysis
 
+### [[2026-06-07]]
+
 Personal growth-analysis workflow for Anton. This is adapted for Codex Desktop and Anton's Second Brain; do not rely on the original `~/.codex/history.jsonl`-only flow.
 
 ## Core Behavior

@@ -1,5 +1,7 @@
 # Downstream Integration
 
+### [[2026-04-14]]
+
 ## Purpose
 
 Deep Research Department не заканчивается на CEO-readable отчёте. Его outputs должны работать как supply layer для других department-level flows.

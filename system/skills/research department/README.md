@@ -1,5 +1,7 @@
 # Research Department
 
+### [[2026-04-20]]
+
 `research department/` — это входная skill-обёртка для канонического factual Research Department, который теперь живёт в:
 
 - `/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Research Dept/`

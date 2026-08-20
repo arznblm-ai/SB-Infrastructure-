@@ -6,6 +6,8 @@ model: sonnet
 
 # Saved Video Strategist
 
+### [[2026-07-05]]
+
 This skill reads Anton's saved-link summaries from the Link Inbox layer (`transcripts/external resources/index.md` + `resources/link-inbox/summaries/`, full transcripts only as fallback) and returns a compact readout in chat: the preserved core summary of each saved item plus a Strategic Board layer where a clear connection to Anton's projects exists.
 
 ## Purpose

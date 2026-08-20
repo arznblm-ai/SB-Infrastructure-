@@ -6,6 +6,8 @@ model: haiku
 
 # Video Transcribe
 
+### [[2026-08-03]]
+
 Use the bundled script for every transcription instead of re-writing Whisper code inline.
 
 ## Workflow

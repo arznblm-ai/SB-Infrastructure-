@@ -5,6 +5,8 @@ description: "Нормализатор источников: превращае�
 
 # Source Normalizer
 
+### [[2026-04-15]]
+
 ## Mission
 
 Сделать canonical source units, пригодные для factual synthesis и verification.

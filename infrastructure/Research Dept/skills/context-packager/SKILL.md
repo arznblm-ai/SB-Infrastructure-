@@ -5,6 +5,8 @@ description: "Библиотекарь agent context layer: упаковывае
 
 # Context Packager
 
+### [[2026-04-14]]
+
 ## Mission
 
 Сделать результат пригодным для downstream reuse без повторного веб-поиска.

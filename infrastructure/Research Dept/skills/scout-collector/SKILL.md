@@ -5,6 +5,8 @@ description: "Разведчик factual department: собирает candidate 
 
 # Scout Collector
 
+### [[2026-04-15]]
+
 ## Mission
 
 Построить source universe, достаточный для factual market intelligence или verification.

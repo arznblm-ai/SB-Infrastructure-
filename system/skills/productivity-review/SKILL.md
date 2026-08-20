@@ -6,6 +6,8 @@ model: sonnet
 
 # Productivity Review
 
+### [[2026-05-26]]
+
 ## Purpose
 
 Build Anton's calendar-based productivity memory: weekly reviews, monthly rollups, yearly rollups, and accumulated stats.

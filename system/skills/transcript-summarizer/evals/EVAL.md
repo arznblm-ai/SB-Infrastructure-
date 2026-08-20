@@ -1,5 +1,7 @@
 # EVAL — transcript-summarizer
 
+### [[2026-07-06]]
+
 > **Thesis:** Регрессионный eval-набор для скилла `transcript-summarizer`: 5 тест-кейсов на синтетических фикстурах проверяют классификацию (лекция/встреча), структуру summary, роутинг и устойчивость к мусорному вводу.
 
 **Скилл:** `/Users/anton/AI AGENT FOLDER/Second Brain/system/skills/transcript-summarizer/SKILL.md`
