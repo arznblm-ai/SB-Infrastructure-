@@ -9,10 +9,13 @@ vault_archive.py — копилка выпусков AI Twitter Digest в vault.
 Правила:
 - best-effort: любая ошибка сохранения пишется в лог и НЕ влияет на отправку
   и на двухфазный state (`last_seen_id` коммитится независимо);
-- имя файла по конвенции vault: `{automation} {summary} AI дайджест утро – YYYY-MM-DD.md`
-  (перед датой EN DASH, ≤80 символов);
-- часть суток и дата берутся из заголовка выпуска («🤖 AI Twitter — утро 2026-08-07»),
-  fallback — текущее время (утро, если час < 15);
+- имя файла по конвенции vault: `{automation} {summary} AI дайджест – YYYY-MM-DD.md`
+  (дата отправки, перед датой EN DASH, ≤80 символов);
+- накопительный режим: выпуск покрывает несколько суток, поэтому «утро/вечер»
+  в имени больше нет, а охват периода живёт во frontmatter
+  (`period_start` / `period_end`) — из заголовка выпуска или из CLI-аргументов;
+- старый заголовок («🤖 AI Twitter — утро 2026-08-07») по-прежнему разбирается:
+  часть суток попадает во frontmatter, дата — в имя файла;
 - строка выпуска дозаписывается в `digests/index.md`.
 
 Резолв vault (скрипт исполняется ВНЕ vault, в /opt — по расположению файла не определить):
@@ -22,6 +25,7 @@ vault_archive.py — копилка выпусков AI Twitter Digest в vault.
 
 CLI (смоук/ручное сохранение):
     vault_archive.py --file /tmp/digest.txt
+    vault_archive.py --file /tmp/digest.txt --period-start 2026-08-18 --period-end 2026-08-21
     vault_archive.py --text "smoke test" --part утро --date 1970-01-01
     vault_archive.py --where          # показать, куда будет писать
 """
@@ -52,9 +56,15 @@ FILENAME_MAX_CHARS = 80
 PART_MORNING = "утро"
 PART_EVENING = "вечер"
 
-# «🤖 AI Twitter — утро 2026-08-07» (тире может быть любым, часть/дата — обязательны)
+# Старый однодневный заголовок: «🤖 AI Twitter — утро 2026-08-07»
 HEADER_RE = re.compile(
     r"AI\s+Twitter\s*[—–-]?\s*(утро|вечер)\s+(\d{4}-\d{2}-\d{2})"
+)
+
+# Накопительный заголовок: «🤖 AI Twitter — дайджест за 3 дн., 19.08–21.08.2026»
+PERIOD_HEADER_RE = re.compile(
+    r"AI\s+Twitter\s*[—–-]?\s*дайджест\s+за\s+\d+\s*дн\.,\s*"
+    r"(\d{2})\.(\d{2})\s*[–—-]\s*(\d{2})\.(\d{2})\.(\d{4})"
 )
 
 INDEX_HEADER = (
@@ -99,35 +109,65 @@ def part_for_hour(hour: int) -> str:
     return PART_MORNING if hour < MORNING_BEFORE_HOUR else PART_EVENING
 
 
-def parse_header(text: str, now: dt.datetime) -> tuple[str, str]:
-    """(дата, часть суток) из заголовка выпуска; fallback — текущее время."""
+def parse_header(text: str, now: dt.datetime) -> tuple[str, str | None]:
+    """(дата выпуска, часть суток или None) из старого заголовка; fallback — сейчас.
+
+    У накопительного заголовка части суток нет и даты отправки в нём нет —
+    в этом случае датой файла становится дата отправки (сейчас).
+    """
     match = HEADER_RE.search(text or "")
     if match:
         return match.group(2), match.group(1)
-    return now.strftime("%Y-%m-%d"), part_for_hour(now.hour)
+    return now.strftime("%Y-%m-%d"), None
 
 
-def note_name(date_str: str, part: str) -> str:
-    """`{automation} {summary} AI дайджест утро – YYYY-MM-DD` (без .md)."""
-    name = f"{{automation}} {{summary}} AI дайджест {part} {EN_DASH} {date_str}"
+def parse_period(text: str) -> tuple[str, str] | None:
+    """(period_start, period_end) YYYY-MM-DD из накопительного заголовка."""
+    match = PERIOD_HEADER_RE.search(text or "")
+    if not match:
+        return None
+    start_day, start_month, end_day, end_month, year = match.groups()
+    end_year = int(year)
+    # Период может пересекать Новый год: 30.12–02.01.2027 → начало в 2026.
+    start_year = end_year - 1 if int(start_month) > int(end_month) else end_year
+    return f"{start_year}-{start_month}-{start_day}", f"{end_year}-{end_month}-{end_day}"
+
+
+def note_name(date_str: str) -> str:
+    """`{automation} {summary} AI дайджест – YYYY-MM-DD` (без .md), дата отправки."""
+    name = f"{{automation}} {{summary}} AI дайджест {EN_DASH} {date_str}"
     if len(name) + len(".md") > FILENAME_MAX_CHARS:
         log(f"имя длиннее {FILENAME_MAX_CHARS} символов: {name}.md")
     return name
 
 
-def note_body(text: str, date_str: str, part: str) -> str:
-    front = (
-        "---\n"
-        f"date: {date_str}\n"
-        f"part: {part}\n"
-        "source: ai-twitter-digest\n"
-        "---\n\n"
-    )
+def note_body(
+    text: str,
+    date_str: str,
+    part: str | None = None,
+    period_start: str | None = None,
+    period_end: str | None = None,
+) -> str:
+    lines = ["---", f"date: {date_str}"]
+    if part:
+        lines.append(f"part: {part}")
+    lines.append(f"period_start: {period_start or date_str}")
+    lines.append(f"period_end: {period_end or date_str}")
+    lines.append("source: ai-twitter-digest")
+    lines.append("---")
+    front = "\n".join(lines) + "\n\n"
     return front + (text or "").strip() + "\n"
 
 
-def index_line(name: str, date_str: str, part: str) -> str:
-    return f"- [[{name}]] — {date_str} {part}"
+def index_line(
+    name: str,
+    date_str: str,
+    period_start: str | None = None,
+    period_end: str | None = None,
+) -> str:
+    if period_start and period_end and period_start != period_end:
+        return f"- [[{name}]] — {date_str} (период {period_start} … {period_end})"
+    return f"- [[{name}]] — {date_str}"
 
 
 def append_index(index_path: Path, line: str) -> bool:
@@ -151,20 +191,31 @@ def archive_digest(
     vault: Path | None = None,
     part: str | None = None,
     date_str: str | None = None,
+    period_start: str | None = None,
+    period_end: str | None = None,
 ) -> Path:
     """Сохранить выпуск в vault и дозаписать строку индекса. Бросает исключение при ошибке."""
     now = now or dt.datetime.now()
     parsed_date, parsed_part = parse_header(text, now)
     date_str = date_str or parsed_date
     part = part or parsed_part
+    if not (period_start and period_end):
+        parsed_period = parse_period(text)
+        if parsed_period:
+            period_start = period_start or parsed_period[0]
+            period_end = period_end or parsed_period[1]
 
     target_dir = digests_dir(vault)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    name = note_name(date_str, part)
+    name = note_name(date_str)
     note_path = target_dir / f"{name}.md"
-    note_path.write_text(note_body(text, date_str, part), encoding="utf-8")
-    append_index(target_dir / INDEX_NAME, index_line(name, date_str, part))
+    note_path.write_text(
+        note_body(text, date_str, part, period_start, period_end), encoding="utf-8"
+    )
+    append_index(
+        target_dir / INDEX_NAME, index_line(name, date_str, period_start, period_end)
+    )
     return note_path
 
 
@@ -174,10 +225,15 @@ def archive_digest_safe(
     vault: Path | None = None,
     part: str | None = None,
     date_str: str | None = None,
+    period_start: str | None = None,
+    period_end: str | None = None,
 ) -> Path | None:
     """Best-effort обёртка: ошибка → строка в лог, None; вызывающий код не страдает."""
     try:
-        path = archive_digest(text, now=now, vault=vault, part=part, date_str=date_str)
+        path = archive_digest(
+            text, now=now, vault=vault, part=part, date_str=date_str,
+            period_start=period_start, period_end=period_end,
+        )
     except Exception as exc:  # noqa: BLE001 — копилка не имеет права ронять выпуск
         log(f"копилка не сохранила выпуск ({type(exc).__name__}: {exc})")
         return None
@@ -186,8 +242,13 @@ def archive_digest_safe(
 
 
 def is_digest(text: str) -> bool:
-    """Это выпуск (а не ❌-алерт)? Отличаем по заголовку из digest_builder.header()."""
-    return bool(HEADER_RE.search(text or ""))
+    """Это выпуск (а не ❌-алерт)? Отличаем по заголовку из digest_builder.header().
+
+    Понимаем оба вида заголовка: накопительный («дайджест за N дн., …») и старый
+    однодневный («утро|вечер YYYY-MM-DD»).
+    """
+    body = text or ""
+    return bool(PERIOD_HEADER_RE.search(body) or HEADER_RE.search(body))
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -199,6 +260,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--part", choices=[PART_MORNING, PART_EVENING],
                         help="часть суток (по умолчанию из заголовка выпуска / по часу)")
     parser.add_argument("--date", help="дата YYYY-MM-DD (по умолчанию из заголовка / сегодня)")
+    parser.add_argument("--period-start", help="начало охвата выпуска YYYY-MM-DD (frontmatter)")
+    parser.add_argument("--period-end", help="конец охвата выпуска YYYY-MM-DD (frontmatter)")
     parser.add_argument("--where", action="store_true",
                         help="показать каталог копилки и выйти")
     return parser.parse_args()
@@ -217,11 +280,16 @@ def main() -> int:
     else:
         text = sys.stdin.read()
 
-    if args.date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
-        print("--date ожидает формат YYYY-MM-DD", file=sys.stderr)
-        return 2
+    for flag, value in (("--date", args.date), ("--period-start", args.period_start),
+                        ("--period-end", args.period_end)):
+        if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            print(f"{flag} ожидает формат YYYY-MM-DD", file=sys.stderr)
+            return 2
 
-    path = archive_digest_safe(text, part=args.part, date_str=args.date)
+    path = archive_digest_safe(
+        text, part=args.part, date_str=args.date,
+        period_start=args.period_start, period_end=args.period_end,
+    )
     if path is None:
         return 1
     print(path)

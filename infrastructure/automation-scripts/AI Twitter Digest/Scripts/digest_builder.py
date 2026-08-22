@@ -17,11 +17,18 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from spool import parse_dt  # noqa: E402 — соседний модуль, путь добавлен выше
 
 LOG_FILE = Path.home() / "Library" / "Logs" / "ai-twitter-digest.log"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/Users/anton/.local/bin/claude")
@@ -33,25 +40,76 @@ CLAUDE_TIMEOUT_SECONDS = 300
 MORNING_BEFORE_HOUR = 15
 
 
-def _per_account_cap() -> int:
-    """Сколько твитов максимум берём от одного автора (env AI_DIGEST_PER_ACCOUNT_CAP)."""
+DEFAULT_PER_ACCOUNT_CAP = 4
+MAX_PER_ACCOUNT_CAP = 12
+
+
+def _per_account_cap(window_hours: float | None = None) -> int:
+    """Сколько твитов максимум берём от одного автора.
+
+    Накопительный режим: окно выпуска больше не 12 часов, а 2-3 суток, поэтому
+    cap растёт вместе с реальным охватом батча — 4 твита на каждые 12 часов,
+    но не больше MAX_PER_ACCOUNT_CAP, иначе плодовитый аккаунт снова съест выпуск.
+    Явный env-override AI_DIGEST_PER_ACCOUNT_CAP имеет приоритет над динамикой.
+    """
     raw = os.environ.get("AI_DIGEST_PER_ACCOUNT_CAP", "")
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return 4
-    return value if value > 0 else 4
+        value = 0
+    if value > 0:
+        return value
+    if not window_hours or window_hours <= 0:
+        return DEFAULT_PER_ACCOUNT_CAP
+    dynamic = 4 * math.ceil(window_hours / 12)
+    return max(DEFAULT_PER_ACCOUNT_CAP, min(MAX_PER_ACCOUNT_CAP, dynamic))
+
+
+# ── Охват батча (окно выпуска) ───────────────────────────────────────────
+
+def batch_period(tweets: list[dict]) -> tuple[dt.datetime | None, dt.datetime | None]:
+    """(самый старый, самый свежий) твит батча — реальное окно выпуска."""
+    stamps = [parse_dt(t.get("date", "")) for t in tweets if isinstance(t, dict)]
+    stamps = [s for s in stamps if s is not None]
+    if not stamps:
+        return None, None
+    return min(stamps), max(stamps)
+
+
+def period_hours(period: tuple[dt.datetime | None, dt.datetime | None]) -> float | None:
+    start, end = period
+    if start is None or end is None:
+        return None
+    return max(0.0, (end - start).total_seconds() / 3600.0)
+
+
+def period_days(period: tuple[dt.datetime | None, dt.datetime | None]) -> int:
+    start, end = period
+    if start is None or end is None:
+        return 1
+    return (end.date() - start.date()).days + 1
+
+
+def period_desc(period: tuple[dt.datetime | None, dt.datetime | None]) -> str:
+    """Человекочитаемый охват батча — уходит в промпт и в заголовок."""
+    start, end = period
+    if start is None or end is None:
+        return "период"
+    days = period_days(period)
+    if days <= 1:
+        return f"{start:%d.%m.%Y}"
+    return f"{days} дн., {start:%d.%m}–{end:%d.%m.%Y}"
 
 
 PROMPT_TEMPLATE = """Ты — редактор ежедневного дайджеста про AI для одного читателя (предприниматель, делает AI-продукты и продакшн-студию). Ниже — свежие твиты из его подборки AI-аккаунтов. Сделай из них редакторский дайджест на русском языке.
 
 Главное правило: дайджест — это срез по всей индустрии, а не хроника одной компании и не лента одного автора. Даже если в материале много твитов от одного аккаунта или про один запуск, выпуск должен показывать разные части индустрии.
 
-ПЕРВАЯ СЕКЦИЯ ВЫПУСКА — «📌 Новость дня»:
-- Это ОДНО главное событие батча — то, которое обсуждают НЕСКОЛЬКО разных авторов.
-- Формат секции: суть события по-русски (2-3 предложения) → 2-3 дословные цитаты В ОРИГИНАЛЕ от РАЗНЫХ авторов, у каждой цитаты свой (@handle) и своя ссылка на отдельной строке → последняя строка «Почему важно: …».
-- Жёсткое правило против выдумывания: если в батче НЕТ события, которое минимум два автора обсуждают независимо друг от друга, секцию «Новость дня» полностью пропусти и начинай выпуск сразу с тематических секций. Один громкий твит одного автора — это НЕ новость дня. Не склеивай разные события в одно ради этой секции и не выдавай за общий сюжет то, что просто относится к одной теме.
-- Твиты, использованные в «Новости дня», больше нигде не повторяются: ни в тематических секциях, ни в «⚡ Коротко».
+ПЕРВАЯ СЕКЦИЯ ВЫПУСКА — «📌 Главное за период»:
+- Это 1-3 главных события батча — те, которые обсуждают НЕСКОЛЬКО разных авторов. Больше трёх не бери: секция должна оставаться коротким списком главного, а не пересказом всего периода.
+- Формат каждого события: суть по-русски (2-3 предложения) → 2-3 дословные цитаты В ОРИГИНАЛЕ от РАЗНЫХ авторов, у каждой цитаты свой (@handle) и своя ссылка на отдельной строке → последняя строка «Почему важно: …».
+- Жёсткое правило против выдумывания: событие попадает сюда, только если минимум два автора обсуждают его независимо друг от друга. Если таких событий нет вообще, секцию «Главное за период» полностью пропусти и начинай выпуск сразу с тематических секций. Один громкий твит одного автора — это НЕ главное событие. Не склеивай разные события в одно ради этой секции и не выдавай за общий сюжет то, что просто относится к одной теме.
+- Твиты, использованные в «Главном за период», больше нигде не повторяются: ни в тематических секциях, ни в «⚡ Коротко».
 
 ЧТО ЧИТАТЕЛЮ ИНТЕРЕСНО — высокий приоритет, в порядке убывания:
 1. Релизы моделей и инструментов и, главное, что они позволяют делать нового.
@@ -69,7 +127,9 @@ PROMPT_TEMPLATE = """Ты — редактор ежедневного дайдж
 
 ОБЪЁМ — не пережимай выпуск:
 - Если материала достаточно, делай 10-18 основных пунктов, а не 5-10. Короткий выпуск оправдан только тогда, когда в батче реально мало содержательного.
+- Объём выпуска НЕ растёт вместе с длиной периода: те же 10-18 основных пунктов плюс «⚡ Коротко» — независимо от того, за сутки материал или за трое.
 - Содержательный твит не выбрасывается молча: он либо становится пунктом, либо уходит строкой в «⚡ Коротко».
+{multiday_rule}
 - Правила баланса ниже (≤2 пункта на автора, склейка серии анонсов) — про доминирование одного автора, а не про общий объём выпуска. Общий объём они не ограничивают.
 
 ФОРМАТ ОСНОВНОГО ПУНКТА — строго в этом порядке:
@@ -98,9 +158,16 @@ PROMPT_TEMPLATE = """Ты — редактор ежедневного дайдж
 - Пропускай шум: приветствия, мемы без содержания, чистый самопиар, треды-опросы, анонсы стримов.
 - Формат — обычный текст для Telegram. НЕ используй markdown-разметку (*, _, `, []()), только текст, эмодзи и голые URL.
 
-{truncation_note}Материал ({tweet_count} твитов за период):
+{truncation_note}Материал ({tweet_count} твитов за период {period}):
 
 {body}"""
+
+MULTIDAY_RULE = (
+    "- Материал здесь за несколько дней — отбирай жёстче: мелкое, проходное и "
+    "устаревшее (к концу периода это уже неактуально или перекрыто более поздним "
+    "твитом) выбрасывай целиком, а не сжимай в строку «Коротко». Предыдущее правило "
+    "про «не выбрасывать молча» на многодневном материале уступает этому.\n"
+)
 
 
 def log(message: str) -> None:
@@ -182,6 +249,8 @@ def build_prompt(
     truncated: bool,
     total: int,
     trimmed: dict[str, int] | None = None,
+    cap: int = DEFAULT_PER_ACCOUNT_CAP,
+    period: tuple[dt.datetime | None, dt.datetime | None] = (None, None),
 ) -> str:
     body = "\n\n".join(format_tweet(i + 1, t) for i, t in enumerate(tweets))
     notes: list[str] = []
@@ -192,7 +261,7 @@ def build_prompt(
         )
         notes.append(
             "Внимание: ленты этих авторов уже подрезаны — оставлено не больше "
-            f"{_per_account_cap()} твитов на автора, остальное выброшено: {shown}. "
+            f"{cap} твитов на автора, остальное выброшено: {shown}. "
             "Значит объём в материале не отражает реальный объём их постинга и тем более "
             "не отражает важность: не делай из них главных героев выпуска."
         )
@@ -202,14 +271,25 @@ def build_prompt(
             f"{len(tweets)} самых заметных по реакциям — это выборка, а не полная лента."
         )
     note = ("\n\n".join(notes) + "\n\n") if notes else ""
-    return PROMPT_TEMPLATE.format(truncation_note=note, tweet_count=len(tweets), body=body)
+    return PROMPT_TEMPLATE.format(
+        truncation_note=note,
+        tweet_count=len(tweets),
+        period=period_desc(period),
+        multiday_rule=MULTIDAY_RULE if period_days(period) >= 2 else "",
+        body=body,
+    )
 
 
-def prepare_tweets(tweets: list[dict]) -> tuple[list[dict], bool, dict[str, int]]:
-    """Общий детерминированный отбор: сначала лимит на автора, потом общий лимит."""
-    balanced, trimmed = cap_per_account(tweets)
+def prepare_tweets(tweets: list[dict]) -> tuple[list[dict], bool, dict[str, int], int]:
+    """Общий детерминированный отбор: сначала лимит на автора, потом общий лимит.
+
+    Лимит на автора зависит от реального охвата батча (в накопительном режиме
+    это 2-3 суток, а не 12 часов) — см. `_per_account_cap`.
+    """
+    cap = _per_account_cap(period_hours(batch_period(tweets)))
+    balanced, trimmed = cap_per_account(tweets, cap)
     capped, truncated = cap_tweets(balanced)
-    return capped, truncated, trimmed
+    return capped, truncated, trimmed, cap
 
 
 # ── LLM ──────────────────────────────────────────────────────────────────
@@ -256,7 +336,18 @@ def fallback_body(tweets: list[dict], limit: int = 12) -> str:
 
 # ── Сборка выпуска ───────────────────────────────────────────────────────
 
-def header(now: dt.datetime) -> str:
+def header(
+    now: dt.datetime,
+    period: tuple[dt.datetime | None, dt.datetime | None] = (None, None),
+) -> str:
+    """Заголовок выпуска.
+
+    Многодневный батч → «дайджест за N дн., DD.MM–DD.MM.YYYY».
+    Батч в пределах суток (или пустой) → прежний однодневный вид «утро|вечер дата».
+    """
+    start, end = period
+    if start is not None and end is not None and period_days(period) >= 2:
+        return f"🤖 AI Twitter — дайджест за {period_desc(period)}"
     part = "утро" if now.hour < MORNING_BEFORE_HOUR else "вечер"
     return f"🤖 AI Twitter — {part} {now.strftime('%Y-%m-%d')}"
 
@@ -274,11 +365,12 @@ def errors_footer(errors: list[dict]) -> str:
 def build_digest(payload: dict, now: dt.datetime) -> str:
     tweets = [t for t in (payload.get("tweets") or []) if isinstance(t, dict)]
     errors = [e for e in (payload.get("errors") or []) if isinstance(e, dict)]
-    head = header(now)
+    period = batch_period(tweets)
+    head = header(now, period)
     if not tweets:
         return f"{head}\n\nТишина в ленте: новых постов за период нет." + errors_footer(errors)
-    capped, truncated, trimmed = prepare_tweets(tweets)
-    body = run_claude(build_prompt(capped, truncated, len(tweets), trimmed))
+    capped, truncated, trimmed, cap = prepare_tweets(tweets)
+    body = run_claude(build_prompt(capped, truncated, len(tweets), trimmed, cap, period))
     if body is None:
         body = fallback_body(capped)
     stats = f"\n\nИсточник: {len(tweets)} твитов, {payload.get('accounts_ok', '?')} аккаунтов."
@@ -316,16 +408,18 @@ def main() -> int:
         if not tweets:
             log("нет твитов — промпт не строится")
             return 0
-        capped, truncated, trimmed = prepare_tweets(tweets)
-        print(build_prompt(capped, truncated, len(tweets), trimmed))
+        period = batch_period(tweets)
+        capped, truncated, trimmed, cap = prepare_tweets(tweets)
+        print(build_prompt(capped, truncated, len(tweets), trimmed, cap, period))
         return 0
 
     if args.no_llm:
         tweets = [t for t in (payload.get("tweets") or []) if isinstance(t, dict)]
         errors = [e for e in (payload.get("errors") or []) if isinstance(e, dict)]
         if tweets:
-            capped, _, _ = prepare_tweets(tweets)
-            text = f"{header(now)}\n\n{fallback_body(capped)}{errors_footer(errors)}"
+            period = batch_period(tweets)
+            capped, _, _, _ = prepare_tweets(tweets)
+            text = f"{header(now, period)}\n\n{fallback_body(capped)}{errors_footer(errors)}"
         else:
             text = f"{header(now)}\n\nТишина в ленте: новых постов за период нет.{errors_footer(errors)}"
     else:

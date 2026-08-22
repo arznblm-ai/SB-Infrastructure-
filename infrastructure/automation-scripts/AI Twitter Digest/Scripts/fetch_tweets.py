@@ -12,8 +12,13 @@ fetch_tweets.py — сбор свежих твитов по списку AI-ак
 State коммитится ОТДЕЛЬНЫМ вызовом (--commit-state), уже после того как
 дайджест реально ушёл в Telegram — чтобы упавшая отправка не съедала твиты.
 
+Накопительный режим (--spool): свежие твиты дописываются в общий спул
+(spool.py), и сразу после успешной записи коммитится last_seen_id — выпуск
+собирается отдельной редкой digest-фазой из накопленного, не каждый fetch.
+
 Использование:
     fetch_tweets.py --out /tmp/tweets.json
+    fetch_tweets.py --spool                             # fetch-фаза: копим в спул
     fetch_tweets.py --account karpathy --limit 5        # smoke-тест
     fetch_tweets.py --commit-state /tmp/tweets.json
     fetch_tweets.py --alert-state get|set|clear
@@ -31,9 +36,15 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-PROJECT_DIR = Path("/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/AI Twitter Digest")
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import spool  # noqa: E402 — соседний модуль, путь добавлен выше
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_DIR / "config" / "accounts.json"
-RUNTIME_DIR = Path.home() / ".config" / "ai-twitter-digest"
+RUNTIME_DIR = spool.runtime_dir()      # env AI_DIGEST_RUNTIME_DIR → ~/.config/ai-twitter-digest
 DB_FILE = RUNTIME_DIR / "accounts.db"
 STATE_FILE = RUNTIME_DIR / "state.json"
 LOG_FILE = Path.home() / "Library" / "Logs" / "ai-twitter-digest.log"
@@ -294,7 +305,11 @@ def commit_state(payload_path: Path) -> int:
     except Exception as exc:
         log(f"commit-state: не читается {payload_path}: {exc}")
         return 1
-    proposal = payload.get("state_proposal") or {}
+    return commit_state_payload(payload)
+
+
+def commit_state_payload(payload: dict) -> int:
+    proposal = (payload or {}).get("state_proposal") or {}
     if not isinstance(proposal, dict):
         log("commit-state: некорректный state_proposal")
         return 1
@@ -323,6 +338,8 @@ def alert_state(mode: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Сбор свежих твитов AI-аккаунтов через twscrape")
     parser.add_argument("--out", help="куда писать JSON (по умолчанию stdout)")
+    parser.add_argument("--spool", action="store_true",
+                        help="fetch-фаза: дописать свежие твиты в спул и сразу закоммитить state")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="путь к accounts.json")
     parser.add_argument("--account", help="smoke-тест: только этот аккаунт (state игнорируется)")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="сколько твитов тянуть на аккаунт")
@@ -347,6 +364,23 @@ def main() -> int:
     payload, code = asyncio.run(run_fetch(args))
     if not payload:
         return code
+
+    if args.spool:
+        # Ошибки чтения копятся за всё окно: футер выпуска строится по объединению,
+        # а не по последнему прогону.
+        try:
+            spool.merge_errors(payload.get("errors"), payload.get("generated_at", ""))
+        except Exception as exc:  # noqa: BLE001 — meta не имеет права ронять fetch
+            log(f"spool_meta не обновлён ({type(exc).__name__}: {exc})")
+        if code != EXIT_OK:
+            return code
+        written = spool.append(payload.get("tweets") or [])
+        log(f"в спул дописано {written} твитов")
+        # last_seen_id двигаем ТОЛЬКО после успешной записи в спул: упавший
+        # append оставит твиты в окне и следующий fetch заберёт их снова.
+        commit_state_payload(payload)
+        return code
+
     text = json.dumps(payload, ensure_ascii=False, indent=1)
     if args.out:
         out_path = Path(args.out)
