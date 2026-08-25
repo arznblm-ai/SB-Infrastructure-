@@ -351,6 +351,20 @@ def extract_section(text: str, header: str) -> str:
     return ""
 
 
+def has_real_transcript(text: str) -> bool:
+    """Секция «Транскрипт» содержит реальный текст, а не плейсхолдер.
+
+    Работает и для заметки целиком, и для собранной MCP-секции.
+    """
+    body = extract_section(text, "Транскрипт")
+    if not body:
+        return False
+    return (
+        TRANSCRIPT_LOADING_PLACEHOLDER not in body
+        and TRANSCRIPT_MISSING_PLACEHOLDER not in body
+    )
+
+
 def build_mcp_transcript_section(doc_text: str) -> str:
     transcript = extract_section(doc_text, "Transcript")
     key_points = extract_section(doc_text, "Key Points")
@@ -576,11 +590,20 @@ def best_match(
 # ── Обновление заметки транскриптом из MCP ────────────────────────────────────
 
 def inject_mcp_content(filepath: Path, mcp_section: str):
-    """Заменяет блок от ## Ключевые моменты / ## Транскрипт до конца файла."""
+    """Заменяет блок от ## Ключевые моменты / ## Транскрипт до конца файла.
+
+    Инвариант: заметка с реальным транскриптом никогда не перезаписывается
+    заглушкой или секцией без транскрипта — разрешён только апгрейд
+    (плейсхолдер → реальный транскрипт), даунгрейд запрещён.
+    """
     if not filepath.exists():
         filepath.write_text(mcp_section + "\n", encoding="utf-8")
         return
     content = filepath.read_text(encoding="utf-8")
+
+    if has_real_transcript(content) and not has_real_transcript(mcp_section):
+        print(f"  [MCP] пропускаю: заметка уже содержит транскрипт — {filepath.name}")
+        return
 
     # Ищем где начинается старый транскрипт/summary блок
     cut_markers = ["## Ключевые моменты", "## Action Items", "## Транскрипт", "## Summary"]
@@ -817,6 +840,10 @@ def fetch_and_inject_transcript(call: dict, filepath: Path) -> tuple[bool, Path]
         return True, filepath
 
     # Все попытки исчерпаны
+    if filepath.exists() and has_real_transcript(filepath.read_text(encoding="utf-8")):
+        # Локальный (parakeet/whisper) транскрипт уже на месте — заглушкой не затирать.
+        print(f"  [MCP] пропускаю: заметка уже содержит транскрипт — {filepath.name}")
+        return False, filepath
     if not ensure_note_metadata(
         filepath,
         call.get("call_id", ""),

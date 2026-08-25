@@ -203,6 +203,37 @@ def summary_filename(path: Path, title: str, folder_name: str) -> str:
     return f"{prefix} {{summary}} {topic} – {date}.md"
 
 
+def infer_track(content: str, title: str) -> str:
+    """Детерминированная эвристика трека (ADR-025): consulting|producer|ugsee|none.
+
+    Считает совпадения ключевых слов в тексте+заголовке (регистронезависимо);
+    при конфликте побеждает больший счёт, при равенстве — фиксированный
+    приоритет consulting > ugsee > producer.
+    """
+    text = f"{title}\n{content}".lower()
+
+    consulting_keywords = [
+        "vitalik", "виталик", "макс пономар", "friends", "иинизация", "консалтинг",
+    ]
+    ugsee_keywords = ["ugsee", "минаев", "ugc media", "creative hub"]
+    producer_keywords = ["portal", "смет", "тендер", "раскадровк", "продакшн"]
+
+    scores = {
+        "consulting": sum(text.count(kw) for kw in consulting_keywords),
+        "ugsee": sum(text.count(kw) for kw in ugsee_keywords),
+        "producer": sum(text.count(kw) for kw in producer_keywords),
+    }
+    # «пилот» считается сигналом консалтинга только рядом с агентской темой
+    if "пилот" in text and "агентств" in text:
+        scores["consulting"] += 1
+
+    # Порядок перебора задаёт приоритет при равном счёте
+    for track in ("consulting", "ugsee", "producer"):
+        if scores[track] > 0 and scores[track] == max(scores.values()):
+            return track
+    return "none"
+
+
 def build_local_summary(path: Path, content: str, preferred_folder: Optional[str]) -> tuple[str, str, str]:
     folder_name = classify_folder(path, content, preferred_folder)
     date = frontmatter_value(content, "date") or extract_date(path.name) or datetime.now().strftime("%Y-%m-%d")
@@ -227,6 +258,7 @@ def build_local_summary(path: Path, content: str, preferred_folder: Optional[str
         "  - status/active",
         f"date: {date}",
         "status: active",
+        f"track: {infer_track(content, title)}",
         f"source: \"[[{Path(source).stem}]]\"",
         "generated_by: local-transcript-summarizer",
         "---",
