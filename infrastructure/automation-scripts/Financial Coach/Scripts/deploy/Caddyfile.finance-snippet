@@ -1,0 +1,83 @@
+# Финансовый дашборд на https://163.5.29.10.sslip.io/finance
+#
+# ВСТАВЛЯТЬ: внутрь существующего блока сайта `163.5.29.10.sslip.io { ... }`,
+# СТРОГО ПЕРЕД `handle { reverse_proxy 127.0.0.1:9119 }`.
+# Порядок важен: голый `handle { ... }` без матчера — это catch-all, он перехватит
+# и /finance тоже. Caddy сортирует директивы по своему внутреннему порядку, но
+# несколько `handle`-блоков между собой проверяются в порядке написания в файле.
+#
+# Дашборд отдаётся статикой из /var/www/finance/index.html — Caddy работает не от root
+# и /root/second-brain читать не может, поэтому копию туда кладёт systemd-юнит
+# financial-coach-publish.path (см. README.md, раздел «Публикация дашборда»).
+#
+# ХЕШ ПАРОЛЯ: сгенерировать самому — `caddy hash-password` (пароль вводится с клавиатуры,
+# в файл попадает только bcrypt-хеш вида $2a$14$...). Хеш начинается с `$` — в Caddyfile
+# его НЕ надо экранировать, но если пароль/хеш содержит `{` или `}`, обернуть в кавычки.
+
+	# 1) /finance без слеша уводим на /finance/ — тогда после strip_prefix путь
+	#    остаётся "/" и file_server отдаёт index.html. Без этого редиректа путь
+	#    после strip_prefix становится пустым, и в части версий Caddy это 404.
+	redir /finance /finance/ 308
+
+	@finance path /finance/*
+	handle @finance {
+		# ПРОВЕРЕНО 2026-08-27: на сервере Caddy v2.11.4 → нужен именно basic_auth
+		# (переименовывать в basicauth НЕ надо; тот алиас — для версий < 2.8).
+		basic_auth {
+			anton PASTE_BCRYPT_HASH_HERE
+		}
+
+		header {
+			# дашборд меняется каждый вечер (и при каждой правке модели) — кэш только мешает
+			Cache-Control "no-store"
+			# из поиска дашборд убираем
+			X-Robots-Tag "noindex, nofollow"
+			# не светим, чем отдаём
+			-Server
+		}
+
+		uri strip_prefix /finance
+		root * /var/www/finance
+		file_server
+	}
+
+# --- Как это выглядит в итоговом /etc/caddy/Caddyfile ------------------------
+#
+# 163.5.29.10.sslip.io {
+#     redir /finance /finance/ 308
+#
+#     @finance path /finance/*
+#     handle @finance {
+#         basic_auth {
+#             anton $2a$14$PASTE_BCRYPT_HASH_HERE
+#         }
+#         header {
+#             Cache-Control "no-store"
+#             X-Robots-Tag "noindex, nofollow"
+#             -Server
+#         }
+#         uri strip_prefix /finance
+#         root * /var/www/finance
+#         file_server
+#     }
+#
+#     handle {
+#         reverse_proxy 127.0.0.1:9119     # ← дашборд Гермеса, не трогать
+#     }
+# }
+#
+# --- Альтернатива, если что-то из этого не заведётся -------------------------
+#
+# (а) Вместо связки redir + @finance + `uri strip_prefix` можно взять handle_path —
+#     он снимает префикс сам:
+#         handle_path /finance* {
+#             basic_auth { anton ... }
+#             header { ... }
+#             root * /var/www/finance
+#             file_server
+#         }
+#     Тут матчер `/finance*` ловит и /finance, и /finance/, и /financeXXX
+#     (звёздочка в path-матчере — это суффикс, а не «сегмент пути»).
+#
+# (б) Если нужен отдельный поддомен вместо подпути — завести второй блок сайта
+#     (finance.163.5.29.10.sslip.io) — но тогда нужен отдельный TLS-сертификат.

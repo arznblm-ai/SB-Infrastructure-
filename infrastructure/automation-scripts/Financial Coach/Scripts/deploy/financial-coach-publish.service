@@ -1,0 +1,11 @@
+[Unit]
+Description=Financial Coach: копия дашборда в веб-каталог /var/www/finance
+Documentation=file:///root/second-brain/infrastructure/Financial Coach/Scripts/deploy/README.md
+
+[Service]
+Type=oneshot
+User=root
+# -D создаёт /var/www/finance, если его ещё нет; -m 644 — чтобы Caddy (не root) мог читать
+ExecStart=/usr/bin/install -m 644 -D "/root/second-brain/infrastructure/Financial Coach/dashboard/index.html" /var/www/finance/index.html
+StandardOutput=journal
+StandardError=journal

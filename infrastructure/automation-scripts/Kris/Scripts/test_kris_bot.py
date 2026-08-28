@@ -5,6 +5,7 @@
     python3 -m pytest Scripts/test_kris_bot.py -q
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -323,3 +324,145 @@ def test_claude_cmd_has_no_skip_permissions_and_whitelists_tools():
 def test_claude_cmd_resumes_session():
     cmd = kb.build_claude_cmd("привет", "sid-123")
     assert cmd[cmd.index("--resume") + 1] == "sid-123"
+
+
+# ---------------------------------------------------------------------------
+# Человеческий текст ошибки Claude (вместо сырого JSON в Telegram)
+# ---------------------------------------------------------------------------
+BATTLEFIELD_AUTH_JSON = (
+    '{"type":"result","subtype":"error_during_execution","service_tier"'
+    ':"standard","cache_creation":{"ephemeral_5m_input_tokens":0,'
+    '"ephemeral_1h_input_tokens":0},"num_turns":1,"duration_ms":842,'
+    '"duration_api_ms":810,"is_error":true,"result":"Failed to authenticate: '
+    'OAuth session expired and could not be refreshed","total_cost_usd":0.0,'
+    '"session_id":"abc-123"}'
+)
+
+
+def test_human_error_auth_failure_is_human_with_no_braces():
+    msg = kb.human_error(BATTLEFIELD_AUTH_JSON)
+    assert "{" not in msg and "}" not in msg
+    assert "setup-token" in msg
+    assert "OAuth" not in msg
+    assert msg == (
+        "Авторизация Claude на сервере протухла. "
+        "Прогони claude setup-token по ssh - и я вернусь."
+    )
+
+
+def test_human_error_timeout():
+    msg = kb.human_error("Error: operation timed out after 900000ms")
+    assert msg == "Думала слишком долго и не успела. Попробуй ещё раз."
+
+
+def test_human_error_rate_limit():
+    msg = kb.human_error("Error: 429 rate limit exceeded, please retry")
+    assert msg == "Claude сейчас перегружен или упёрся в лимит. Подожди немного и повтори."
+
+
+def test_human_error_overloaded():
+    msg = kb.human_error("Overloaded: the model is overloaded, try again later")
+    assert msg == "Claude сейчас перегружен или упёрся в лимит. Подожди немного и повтори."
+
+
+def test_human_error_unknown_is_trimmed_and_has_no_json():
+    raw = '{"weird": "' + ("x" * 300) + '"}'
+    msg = kb.human_error(raw)
+    prefix = "Что-то сломалось на моей стороне: "
+    suffix = ". Полная ошибка в логе на сервере."
+    assert "{" not in msg and "}" not in msg and '"' not in msg
+    assert msg.startswith(prefix)
+    assert msg.endswith(suffix)
+    snippet = msg[len(prefix) : -len(suffix)]
+    assert len(snippet) == 120
+
+
+# ---------------------------------------------------------------------------
+# run_owner_turn: разбор очереди после батча/вечернего прогона
+# ---------------------------------------------------------------------------
+class FakeBot:
+    """Минимальная замена telegram.Bot: только то, что использует run_owner_turn."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+    async def send_chat_action(self, chat_id, action):
+        pass
+
+
+@pytest.fixture()
+def isolated_state(tmp_path, monkeypatch):
+    """state.json во временном каталоге, чтобы тест не трогал боевой файл."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(kb, "STATE_DIR", str(state_dir))
+    monkeypatch.setattr(kb, "STATE_FILE", str(state_dir / "state.json"))
+    kb.pending_queue.clear()
+    yield
+    kb.pending_queue.clear()
+
+
+def test_run_owner_turn_drains_queue_after_batch(isolated_state, monkeypatch):
+    """Батч закончился, в очереди осталось сообщение владельца - разбираем сразу,
+    не дожидаясь его следующего сообщения (сам дефект)."""
+    kb.pending_queue.append("привет, ты тут?")
+
+    calls = []
+
+    async def fake_run_claude(prompt, session_id=None):
+        calls.append((prompt, session_id))
+        return ("ответ владельцу", "sid-1", None)
+
+    monkeypatch.setattr(kb, "run_claude", fake_run_claude)
+
+    bot = FakeBot()
+    asyncio.run(kb.run_owner_turn(bot, kb.ALLOWED_USER, None))
+
+    assert calls == [("привет, ты тут?", None)]
+    assert bot.sent == [(kb.ALLOWED_USER, "ответ владельцу")]
+    assert list(kb.pending_queue) == []
+
+
+def test_run_owner_turn_drains_multiple_queued_messages(isolated_state, monkeypatch):
+    """Несколько сообщений в очереди - уходят одним склеенным промптом,
+    очередь пустеет полностью."""
+    kb.pending_queue.append("первое")
+    kb.pending_queue.append("второе")
+
+    prompts = []
+
+    async def fake_run_claude(prompt, session_id=None):
+        prompts.append(prompt)
+        return ("ок", None, None)
+
+    monkeypatch.setattr(kb, "run_claude", fake_run_claude)
+
+    bot = FakeBot()
+    asyncio.run(kb.run_owner_turn(bot, kb.ALLOWED_USER, None))
+
+    # Первый прогон забирает "первое" + всё, что успело накопиться ("второе"),
+    # склеивая их одним промптом - так же, как это делал старый цикл в on_private_message.
+    assert prompts == ["первое\n\nвторое"]
+    assert list(kb.pending_queue) == []
+    assert len(bot.sent) == 1
+
+
+def test_run_owner_turn_none_and_empty_queue_skips_claude(isolated_state, monkeypatch):
+    """initial_text=None и пустая очередь - Claude вообще не вызываем."""
+    called = {"flag": False}
+
+    async def fake_run_claude(prompt, session_id=None):
+        called["flag"] = True
+        return ("", None, None)
+
+    monkeypatch.setattr(kb, "run_claude", fake_run_claude)
+
+    bot = FakeBot()
+    asyncio.run(kb.run_owner_turn(bot, kb.ALLOWED_USER, None))
+
+    assert called["flag"] is False
+    assert bot.sent == []
+    assert not kb.claude_lock.locked()

@@ -1,0 +1,20 @@
+	# --- Финансовый дашборд (Financial Coach) ---------------------------------
+	# Вставляется ПЕРЕД catch-all `handle { reverse_proxy 127.0.0.1:9119 }`.
+	# Защита — неугадываемый путь вместо basic auth (решение Антона 27.08:
+	# интерактивный ввод пароля в его терминале не работает).
+	# SECRET_PATH подставляется командой из README (раздел 5.3).
+	# Кто знает ссылку — тот войдёт: не пересылать и не класть в общие чаты.
+	redir /SECRET_PATH /SECRET_PATH/ 308
+
+	@finance path /SECRET_PATH/*
+	handle @finance {
+		header {
+			Cache-Control "no-store"
+			X-Robots-Tag "noindex, nofollow"
+			-Server
+		}
+		uri strip_prefix /SECRET_PATH
+		root * /var/www/finance
+		file_server
+	}
+

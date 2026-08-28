@@ -1,0 +1,11 @@
+[Unit]
+Description=Financial Coach: следить за dashboard/index.html и публиковать его в /var/www/finance
+Documentation=file:///root/second-brain/infrastructure/Financial Coach/Scripts/deploy/README.md
+
+[Path]
+# Syncthing довозит новый HTML с мака — публикуем сразу, не дожидаясь таймера 21:00
+PathChanged=/root/second-brain/infrastructure/Financial Coach/dashboard/index.html
+Unit=financial-coach-publish.service
+
+[Install]
+WantedBy=multi-user.target

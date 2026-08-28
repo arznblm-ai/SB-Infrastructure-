@@ -16,6 +16,12 @@
 
 `_commands/transcripts.md` — дубль обёртки: `/transcripts` и `/summarize` вели на один и тот же `transcript-summarizer`. Содержательная часть влита в `/summarize`.
 
+## Выведено 2026-08-26 (архив департамента, решение Антона)
+
+| Скилл | Почему выведен |
+|---|---|
+| `alina` | Департамент `infrastructure/Alina/` архивирован целиком (TG-бот @Alina_portal_bot выключен, тег `producer-final`). Умение считать сметы (бриф → брейкдаун по таймингу и ценам) унаследовал проектный компаньон Крис — `system/skills/kris/SKILL.md`, команда `/kris`. Знания (`knowledge/`, `estimates/`) скопированы в `infrastructure/Kris/memory/`; оригиналы Алины не тронуты, банner-архив — в начале `infrastructure/Alina/CLAUDE.md`. |
+
 ## Как вернуть
 
 ```bash

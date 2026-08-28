@@ -4,11 +4,21 @@
 Без LLM (cost gate плана): данные + шаблон = HTML. Плюс копия в ~/Desktop/Vibecode OUT/
 (постоянное правило Антона).
 
+Публикация (VPS): если задан FINANCE_PUBLISH_DIR (переменная окружения или ключ в
+finance.env) — готовый index.html атомарно кладётся в этот каталог (там его отдаёт Caddy,
+см. Scripts/deploy/README.md). На маке переменная не задана — шаг просто пропускается.
+Нет каталога или нет прав — предупреждение в stderr, но не падение: рендер уже состоялся.
+
 Что откуда:
   * план-слой (приходы, долги, налоги, burn, pipeline) — data/model.json;
   * живые остатки счетов — последний data/planfact/YYYY-MM-DD.json, поле data.balances
     (только рублёвые счета; USD/крипто-счета в ликвидное не входят — Конституция модели, п.5).
 Остатки в model.json НЕ хардкодятся: accounts.liquid_total = null, цифра приходит из снапшота.
+
+Плюс сторож задвоения: прогнозные строки модели сверяются с фактическими приходами
+из того же снапшота (только сумма и окно дат — названия в плане и в выписке не совпадают).
+Совпадение у строки без received -> жёлтый блок вверху + WARNING в stderr; у строки
+с received=true -> зелёная пометка «подтверждено фактом». Ничего не удаляется автоматически.
 
 Вёрстка наследует референс dashboard/finance_dashboard_2026_08_14_v9.html (карточки, таблицы,
 слайдеры, тумблеры, график, вердикт). Прогноз считает vanilla JS на странице, данные лежат
@@ -24,7 +34,10 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import shutil
+from datetime import date as _date
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +58,20 @@ RECOMMENDED_KEYS = (
 )
 
 NBSP = " "
+
+# --- сторож задвоения --------------------------------------------------------
+# Мотив: 14.08 пришёл платёж «Аллфуд» 140 300, а прогнозная строка «Алмафуд остаток»
+# 140 000 провисела в модели до 27.08 — 12 дней задвоения (~119к чистыми).
+# Названия в плане и в выписке не совпадают дословно, поэтому матчинг только
+# детерминированный: по СУММЕ (относительный допуск) и по ОКНУ ДАТ. Ничего не
+# удаляется автоматически — решение об исключении строки принимает Антон/Том.
+
+#: допуск по сумме: |факт − план| / план
+DUPE_TOLERANCE = 0.05
+#: окно поиска факта начинается за столько дней до первого числа месяца строки
+DUPE_WINDOW_DAYS = 45
+#: глубина выборки фактических приходов из снапшота
+DUPE_LOOKBACK_DAYS = 90
 
 log = common.get_logger("render")
 
@@ -95,7 +122,8 @@ def validate_model(model: object) -> list[str]:
             problems.append(
                 f"{item.get('project')}: net {item.get('net')} != выручка − команде − налог ({expected})"
             )
-    team_sum = sum(d.get("amount", 0) for d in model.get("team_debts", []))
+    # долг с paid_by_schedule гасится графиком (one_off_expenses), в team_debt приходов не входит
+    team_sum = sum(d.get("amount", 0) for d in model.get("team_debts", []) if not d.get("paid_by_schedule"))
     income_team = sum(i.get("team_debt", 0) for i in model.get("confirmed_income", []))
     if team_sum and income_team and team_sum != income_team:
         problems.append(
@@ -153,6 +181,212 @@ def read_live_balances(data_dir: Path) -> dict[str, Any]:
     result["liquid_total"] = round(total, 2)
     result["verified"] = True
     return result
+
+
+# --- сторож задвоения: факт из ПланФакта vs прогнозные строки модели ---------
+
+
+def op_contragent(op: dict) -> str:
+    """Контрагент операции: верхний уровень пуст почти всегда — берём из operationParts."""
+    top = ((op.get("contrAgent") or {}).get("title") or "").strip()
+    if top:
+        return top
+    names: list[str] = []
+    for part in op.get("operationParts") or []:
+        title = ((part.get("contrAgent") or {}).get("title") or "").strip()
+        if title and title not in names:
+            names.append(title)
+    return ", ".join(names) or "контрагент не указан"
+
+
+def read_recent_incomes(
+    data_dir: Path, today: str, lookback_days: int = DUPE_LOOKBACK_DAYS
+) -> dict[str, Any]:
+    """Фактические приходы по РУБЛЁВЫМ счетам за последние N дней.
+
+    Сырьё — тот же снапшот ПланФакта, что и остатки (конверт: ['data']['operations']).
+    Валютные/крипто-счета не берём: модель считает рубли (Конституция модели, п.5).
+    """
+    result: dict[str, Any] = {
+        "snapshot": None, "date": None, "since": common.shift_days(today, -lookback_days),
+        "ops": [], "problem": None,
+    }
+    snap = common.latest_snapshot("planfact", data_dir)
+    if snap is None:
+        result["problem"] = "снапшота ПланФакта нет"
+        return result
+    result["snapshot"] = snap.name
+    envelope = common.read_json(snap)
+    if not isinstance(envelope, dict):
+        result["problem"] = f"снапшот нечитаем: {snap.name}"
+        return result
+    result["date"] = envelope.get("date")
+    operations = (envelope.get("data") or {}).get("operations")
+    if not isinstance(operations, list):
+        result["problem"] = f"в снапшоте {snap.name} нет data.operations"
+        return result
+
+    since = result["since"]
+    for op in operations:
+        if op.get("operationType") != "Income":
+            continue
+        date_str = op.get("operationDate") or ""
+        if not date_str or date_str[:10] < since or date_str[:10] > today:
+            continue
+        account = op.get("account") or {}
+        currency = account.get("currencyCode") or (op.get("accountCurrency") or {}).get("currencyCode")
+        if currency != "RUB":
+            continue
+        try:
+            date_obj = _date.fromisoformat(date_str[:10])
+        except ValueError:
+            continue
+        result["ops"].append({
+            "operation_id": op.get("operationId"),
+            "date": date_str[:10],
+            "date_obj": date_obj,
+            "value": float(op.get("value") or 0.0),
+            "contragent": op_contragent(op),
+            "comment": (op.get("comment") or "").strip(),
+            "account": account.get("title") or "?",
+        })
+    result["ops"].sort(key=lambda o: o["date"])
+    return result
+
+
+def month_start(month_key: Any) -> _date | None:
+    """'2026-09' -> date(2026, 9, 1); всё непонятное -> None."""
+    try:
+        year, month = str(month_key).split("-")[:2]
+        return _date(int(year), int(month), 1)
+    except (ValueError, TypeError):
+        return None
+
+
+def model_income_rows(model: dict) -> list[dict[str, Any]]:
+    """Строки прогноза, которые сторож проверяет: confirmed_income + pipeline (тумблеры)."""
+    rows: list[dict[str, Any]] = []
+    for item in model.get("confirmed_income", []):
+        rows.append({
+            "id": item.get("id"),
+            "project": item.get("project", "?"),
+            "amount": item.get("amount", 0) or 0,
+            "month": item.get("month"),
+            "received": bool(item.get("received")),
+            "kind": "confirmed",
+        })
+    for item in model.get("pipeline", []):
+        rows.append({
+            "id": item.get("id"),
+            "project": item.get("project", "?"),
+            "amount": item.get("estimate", 0) or 0,
+            "month": item.get("month"),
+            "received": bool(item.get("received")),
+            "kind": "pipeline",
+        })
+    return rows
+
+
+def find_income_duplicates(model: dict, incomes: dict[str, Any], today: str) -> dict[str, Any]:
+    """Сверяет прогнозные строки с фактическими приходами.
+
+    Матчинг детерминированный, без имён:
+      * сумма: |факт − план| / план <= DUPE_TOLERANCE (5%);
+      * дата: operationDate в окне [первое число месяца строки − 45 дней; сегодня].
+    Строки с received=true проверяются первыми — для них совпадение означает
+    «подтверждено фактом» (зелёный статус), а не подозрение на задвоение.
+    Один фактический приход закрывает максимум одну строку.
+    """
+    report: dict[str, Any] = {
+        "suspects": [], "confirmed": [], "checked_rows": 0,
+        "ops_count": len(incomes.get("ops") or []),
+        "problem": incomes.get("problem"),
+        "since": incomes.get("since"),
+        "snapshot": incomes.get("snapshot"),
+    }
+    ops = incomes.get("ops") or []
+    if not ops:
+        return report
+
+    today_obj = _date.fromisoformat(today)
+    rows = model_income_rows(model)
+    rows.sort(key=lambda r: 0 if r["received"] else 1)  # received — в первую очередь
+    used: set[Any] = set()
+
+    for row in rows:
+        amount = row["amount"]
+        start = month_start(row["month"])
+        if amount <= 0 or start is None:
+            log.debug("Сторож пропустил строку %s (сумма %s, месяц %s)",
+                      row["id"], amount, row["month"])
+            continue
+        window_start = start - timedelta(days=DUPE_WINDOW_DAYS)
+        report["checked_rows"] += 1
+
+        best: tuple[float, dict[str, Any]] | None = None
+        for op in ops:
+            if op["operation_id"] in used:
+                continue
+            if op["date_obj"] < window_start or op["date_obj"] > today_obj:
+                continue
+            delta = abs(op["value"] - amount) / amount
+            if delta > DUPE_TOLERANCE:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, op)
+        if best is None:
+            continue
+
+        delta, op = best
+        used.add(op["operation_id"])
+        match = {
+            "row": row,
+            "op": op,
+            "delta": round(op["value"] - amount, 2),
+            "delta_pct": round(delta * 100, 2),
+            "window": f"{window_start.isoformat()}…{today}",
+        }
+        if row["received"]:
+            report["confirmed"].append(match)
+        else:
+            report["suspects"].append(match)
+    return report
+
+
+def log_duplicates(report: dict[str, Any]) -> None:
+    """Тот же сигнал, что и на дашборде, но в stderr рендера."""
+    if report.get("problem"):
+        log.warning("Сторож задвоения: not verified — %s", report["problem"])
+        return
+    log.info("Сторож задвоения: проверено строк %s против %s фактических приходов с %s "
+             "(допуск %.0f%%, окно −%s дн от месяца строки)",
+             report["checked_rows"], report["ops_count"], report["since"],
+             DUPE_TOLERANCE * 100, DUPE_WINDOW_DAYS)
+    for m in report["confirmed"]:
+        op, row = m["op"], m["row"]
+        log.info("ПОДТВЕРЖДЕНО ФАКТОМ: строка «%s» (%s ₽, received=true) = приход %s, %s, %s ₽ "
+                 "(расхождение %s ₽ / %s%%)",
+                 row["project"], round(row["amount"]), op["date"], op["contragent"],
+                 round(op["value"]), m["delta"], m["delta_pct"])
+    for m in report["suspects"]:
+        op, row = m["op"], m["row"]
+        log.warning("ВОЗМОЖНОЕ ЗАДВОЕНИЕ: строка прогноза «%s» (%s ₽) похожа на уже пришедший "
+                    "платёж: %s, %s, %s ₽ — проверь задвоение",
+                    row["project"], round(row["amount"]), op["date"], op["contragent"],
+                    round(op["value"]))
+    if not report["suspects"] and not report["confirmed"]:
+        log.info("Сторож задвоения: совпадений нет")
+
+
+def dupe_marks(report: dict[str, Any]) -> dict[Any, dict[str, Any]]:
+    """id строки модели -> совпадение (для пометок прямо в таблице приходов)."""
+    marks: dict[Any, dict[str, Any]] = {}
+    for kind in ("confirmed", "suspects"):
+        for m in report.get(kind, []):
+            rid = m["row"].get("id")
+            if rid is not None:
+                marks[rid] = {**m, "status": "ok" if kind == "confirmed" else "warn"}
+    return marks
 
 
 def team_detail_map(model: dict) -> dict[str, str]:
@@ -292,6 +526,12 @@ CSS = """
   .bal-crit { color: var(--danger-text); font-weight: 600; }
   .note { font-size: 11px; color: var(--text-sec); line-height: 1.6; margin-top: 8px; }
   .flag { font-size: 11px; line-height: 1.6; margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: var(--warn-bg); color: var(--warn-text); }
+  .dupe { margin: 0 0 18px; padding: 12px 14px; border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-text); font-size: 13px; line-height: 1.6; }
+  .dupe .dupe-h { font-weight: 700; margin-bottom: 6px; }
+  .dupe ul { margin: 0; padding-left: 18px; }
+  .dupe li + li { margin-top: 6px; }
+  .dupe .dupe-note { font-size: 11px; opacity: .8; margin-top: 8px; }
+  .dupe-ok { background: var(--ok-bg); color: var(--ok-text); }
   .details { font-size: 10px; color: var(--text-ter); margin-top: 3px; }
   .chart { position: relative; height: 210px; padding: 20px 10px 30px; margin-top: 12px; }
   .chart-grid { position: absolute; left: 50px; right: 10px; top: 20px; bottom: 30px; }
@@ -536,7 +776,70 @@ def section_team_debts(model: dict) -> str:
 """
 
 
-def section_confirmed(model: dict) -> str:
+def ddmm(date_str: str) -> str:
+    """'2026-08-14' -> '14.08'."""
+    parts = str(date_str).split("-")
+    return f"{parts[2]}.{parts[1]}" if len(parts) == 3 else str(date_str)
+
+
+def section_duplicates(report: dict[str, Any]) -> str:
+    """Блоки сторожа задвоения: жёлтый (подозрение) и зелёный (подтверждено фактом)."""
+    blocks: list[str] = []
+    if report.get("suspects"):
+        items = "\n".join(
+            "    <li>Строка прогноза «{project}» ({amount}) похожа на уже пришедший платёж: "
+            "{date}, {contragent}, {value} — проверь задвоение.{comment}</li>".format(
+                project=esc(m["row"]["project"]),
+                amount=fmt_rub(m["row"]["amount"]),
+                date=esc(ddmm(m["op"]["date"]) + "." + m["op"]["date"][:4]),
+                contragent=esc(m["op"]["contragent"]),
+                value=fmt_rub(m["op"]["value"]),
+                comment=f' <span class="dupe-note">({esc(m["op"]["comment"])})</span>'
+                        if m["op"]["comment"] else "",
+            )
+            for m in report["suspects"]
+        )
+        blocks.append(f"""
+<div class="dupe">
+  <div class="dupe-h">⚠️ Сторож задвоения: {len(report['suspects'])} совпадени(е/я) по сумме и дате</div>
+  <ul>
+{items}
+  </ul>
+  <div class="dupe-note">Матчинг детерминированный: сумма ±{round(DUPE_TOLERANCE * 100)}%, окно
+  [месяц строки −{DUPE_WINDOW_DAYS} дн … сегодня], названия не сравниваются. Строку из прогноза
+  автоматически никто не убирает — решение за Антоном.</div>
+</div>
+""")
+    if report.get("confirmed"):
+        items = "\n".join(
+            "    <li>«{project}» ({amount}) — подтверждено фактом {date}: {contragent}, {value}.</li>".format(
+                project=esc(m["row"]["project"]),
+                amount=fmt_rub(m["row"]["amount"]),
+                date=esc(ddmm(m["op"]["date"])),
+                contragent=esc(m["op"]["contragent"]),
+                value=fmt_rub(m["op"]["value"]),
+            )
+            for m in report["confirmed"]
+        )
+        blocks.append(f"""
+<div class="dupe dupe-ok">
+  <div class="dupe-h">✅ Найдено в выписке ПланФакта (строки с флагом «получен»)</div>
+  <ul>
+{items}
+  </ul>
+  <div class="dupe-note">Деньги уже в остатке — строку в прогнозе стоит закрыть, чтобы не задваивать.
+  Автоматически не убираем.</div>
+</div>
+""")
+    if report.get("problem"):
+        blocks.append(
+            f'<div class="flag">Сторож задвоения: not verified — {esc(report["problem"])}.</div>'
+        )
+    return "".join(blocks)
+
+
+def section_confirmed(model: dict, marks: dict[Any, dict[str, Any]] | None = None) -> str:
+    marks = marks or {}
     details = team_detail_map(model)
     default_pct = model.get("tax_rules", {}).get("default_pct", 12)
     rows = []
@@ -559,8 +862,17 @@ def section_confirmed(model: dict) -> str:
         detail = details.get(item.get("project", ""), "")
         team_cell = (f'{fmt_rub(team, "")}<div class="details">{esc(detail)}</div>' if team
                      else '0 ✓<div class="details">оплачено ранее</div>' if not item.get("off_ip") else "—")
+        mark = marks.get(item.get("id"))
+        if mark and mark["status"] == "ok":
+            mark_cell = (f'<div><span class="pill p-ok">подтверждено фактом {esc(ddmm(mark["op"]["date"]))}</span></div>'
+                         f'<div class="details">{esc(mark["op"]["contragent"])} · {fmt_rub(mark["op"]["value"])}</div>')
+        elif mark:
+            mark_cell = (f'<div><span class="pill p-warn">похоже на задвоение</span></div>'
+                         f'<div class="details">{esc(ddmm(mark["op"]["date"]))} · {esc(mark["op"]["contragent"])} · {fmt_rub(mark["op"]["value"])}</div>')
+        else:
+            mark_cell = ""
         rows.append(
-            f'    <tr><td>{esc(item.get("project"))}</td>'
+            f'    <tr><td>{esc(item.get("project"))}{mark_cell}</td>'
             f'<td class="r">{fmt_rub(rev, "")}</td>'
             f'<td class="r">{team_cell}</td>'
             f'<td class="r">{tax_cell}</td>'
@@ -664,7 +976,14 @@ def section_controls(model: dict, page: dict[str, Any]) -> str:
 """
 
 
-def build_html(model: dict, balances: dict[str, Any], page: dict[str, Any], sources: dict[str, str]) -> str:
+def build_html(
+    model: dict,
+    balances: dict[str, Any],
+    page: dict[str, Any],
+    sources: dict[str, str],
+    dupes: dict[str, Any] | None = None,
+) -> str:
+    dupes = dupes or {"suspects": [], "confirmed": []}
     data_json = json.dumps(page, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     months_x = "".join(
         f"<span>{esc(m.get('label', '').split()[0][:3])}</span>" for m in page["months"]
@@ -702,7 +1021,7 @@ def build_html(model: dict, balances: dict[str, Any], page: dict[str, Any], sour
 
 <h1>Финансовая сводка</h1>
 <div class="subtitle">модель от {esc(model.get('updated_at'))} · остатки из ПланФакта {esc(balances.get('date') or '—')} · единый пул: бизнес + личное</div>
-
+{section_duplicates(dupes)}
 <div class="g3" style="margin-bottom:18px;">
   <div class="card" id="kpi-min"><div class="clabel">Минимум за период</div><div class="cval-lg" id="kpi-min-val">—</div><div class="csub" id="kpi-min-sub">—</div></div>
   <div class="card" id="kpi-dec"><div class="clabel">Баланс на 1 января 2027</div><div class="cval-lg" id="kpi-dec-val">—</div><div class="csub">без крипты</div></div>
@@ -712,7 +1031,7 @@ def build_html(model: dict, balances: dict[str, Any], page: dict[str, Any], sour
 {section_assets(model, balances, page)}
 {section_team_debts(model)}
 <hr class="divider">
-{section_confirmed(model)}
+{section_confirmed(model, dupe_marks(dupes))}
 {section_pipeline(model)}
 <hr class="divider">
 {section_one_offs(model)}
@@ -772,6 +1091,47 @@ def copy_to_vibecode_out(src: Path, dest_dir: Path) -> Path:
     return dest
 
 
+def resolve_publish_dir(cli_value: str | None) -> Path | None:
+    """Куда публиковать index.html: CLI > os.environ > finance.env. Нет значения — None.
+
+    На маке ключ не задан вовсе, поэтому шаг публикации молча пропускается и поведение
+    остаётся прежним. На VPS значение приходит из /root/.config/second-brain/finance.env
+    (его же читает systemd EnvironmentFile) — обычно /var/www/finance.
+    """
+    if cli_value:
+        return Path(cli_value).expanduser()
+    value = os.environ.get("FINANCE_PUBLISH_DIR")
+    if not value:
+        try:
+            value = common.load_env().get("FINANCE_PUBLISH_DIR")
+        except OSError as exc:  # нечитаемый env-файл не должен валить рендер
+            log.warning("env-файл не прочитан (%s) — публикация пропущена", exc)
+            return None
+    return Path(value).expanduser() if value else None
+
+
+def publish_dashboard(src: Path, dest_dir: Path) -> Path:
+    """Атомарно кладёт index.html в веб-каталог: temp рядом + os.replace.
+
+    Пишем temp в тот же каталог, иначе os.replace может уехать через границу ФС.
+    Readers (Caddy) видят либо старый файл целиком, либо новый — половинчатого нет.
+    """
+    tmp = dest_dir / f".index.html.{os.getpid()}.tmp"
+    try:
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest_dir / "index.html")
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    dest = dest_dir / "index.html"
+    log.info("Опубликовано: %s", dest)
+    return dest
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Рендер дашборда из data/model.json")
     common.add_common_args(parser)
@@ -782,6 +1142,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--copy-dir", default=None, metavar="PATH",
                         help=f"куда класть копию (по умолчанию {common.VIBECODE_OUT})")
     parser.add_argument("--no-copy", action="store_true", help="не копировать наружу")
+    parser.add_argument("--publish-dir", default=None, metavar="PATH",
+                        help="куда публиковать index.html (по умолчанию FINANCE_PUBLISH_DIR "
+                             "из окружения или finance.env; на маке обычно не задан)")
+    parser.add_argument("--no-publish", action="store_true",
+                        help="не публиковать, даже если FINANCE_PUBLISH_DIR задан")
     args = parser.parse_args(argv)
     common.apply_common_args(args, log)
 
@@ -789,6 +1154,7 @@ def main(argv: list[str] | None = None) -> int:
     model_path = Path(args.model) if args.model else data_dir / "model.json"
     dashboard_dir = Path(args.dashboard_dir) if args.dashboard_dir else common.DASHBOARD_DIR
     copy_dir = Path(args.copy_dir) if args.copy_dir else common.VIBECODE_OUT
+    publish_dir = None if args.no_publish else resolve_publish_dir(args.publish_dir)
 
     if not model_path.is_file():
         # план-слоя ещё нет — это штатное состояние молодого департамента, не ошибка синка
@@ -824,13 +1190,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         log.warning("not verified: %s — стартовый остаток берём из handoff_reference", balances["problem"])
 
+    today = common.today_str(args.date)
+    incomes = read_recent_incomes(data_dir, today)
+    dupes = find_income_duplicates(model, incomes, today)
+    log_duplicates(dupes)
+
     page = build_page_data(model, balances)
-    html_text = build_html(model, balances, page, sources)
+    html_text = build_html(model, balances, page, sources, dupes)
 
     target = dashboard_dir / "index.html"
     if not args.live:
-        log.info("DRY-RUN: записал бы %s (%d символов)%s", target, len(html_text),
-                 "" if args.no_copy else f" и копию в {copy_dir}")
+        log.info("DRY-RUN: записал бы %s (%d символов)%s%s", target, len(html_text),
+                 "" if args.no_copy else f" и копию в {copy_dir}",
+                 f", публикация в {publish_dir}" if publish_dir else "")
         return EXIT_OK
 
     dashboard_dir.mkdir(parents=True, exist_ok=True)
@@ -843,6 +1215,17 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             # на VPS каталога Desktop нет — это не повод валить синк
             log.warning("Копия не сделана (%s): %s", copy_dir, exc)
+
+    if publish_dir is not None:
+        if not publish_dir.is_dir():
+            # каталог создаёт Антон ранбуком (Scripts/deploy/README.md) — сами не лезем в /var
+            log.warning("Публикация пропущена: каталога нет (%s)", publish_dir)
+        else:
+            try:
+                publish_dashboard(target, publish_dir)
+            except OSError as exc:
+                # нет прав / диск полон — рендер уже состоялся, синк не валим
+                log.warning("Публикация не удалась (%s): %s", publish_dir, exc)
 
     return EXIT_OK
 

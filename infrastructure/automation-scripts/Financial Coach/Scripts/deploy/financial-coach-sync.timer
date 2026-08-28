@@ -1,8 +1,10 @@
 [Unit]
-Description=Financial Coach sync — ежедневно в 08:30 по Москве
+Description=Financial Coach sync — ежедневно в 21:00 по Москве
 
 [Timer]
-OnCalendar=*-*-* 08:30:00
+# Вечерний прогон (решение Антона 2026-08-27): к вечеру банк-синк ПланФакта
+# успевает подтянуть дневные операции, поэтому цифры свежее утренних
+OnCalendar=*-*-* 21:00:00
 # Явная зона: не зависим от таймзоны сервера (нужен systemd >= 251, см. README)
 Timezone=Europe/Moscow
 Persistent=true

@@ -696,6 +696,52 @@ async def _typing_loop(bot, chat_id):
 
 
 # ---------------------------------------------------------------------------
+# Человеческий текст ошибки Claude (вместо сырого JSON/traceback в Telegram)
+# ---------------------------------------------------------------------------
+AUTH_ERROR_MARKERS = [
+    "failed to authenticate",
+    "oauth",
+    "session expired",
+    "could not be refreshed",
+]
+TIMEOUT_ERROR_MARKERS = ["timeout", "timed out"]
+OVERLOAD_ERROR_MARKERS = QUOTA_MARKERS + ["overloaded"]
+
+
+def human_error(raw: str) -> str:
+    """Превращает сырой вывод claude CLI (JSON или текст) в короткую человеческую фразу.
+
+    Сама функция ничего не логирует - вызывающий код пишет сырой `raw` в
+    лог-файл (logger.error) до или сразу после вызова.
+    """
+    text = str(raw or "")
+    low = text.lower()
+
+    if any(marker in low for marker in AUTH_ERROR_MARKERS):
+        return (
+            "Авторизация Claude на сервере протухла. "
+            "Прогони claude setup-token по ssh - и я вернусь."
+        )
+    if any(marker in low for marker in TIMEOUT_ERROR_MARKERS):
+        return "Думала слишком долго и не успела. Попробуй ещё раз."
+    if any(marker in low for marker in OVERLOAD_ERROR_MARKERS):
+        return "Claude сейчас перегружен или упёрся в лимит. Подожди немного и повтори."
+
+    core = text
+    try:
+        parsed = json.loads(text.strip()) if text.strip() else None
+        if isinstance(parsed, dict):
+            core = str(parsed.get("result") or parsed.get("error") or text)
+    except (json.JSONDecodeError, ValueError):
+        core = text
+
+    cleaned = re.sub(r'[{}\[\]"]', "", core)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    snippet = cleaned[:120] if cleaned else "неизвестная ошибка"
+    return f"Что-то сломалось на моей стороне: {snippet}. Полная ошибка в логе на сервере."
+
+
+# ---------------------------------------------------------------------------
 # Диалог с владельцем
 # ---------------------------------------------------------------------------
 async def _handle_result(bot, chat_id, first_msg, reply_text, new_sid, error_kind):
@@ -712,8 +758,8 @@ async def _handle_result(bot, chat_id, first_msg, reply_text, new_sid, error_kin
         )
         return
     if error_kind == "error":
-        for chunk in split_message("Ошибка Claude:\n" + (reply_text or "")):
-            await bot.send_message(chat_id=chat_id, text=chunk)
+        logger.error("Ошибка Claude (сырой вывод): %s", reply_text)
+        await bot.send_message(chat_id=chat_id, text=human_error(reply_text))
         return
 
     state = load_state()
@@ -741,24 +787,23 @@ async def _handle_result(bot, chat_id, first_msg, reply_text, new_sid, error_kin
         await bot.send_message(chat_id=chat_id, text=chunk)
 
 
-@owner_only
-async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message is None:
-        return
-    text = message.text or message.caption
-    if not text:
-        return
-    chat_id = update.effective_chat.id
-    bot = context.bot
+async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
+    """Один или несколько прогонов Claude для владельца, под claude_lock.
 
-    if claude_lock.locked():
-        pending_queue.append(text)
-        await bot.send_message(chat_id=chat_id, text="В очереди, сейчас занята")
-        return
+    initial_text=None - начать сразу с очереди (используется после батча и
+    вечернего прогона, когда своего сообщения нет). Если initial_text нет и
+    очередь пуста - тихо выходим, Claude не вызываем и замок не берём.
+
+    Вызывающий код НЕ должен уже держать claude_lock - функция берёт его сама.
+    """
+    if initial_text is None:
+        if not pending_queue:
+            return
+        current = pending_queue.popleft()
+    else:
+        current = initial_text
 
     async with claude_lock:
-        current = text
         while True:
             parts = [current]
             while pending_queue:
@@ -790,6 +835,25 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 current = pending_queue.popleft()
                 continue
             break
+
+
+@owner_only
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if message is None:
+        return
+    text = message.text or message.caption
+    if not text:
+        return
+    chat_id = update.effective_chat.id
+    bot = context.bot
+
+    if claude_lock.locked():
+        pending_queue.append(text)
+        await bot.send_message(chat_id=chat_id, text="В очереди, сейчас занята")
+        return
+
+    await run_owner_turn(bot, chat_id, text)
 
 
 # ---------------------------------------------------------------------------
@@ -834,65 +898,78 @@ async def batch_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Батч пропущен: Claude занят")
         return
 
-    async with claude_lock:
-        claims = claim_buffers()
-        if not claims:
-            logger.info("Батч: буферы пусты")
-            return
+    try:
+        async with claude_lock:
+            claims = claim_buffers()
+            if not claims:
+                logger.info("Батч: буферы пусты")
+                return
 
-        chats = []
-        for _path, chat_id, records in claims:
-            title = ""
-            for rec in records:
-                if rec.get("chat"):
-                    title = rec["chat"]
-            chats.append((chat_id, title, records))
+            chats = []
+            for _path, chat_id, records in claims:
+                title = ""
+                for rec in records:
+                    if rec.get("chat"):
+                        title = rec["chat"]
+                chats.append((chat_id, title, records))
 
-        prompt = build_batch_prompt(chats)
-        total = sum(len(r) for _c, _t, r in chats)
-        logger.info("Батч: чатов=%d сообщений=%d", len(chats), total)
+            prompt = build_batch_prompt(chats)
+            total = sum(len(r) for _c, _t, r in chats)
+            logger.info("Батч: чатов=%d сообщений=%d", len(chats), total)
 
-        reply_text, _sid, error_kind = await run_claude(prompt, None)
+            reply_text, _sid, error_kind = await run_claude(prompt, None)
 
-        if error_kind is not None:
-            logger.warning("Батч не удался (%s), возвращаю буферы", error_kind)
-            release_claims(claims, success=False)
-            return
+            if error_kind is not None:
+                logger.warning("Батч не удался (%s), возвращаю буферы", error_kind)
+                release_claims(claims, success=False)
+                return
 
-        release_claims(claims, success=True)
+            release_claims(claims, success=True)
 
-        state = load_state()
-        state["last_batch_at"] = now_iso()
-        save_state(state)
+            state = load_state()
+            state["last_batch_at"] = now_iso()
+            save_state(state)
 
-        message = interpret_batch_reply(reply_text)
-        if message is None:
-            logger.info("Батч: нечего сообщать (NOTHING)")
-            return
-        try:
-            await send_to_owner(context.bot, message)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Не смог отправить батч-сообщение: %s", exc)
+            message = interpret_batch_reply(reply_text)
+            if message is None:
+                logger.info("Батч: нечего сообщать (NOTHING)")
+                return
+            try:
+                await send_to_owner(context.bot, message)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Не смог отправить батч-сообщение: %s", exc)
+    finally:
+        # Замок к этому моменту уже освобождён (async with отработал).
+        # Если пока шёл батч владелец что-то написал в личку - разберём сейчас,
+        # а не будем ждать его следующего сообщения.
+        if pending_queue:
+            await run_owner_turn(context.bot, ALLOWED_USER, None)
 
 
 async def evening_job(context: ContextTypes.DEFAULT_TYPE):
-    async with claude_lock:
-        logger.info("Вечерний статус: старт")
-        reply_text, _sid, error_kind = await run_claude(build_evening_prompt(), None)
-        if error_kind is not None:
-            logger.warning("Вечерний статус не удался: %s", error_kind)
-            return
-        state = load_state()
-        state["last_evening_at"] = now_iso()
-        save_state(state)
-        text = (reply_text or "").strip()
-        if not text:
-            logger.info("Вечерний статус пустой, ничего не шлю")
-            return
-        try:
-            await send_to_owner(context.bot, text)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Не смог отправить вечерний статус: %s", exc)
+    try:
+        async with claude_lock:
+            logger.info("Вечерний статус: старт")
+            reply_text, _sid, error_kind = await run_claude(build_evening_prompt(), None)
+            if error_kind is not None:
+                logger.warning("Вечерний статус не удался: %s", error_kind)
+                return
+            state = load_state()
+            state["last_evening_at"] = now_iso()
+            save_state(state)
+            text = (reply_text or "").strip()
+            if not text:
+                logger.info("Вечерний статус пустой, ничего не шлю")
+                return
+            try:
+                await send_to_owner(context.bot, text)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Не смог отправить вечерний статус: %s", exc)
+    finally:
+        # Замок уже освобождён к этому моменту. Не оставляем очередь висеть до
+        # следующего входящего сообщения владельца.
+        if pending_queue:
+            await run_owner_turn(context.bot, ALLOWED_USER, None)
 
 
 # ---------------------------------------------------------------------------
