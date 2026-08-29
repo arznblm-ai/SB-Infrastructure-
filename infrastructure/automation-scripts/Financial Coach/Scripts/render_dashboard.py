@@ -35,6 +35,7 @@ import argparse
 import html
 import json
 import os
+import re
 import shutil
 from datetime import date as _date
 from datetime import timedelta
@@ -72,6 +73,10 @@ DUPE_TOLERANCE = 0.05
 DUPE_WINDOW_DAYS = 45
 #: глубина выборки фактических приходов из снапшота
 DUPE_LOOKBACK_DAYS = 90
+#: допуск по сумме при списании факта на запись received_log: |факт − actual| / actual.
+#: Специально жёстче DUPE_TOLERANCE (5%): здесь приход снимается с проверки целиком,
+#: и широкий допуск проглотил бы настоящий дубль, стоящий рядом по сумме.
+RECEIVED_LOG_TOLERANCE = 0.01
 
 log = common.get_logger("render")
 
@@ -96,10 +101,27 @@ def rich(value: Any) -> str:
     return str(value)
 
 
-def short_name(project: str, amount: float) -> str:
-    """'Френдс (личный гонорар)' + 300000 -> 'Френдс 300к' (для подписей в прогнозе)."""
-    base = project.split("(")[0].split("/")[0].strip()
-    return f"{base} {round(amount / 1000)}к"
+def base_name(project: str) -> str:
+    """'Брусника / Перспектива (юрлицо)' -> 'Брусника' (подпись строки в прогнозе)."""
+    return project.split("(")[0].split("/")[0].strip() or "проект"
+
+
+def short_expense_label(label: str) -> str:
+    """Ярлык разовой траты для ячейки расходов помесячной таблицы.
+
+    Правило детерминированное, model.json не трогаем: снимаем ведущие эмодзи, режем по
+    тире/скобке; если хвост про команду — «команда <проект>».
+      '✈️ Таиланд — билеты (оплачено 15.08)'  -> 'Таиланд'
+      'ВТБ Привилегия — команда 30%'          -> 'команда ВТБ Привилегия'
+    Одинаковые ярлыки в одном месяце JS складывает в одну строку («Таиланд 324 000»).
+    """
+    text = re.sub(r"^[\W_]+", "", str(label or "")).strip()
+    parts = re.split(r"\s+[—–-]\s+", text, maxsplit=1)
+    base = parts[0].split("(")[0].strip()
+    tail = parts[1] if len(parts) > 1 else ""
+    if "команд" in tail.lower():
+        return f"команда {base}".strip()
+    return base or "разовая трата"
 
 
 # --- данные ------------------------------------------------------------------
@@ -263,6 +285,80 @@ def month_start(month_key: Any) -> _date | None:
         return None
 
 
+MONTHS_RU = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+
+
+def next_month(day: _date) -> _date:
+    """Первое число следующего месяца."""
+    return _date(day.year + day.month // 12, day.month % 12 + 1, 1)
+
+
+def days_in_month(day: _date) -> int:
+    return (next_month(day) - _date(day.year, day.month, 1)).days
+
+
+def month_key(day: _date) -> str:
+    return f"{day.year:04d}-{day.month:02d}"
+
+
+def month_label(day: _date, base_year: int) -> str:
+    """«Сентябрь», а для соседнего года — «Январь 2027»."""
+    name = MONTHS_RU[day.month - 1]
+    return name if day.year == base_year else f"{name} {day.year}"
+
+
+def build_forecast_months(model: dict, as_of: _date) -> list[dict[str, Any]]:
+    """Состав и окно месяцев прогноза считаются кодом от даты снапшота.
+
+    Живой остаток уже отражает всё потраченное с начала месяца, поэтому у первого
+    (текущего) месяца списывается только хвост: burn × days_left / days_total.
+    `forecast.months` в модели остаётся слоем подписей: если ключ там есть, берём
+    оттуда label, окно и состав не берём никогда (иначе оно застывает на дате,
+    когда модель писали руками, — так в августе 2026 прогноз списывал 20 дней
+    вместо 3). Месяцы раньше месяца снапшота в прогноз не попадают.
+    """
+    forecast = model.get("forecast", {}) or {}
+    overrides: dict[str, dict[str, Any]] = {}
+    for item in forecast.get("months", []) or []:
+        key = item.get("key")
+        if key:
+            overrides[str(key)] = item
+
+    end: _date | None = None
+    raw_end = forecast.get("horizon_end")
+    if raw_end:
+        try:
+            end = _date.fromisoformat(str(raw_end)[:10])
+        except ValueError:
+            log.warning("forecast.horizon_end нечитаем (%s) — горизонт беру из списка месяцев", raw_end)
+    if end is None and overrides:
+        end = month_start(sorted(overrides)[-1])
+    if end is None or end < as_of:
+        end = as_of
+
+    months: list[dict[str, Any]] = []
+    cursor = _date(as_of.year, as_of.month, 1)
+    last = _date(end.year, end.month, 1)
+    while cursor <= last:
+        key = month_key(cursor)
+        override = overrides.get(key) or {}
+        entry: dict[str, Any] = {
+            "key": key,
+            "label": override.get("label") or month_label(cursor, as_of.year),
+        }
+        if not months:
+            total = days_in_month(cursor)
+            entry["days_total"] = total
+            # день снапшота не досчитываем: его траты уже сидят в живом остатке
+            entry["days_left"] = max(total - as_of.day, 0)
+        months.append(entry)
+        cursor = next_month(cursor)
+    return months
+
+
 def model_income_rows(model: dict) -> list[dict[str, Any]]:
     """Строки прогноза, которые сторож проверяет: confirmed_income + pipeline (тумблеры)."""
     rows: list[dict[str, Any]] = []
@@ -273,6 +369,7 @@ def model_income_rows(model: dict) -> list[dict[str, Any]]:
             "amount": item.get("amount", 0) or 0,
             "month": item.get("month"),
             "received": bool(item.get("received")),
+            "dupe_note": (item.get("dupe_note") or "").strip(),
             "kind": "confirmed",
         })
     for item in model.get("pipeline", []):
@@ -282,9 +379,59 @@ def model_income_rows(model: dict) -> list[dict[str, Any]]:
             "amount": item.get("estimate", 0) or 0,
             "month": item.get("month"),
             "received": bool(item.get("received")),
+            "dupe_note": (item.get("dupe_note") or "").strip(),
             "kind": "pipeline",
         })
     return rows
+
+
+def settled_operation_ids(model: dict, ops: list[dict[str, Any]]) -> set[Any]:
+    """id приходов, уже разнесённых по проектам (model.received_log) — их сторож не смотрит.
+
+    Мотив: сторож сверяет прогнозные строки со ВСЕМИ приходами снапшота и не знает,
+    какие из них уже привязаны к проекту и сняты в факт. 27.08 это дало две ложные
+    тревоги: приход «Джи Джи» 559 130 (это Балтика) поймал строку «Зелёная Линия»
+    557 865, приход «Дабл» 784 822 (это Сбер Прайм) — строку «Брусника» 801 875.
+
+    Матчинг записи received_log с приходом: дата ТОЧНАЯ + сумма в пределах
+    RECEIVED_LOG_TOLERANCE (1%, не 5%). Одна запись снимает максимум один приход:
+    если в тот же день пришли два одинаковых платежа, второй остаётся в проверке —
+    именно он и был бы настоящим задвоением.
+    """
+    entries = model.get("received_log")
+    if not isinstance(entries, list) or not entries:
+        return set()
+
+    settled: set[Any] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        date_str = str(entry.get("date") or "")[:10]
+        try:
+            actual = float(entry.get("actual"))
+        except (TypeError, ValueError):
+            actual = 0.0
+        if not date_str or actual <= 0:
+            log.debug("received_log: запись пропущена (дата %r, actual %r)",
+                      entry.get("date"), entry.get("actual"))
+            continue
+        best: tuple[float, Any] | None = None
+        for op in ops:
+            if op["operation_id"] in settled:
+                continue
+            if op["date"] != date_str:
+                continue
+            delta = abs(op["value"] - actual) / actual
+            if delta > RECEIVED_LOG_TOLERANCE:
+                continue
+            if best is None or delta < best[0]:
+                best = (delta, op["operation_id"])
+        if best is None:
+            log.debug("received_log: приход не найден в снапшоте (%s, %s, %s ₽)",
+                      date_str, entry.get("project"), round(actual))
+            continue
+        settled.add(best[1])
+    return settled
 
 
 def find_income_duplicates(model: dict, incomes: dict[str, Any], today: str) -> dict[str, Any]:
@@ -296,10 +443,13 @@ def find_income_duplicates(model: dict, incomes: dict[str, Any], today: str) -> 
     Строки с received=true проверяются первыми — для них совпадение означает
     «подтверждено фактом» (зелёный статус), а не подозрение на задвоение.
     Один фактический приход закрывает максимум одну строку.
+    Приходы, уже разнесённые по проектам (model.received_log), из выборки исключаются
+    целиком — иначе сторож ловит их повторно и даёт ложные тревоги.
     """
     report: dict[str, Any] = {
         "suspects": [], "confirmed": [], "checked_rows": 0,
         "ops_count": len(incomes.get("ops") or []),
+        "excluded_count": 0,
         "problem": incomes.get("problem"),
         "since": incomes.get("since"),
         "snapshot": incomes.get("snapshot"),
@@ -307,6 +457,14 @@ def find_income_duplicates(model: dict, incomes: dict[str, Any], today: str) -> 
     ops = incomes.get("ops") or []
     if not ops:
         return report
+
+    settled = settled_operation_ids(model, ops)
+    if settled:
+        ops = [op for op in ops if op["operation_id"] not in settled]
+        report["excluded_count"] = len(settled)
+        report["ops_count"] = len(ops)
+        if not ops:
+            return report
 
     today_obj = _date.fromisoformat(today)
     rows = model_income_rows(model)
@@ -358,6 +516,10 @@ def log_duplicates(report: dict[str, Any]) -> None:
     if report.get("problem"):
         log.warning("Сторож задвоения: not verified — %s", report["problem"])
         return
+    if report.get("excluded_count"):
+        log.info("Сторож задвоения: исключено из сверки как уже разнесённые: %s приходов "
+                 "(received_log, дата точная + сумма ±%.0f%%)",
+                 report["excluded_count"], RECEIVED_LOG_TOLERANCE * 100)
     log.info("Сторож задвоения: проверено строк %s против %s фактических приходов с %s "
              "(допуск %.0f%%, окно −%s дн от месяца строки)",
              report["checked_rows"], report["ops_count"], report["since"],
@@ -371,9 +533,10 @@ def log_duplicates(report: dict[str, Any]) -> None:
     for m in report["suspects"]:
         op, row = m["op"], m["row"]
         log.warning("ВОЗМОЖНОЕ ЗАДВОЕНИЕ: строка прогноза «%s» (%s ₽) похожа на уже пришедший "
-                    "платёж: %s, %s, %s ₽ — проверь задвоение",
+                    "платёж: %s, %s, %s ₽ — проверь задвоение%s",
                     row["project"], round(row["amount"]), op["date"], op["contragent"],
-                    round(op["value"]))
+                    round(op["value"]),
+                    f' | пометка модели: {row["dupe_note"]}' if row.get("dupe_note") else "")
     if not report["suspects"] and not report["confirmed"]:
         log.info("Сторож задвоения: совпадений нет")
 
@@ -399,8 +562,11 @@ def team_detail_map(model: dict) -> dict[str, str]:
     return {k: " + ".join(v) for k, v in grouped.items()}
 
 
-def build_page_data(model: dict, balances: dict[str, Any]) -> dict[str, Any]:
-    """JSON-блок для JS: всё, от чего считается прогноз (вёрстка отдельно)."""
+def build_page_data(model: dict, balances: dict[str, Any], as_of: _date) -> dict[str, Any]:
+    """JSON-блок для JS: всё, от чего считается прогноз (вёрстка отдельно).
+
+    `as_of` — дата снапшота живых остатков: от неё считается окно первого месяца.
+    """
     start = balances["liquid_total"]
     if start is None:
         start = (model.get("accounts", {}).get("handoff_reference", {}) or {}).get("liquid_total", 0)
@@ -424,11 +590,17 @@ def build_page_data(model: dict, balances: dict[str, Any]) -> dict[str, Any]:
             })
         return tid
 
+    # проекты, где команда гасится графиком (one_off), а не удерживается из прихода:
+    # «чистыми» у них несопоставимо с остальными строками — помечаем сноской
+    scheduled = {
+        d.get("project") for d in model.get("team_debts", []) if d.get("paid_by_schedule")
+    }
+
     for item in model.get("confirmed_income", []):
         tid = push_toggle(item.get("toggle"), "confirmed")
         flows.append({
             "id": item.get("id"),
-            "name": short_name(item.get("project", "?"), item.get("amount", 0)),
+            "title": base_name(item.get("project", "?")),
             "revenue": item.get("amount", 0),
             "tax": item.get("tax", 0),
             "team": item.get("team_debt", 0),
@@ -436,12 +608,13 @@ def build_page_data(model: dict, balances: dict[str, Any]) -> dict[str, Any]:
             "alt_month": item.get("alt_month"),
             "toggle": tid,
             "kind": "confirmed",
+            "schedule": item.get("project") in scheduled,
         })
     for item in model.get("pipeline", []):
         tid = push_toggle(item.get("toggle"), "pipeline")
         flows.append({
             "id": item.get("id"),
-            "name": short_name(item.get("project", "?"), item.get("estimate", 0)),
+            "title": base_name(item.get("project", "?")),
             "revenue": item.get("estimate", 0),
             "tax": item.get("tax", 0),
             "team": item.get("team_cost", 0),
@@ -449,6 +622,7 @@ def build_page_data(model: dict, balances: dict[str, Any]) -> dict[str, Any]:
             "alt_month": None,
             "toggle": tid,
             "kind": "pipeline",
+            "schedule": item.get("project") in scheduled,
         })
 
     crypto = model.get("crypto_reference", {}) or {}
@@ -458,89 +632,152 @@ def build_page_data(model: dict, balances: dict[str, Any]) -> dict[str, Any]:
         "start_verified": balances["verified"],
         "salary": model.get("salary_monthly", 400000),
         "opex": model.get("opex", {"default": 50000, "min": 30000, "max": 200000, "step": 10000}),
-        "months": model.get("forecast", {}).get("months", []),
+        "months": build_forecast_months(model, as_of),
         "flows": flows,
         "toggles": toggles,
-        "one_offs": model.get("one_off_expenses", []),
-        "tax_one_off": model.get("tax_rules", {}).get("one_off", []),
+        # в JS уезжает только то, что нужно счёту и подписи (id, короткий ярлык, месяц,
+        # стартовая сумма) — полные подписи и комментарии рендерит Python в детализации
+        "one_offs": [
+            {
+                "id": o.get("id"),
+                "short": short_expense_label(o.get("label", "")),
+                "month": o.get("month"),
+                "amount": o.get("amount", 0),
+            }
+            for o in model.get("one_off_expenses", [])
+        ],
+        "tax_one_off": [
+            {"label": t.get("label", "налог"), "month": t.get("month"), "amount": t.get("amount", 0)}
+            for t in model.get("tax_rules", {}).get("one_off", [])
+        ],
         "crypto_rub": crypto.get("rub_estimate", 0),
         "runway_variants": model.get("runway_variants", []),
     }
 
 
 # --- вёрстка -----------------------------------------------------------------
+# Структура страницы (решение Антона 28.08, жалоба «оформлено плохо и непонятно»):
+#   1) три крупных числа: на счетах / ближайший приход / остаток на конец года;
+#   2) сценарии — компактный ряд тумблеров;
+#   3) помесячная таблица — главный блок (приходы ЧИСТЫМИ списком, расходы с разбивкой);
+#   4) вердикт;
+#   5) всё остальное — свёрнутые <details>.
+# Правило подачи сумм (CLAUDE.md департамента): ни одной суммы без пометки «смета»
+# или «чистыми»; цепочка смета → команде → налог → чистыми живёт в детализации.
+# Считает по-прежнему JS на странице, данные — в <script id="model-data">.
 
 
 CSS = """
-  :root {
-    --bg: #fafaf7; --card: #ffffff; --card-sec: #f2f0e9;
-    --text: #1a1a1a; --text-sec: #6b6b6b; --text-ter: #9a9a9a; --border: #e5e2d9;
-    --ok-bg: #e8f3e8; --ok-text: #2e7d32;
-    --warn-bg: #fdf3d8; --warn-text: #a86400;
-    --danger-bg: #fce4e4; --danger-text: #b52020;
-    --info-bg: #e3edf7; --info-text: #2a5a94;
-    --radius: 8px;
+  :root{--bg:#faf9f6;--card:#fff;--soft:#f4f2ec;--text:#17181a;--muted:#6c6e72;--faint:#9b9da1;
+    --line:#e9e6dd;--ok-bg:#e9f4ea;--ok:#2b7a33;--warn-bg:#fdf2d6;--warn:#8f5606;
+    --bad-bg:#fce6e3;--bad:#b32d20;--info-bg:#e7eff9;--info:#27548c;--r:12px}
+  *{box-sizing:border-box}
+  body{margin:0;padding:20px 16px 44px;background:var(--bg);color:var(--text);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+  .wrap{max-width:960px;margin:0 auto}
+  h1{font-size:19px;font-weight:600;margin:0 0 4px}
+  .sub{font-size:13px;color:var(--muted)}
+  .stitle{font-size:11.5px;font-weight:600;color:var(--faint);text-transform:uppercase;
+    letter-spacing:.08em;margin:26px 0 10px}
+  .hint{font-size:12.5px;color:var(--faint);line-height:1.55}
+  .note{font-size:13px;color:var(--muted);margin-top:10px;line-height:1.6}
+  .num{font-variant-numeric:tabular-nums}
+  sup{font-size:10px;color:var(--warn)}
+  .tag{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:9px;
+    background:var(--soft);color:var(--muted)}
+  .hero{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0 6px}
+  .hero .box{background:var(--card);border-radius:var(--r);padding:16px 18px 15px}
+  .hero .k{font-size:12.5px;color:var(--muted);margin-bottom:7px}
+  .hero .v{font-size:32px;font-weight:650;letter-spacing:-.02em;line-height:1.12;
+    font-variant-numeric:tabular-nums;white-space:nowrap}
+  .hero .n{font-size:12.5px;color:var(--faint);margin-top:7px;line-height:1.5}
+  .v-ok{color:var(--ok)}.v-warn{color:var(--warn)}.v-bad{color:var(--bad)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:8px;background:var(--card);
+    border:1px solid var(--line);border-radius:999px;padding:8px 14px;font-size:13.5px;
+    color:var(--muted);cursor:pointer;-webkit-user-select:none;user-select:none}
+  .chip input{width:15px;height:15px;margin:0;accent-color:var(--info);flex:none}
+  .chip.on{background:var(--info-bg);border-color:#cfdcee;color:var(--text)}
+  .chip-alt{border-style:dashed}
+  .panel{background:var(--card);border-radius:var(--r);overflow:hidden}
+  .months{width:100%;border-collapse:collapse}
+  .months th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);
+    font-weight:600;text-align:left;padding:12px 14px 8px}
+  .months th.r{text-align:right}
+  .months td{padding:14px;border-top:1px solid var(--line);vertical-align:top}
+  .months td.r{text-align:right}
+  .months .mname{font-weight:600;font-size:15.5px}
+  .months .amt{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .months .zero{color:var(--faint);font-weight:400}
+  .months .lst{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.7}
+  .months tr.year td{background:var(--soft)}
+  details{background:var(--card);border-radius:var(--r);margin-top:10px;overflow:hidden}
+  summary{cursor:pointer;list-style:none;padding:14px 16px;font-size:14.5px;font-weight:600;
+    display:flex;align-items:center;justify-content:space-between;gap:10px}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"▾";font-size:11px;color:var(--faint);font-weight:400}
+  details[open]>summary::after{content:"▴"}
+  .dbody{padding:0 16px 18px}
+  .scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
+  table.data{width:100%;border-collapse:collapse;font-size:14px;min-width:560px}
+  table.data th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);
+    font-weight:600;text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  table.data th.r,table.data td.r{text-align:right}
+  table.data td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.data td.r{white-space:nowrap}
+  table.data td.r .details{white-space:normal}
+  table.data tr:last-child td{border-bottom:0}
+  table.data tr.total td{background:var(--soft);font-weight:600}
+  .details{font-size:11.5px;color:var(--faint);line-height:1.5;margin-top:3px}
+  .pill{display:inline-block;font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:10px;
+    text-transform:uppercase;letter-spacing:.04em}
+  .p-ok{background:var(--ok-bg);color:var(--ok)}
+  .p-warn{background:var(--warn-bg);color:var(--warn)}
+  .p-crit{background:var(--bad-bg);color:var(--bad)}
+  .bal-ok{color:var(--ok)}.bal-warn{color:var(--warn)}.bal-crit{color:var(--bad)}
+  .srow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 0;border-bottom:1px solid var(--line)}
+  .srow:last-child{border-bottom:0}
+  .slabel{font-size:13.5px;color:var(--muted);flex:1 1 190px;min-width:150px}
+  .sval{font-size:14.5px;font-weight:600;text-align:right;min-width:100px;font-variant-numeric:tabular-nums}
+  input[type=range]{flex:1 1 100%;min-width:170px;accent-color:var(--info)}
+  .verdict{margin-top:12px;border-radius:var(--r);padding:14px 16px;font-size:14.5px;line-height:1.55}
+  .v-good{background:var(--ok-bg);color:var(--ok)}
+  .v-mid{background:var(--warn-bg);color:var(--warn)}
+  .v-crit{background:var(--bad-bg);color:var(--bad)}
+  .flag{font-size:13px;line-height:1.6;margin-top:10px;padding:10px 12px;border-radius:8px;
+    background:var(--warn-bg);color:var(--warn)}
+  .alarm{background:var(--warn-bg)}
+  .alarm>summary{color:var(--warn)}
+  .dupe{font-size:13.5px;line-height:1.6}
+  .dupe ul{margin:6px 0 0;padding-left:18px}
+  .dupe li+li{margin-top:6px}
+  .dupe-h{font-weight:600;margin-top:10px}
+  .dupe-ok{color:var(--ok)}
+  .dupe-note{font-size:12px;color:var(--faint);margin-top:8px;line-height:1.55}
+  .kv{display:flex;justify-content:space-between;gap:14px;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .kv:last-child{border-bottom:0}
+  .kv span:last-child{font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+  .chart{position:relative;height:180px;padding:14px 6px 24px;margin-top:4px}
+  .chart-grid{position:absolute;left:46px;right:6px;top:14px;bottom:24px}
+  .chart-x{position:absolute;left:46px;right:6px;bottom:2px;display:flex;justify-content:space-between;
+    font-size:10.5px;color:var(--faint)}
+  .chart-y{position:absolute;left:0;top:14px;bottom:24px;width:42px;display:flex;flex-direction:column;
+    justify-content:space-between;align-items:flex-end;font-size:10.5px;color:var(--faint)}
+  footer{margin-top:26px;font-size:12.5px;color:var(--faint);line-height:1.7}
+  @media (max-width:720px){
+    .hero{grid-template-columns:1fr;gap:10px}
+    .panel{background:transparent;border-radius:0;overflow:visible}
+    .months,.months tbody,.months tr,.months td{display:block;width:100%}
+    .months thead{display:none}
+    .months tr{background:var(--card);border-radius:var(--r);padding:12px 14px;margin-bottom:10px}
+    .months td{border-top:0;padding:8px 0;text-align:left}
+    .months td.r{text-align:left}
+    .months td+td{border-top:1px solid var(--line)}
+    .months td::before{content:attr(data-l);display:block;font-size:11px;text-transform:uppercase;
+      letter-spacing:.05em;color:var(--faint);margin-bottom:3px}
+    .months td:first-child::before{display:none}
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5; }
-  .wrap { max-width: 1000px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 4px; font-weight: 600; }
-  .subtitle { font-size: 12px; color: var(--text-sec); margin-bottom: 20px; }
-  .stitle { font-size: 12px; font-weight: 600; color: var(--text-sec); text-transform: uppercase; letter-spacing: .07em; margin: 22px 0 10px; }
-  .divider { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
-  .g4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-  .g3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
-  .clabel { font-size: 11px; color: var(--text-sec); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .05em; }
-  .cval { font-size: 20px; font-weight: 600; }
-  .cval-lg { font-size: 28px; font-weight: 700; }
-  .csub { font-size: 11px; color: var(--text-sec); margin-top: 3px; }
-  .card-warn { background: var(--warn-bg); border-color: transparent; }
-  .card-warn .cval, .card-warn .cval-lg { color: var(--warn-text); }
-  .card-danger { background: var(--danger-bg); border-color: transparent; }
-  .card-danger .cval, .card-danger .cval-lg { color: var(--danger-text); }
-  .card-ok { background: var(--ok-bg); border-color: transparent; }
-  .card-ok .cval, .card-ok .cval-lg { color: var(--ok-text); }
-  .card-info { background: var(--info-bg); border-color: transparent; }
-  .card-info .cval, .card-info .cval-lg { color: var(--info-text); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { font-size: 11px; font-weight: 500; color: var(--text-sec); text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); text-transform: uppercase; letter-spacing: .04em; }
-  th.r { text-align: right; }
-  td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  td.r { text-align: right; }
-  tr.total td { background: var(--card-sec); font-weight: 600; }
-  .pill { display: inline-block; font-size: 10px; font-weight: 600; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; letter-spacing: .04em; }
-  .p-ok { background: var(--ok-bg); color: var(--ok-text); }
-  .p-warn { background: var(--warn-bg); color: var(--warn-text); }
-  .p-info { background: var(--info-bg); color: var(--info-text); }
-  .p-crit { background: var(--danger-bg); color: var(--danger-text); }
-  .srow { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
-  .slabel { font-size: 13px; color: var(--text-sec); min-width: 190px; }
-  .sval { font-size: 14px; font-weight: 600; min-width: 110px; text-align: right; }
-  input[type="range"] { flex: 1; min-width: 200px; accent-color: var(--info-text); }
-  .toggle-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; color: var(--text-sec); }
-  .toggle-row input { width: 16px; height: 16px; accent-color: var(--info-text); }
-  .toggle-pipeline { background: #f7f4ee; padding: 6px 8px; border-radius: 6px; }
-  .bal-ok { color: var(--ok-text); font-weight: 600; }
-  .bal-warn { color: var(--warn-text); font-weight: 600; }
-  .bal-crit { color: var(--danger-text); font-weight: 600; }
-  .note { font-size: 11px; color: var(--text-sec); line-height: 1.6; margin-top: 8px; }
-  .flag { font-size: 11px; line-height: 1.6; margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: var(--warn-bg); color: var(--warn-text); }
-  .dupe { margin: 0 0 18px; padding: 12px 14px; border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-text); font-size: 13px; line-height: 1.6; }
-  .dupe .dupe-h { font-weight: 700; margin-bottom: 6px; }
-  .dupe ul { margin: 0; padding-left: 18px; }
-  .dupe li + li { margin-top: 6px; }
-  .dupe .dupe-note { font-size: 11px; opacity: .8; margin-top: 8px; }
-  .dupe-ok { background: var(--ok-bg); color: var(--ok-text); }
-  .details { font-size: 10px; color: var(--text-ter); margin-top: 3px; }
-  .chart { position: relative; height: 210px; padding: 20px 10px 30px; margin-top: 12px; }
-  .chart-grid { position: absolute; left: 50px; right: 10px; top: 20px; bottom: 30px; }
-  .chart-x { position: absolute; left: 50px; right: 10px; bottom: 5px; display: flex; justify-content: space-between; font-size: 10px; color: var(--text-ter); }
-  .chart-y { position: absolute; left: 0; top: 20px; bottom: 30px; width: 44px; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; font-size: 10px; color: var(--text-ter); }
-  .trip-row td { background: #fdf3d8; }
-  .crm td { background: #f7f4ee; }
-  footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 11px; color: var(--text-ter); line-height: 1.7; }
-  @media (max-width: 760px) { .g4, .g3 { grid-template-columns: 1fr 1fr; } body { padding: 14px; } }
+  @media (max-width:400px){ body{padding:16px 12px 40px} .hero .v{font-size:28px} }
 """
 
 
@@ -550,6 +787,7 @@ const D = JSON.parse(document.getElementById('model-data').textContent);
 const fmt  = (v) => (v < 0 ? '−' : '') + Math.abs(Math.round(v)).toLocaleString('ru') + ' ₽';
 const fmtK = (v) => (v < 0 ? '−' : '') + Math.round(Math.abs(v) / 1000) + 'к';
 const fc   = (v) => v >= 800000 ? 'bal-ok' : v >= 200000 ? 'bal-warn' : 'bal-crit';
+const hc   = (v) => v >= 800000 ? 'v-ok'   : v >= 0      ? 'v-warn'   : 'v-bad';
 const pill = (v) => v >= 800000 ? '<span class="pill p-ok">стабильно</span>'
                   : v >= 200000 ? '<span class="pill p-warn">напряжённо</span>'
                   : v >= 0      ? '<span class="pill p-warn">тонко</span>'
@@ -565,7 +803,7 @@ const toggleState = () => {
 function compute(opex, oneOffs, toggles) {
   const salary = D.salary;
   const byMonth = {};
-  D.months.forEach(m => { byMonth[m.key] = { income: 0, out: 0, notes: [] }; });
+  D.months.forEach(m => { byMonth[m.key] = { income: 0, out: 0, items: [] }; });
 
   D.flows.forEach(f => {
     const spec = D.toggles.find(t => t.id === f.toggle);
@@ -579,47 +817,58 @@ function compute(opex, oneOffs, toggles) {
     if (!byMonth[month]) return;
     byMonth[month].income += f.revenue;
     byMonth[month].out += f.tax + f.team;
-    byMonth[month].notes.push('+' + f.name);
+    byMonth[month].items.push({
+      title: f.title, net: f.revenue - f.tax - f.team,
+      schedule: !!f.schedule, kind: f.kind,
+    });
   });
 
   const rows = [];
   let bal = D.start_balance;
   const balances = [bal];
-  let minBal = bal, minMonth = 'старт';
+  let minBal = bal, minMonth = 'старт', yearIn = 0, yearOut = 0;
 
   D.months.forEach(m => {
     const bucket = byMonth[m.key];
-    const factor = m.days_left && m.days_total ? m.days_left / m.days_total : 1;
+    // days_left === 0 (снапшот в последний день месяца) — тоже валидное окно, не «нет окна»
+    const factor = (m.days_total && m.days_left != null) ? m.days_left / m.days_total : 1;
     const fixed = Math.round((salary + opex) * factor);
     let out = bucket.out + fixed;
-    const notes = bucket.notes.slice();
-    if (factor < 1) {
-      notes.push('−ЗП+опекс (' + m.days_left + ' дн)');
-    } else {
-      notes.push('−ЗП ' + Math.round(salary / 1000) + 'к', '−опекс ' + Math.round(opex / 1000) + 'к');
-    }
+
+    const exp = [];
+    const push = (name, amount) => {
+      const hit = exp.find(e => e.name === name);
+      if (hit) hit.amount += amount; else exp.push({ name: name, amount: amount });
+    };
+    push(factor < 1 ? 'burn (ЗП + операционка), ' + m.days_left + ' дн' : 'burn (ЗП + операционка)', fixed);
 
     D.one_offs.forEach(o => {
       const value = oneOffs[o.id];
-      if (o.month === m.key && value > 0) {
-        out += value;
-        notes.push('−' + o.label.replace(/\s*\(.*$/, '') + ' ' + Math.round(value / 1000) + 'к');
-      }
+      if (o.month === m.key && value > 0) { out += value; push(o.short, value); }
     });
     D.tax_one_off.forEach(t => {
-      if (t.month === m.key && t.amount) {
-        out += t.amount;
-        notes.push('−налог ' + Math.round(t.amount / 1000) + 'к');
-      }
+      if (t.month === m.key && t.amount) { out += t.amount; push(t.label, t.amount); }
     });
 
     bal = bal + bucket.income - out;
     balances.push(bal);
     if (bal < minBal) { minBal = bal; minMonth = m.label; }
-    rows.push({ label: m.label, income: bucket.income, out: out, bal: bal, notes: notes });
+
+    // «Приходы» в таблице показываются ЧИСТЫМИ, поэтому налог и выплаты команде по этим же
+    // проектам не дублируются в колонке расходов. Сам баланс от перестановки не меняется.
+    const projOut = bucket.out;
+    const incomeNet = bucket.income - projOut;
+    const outShown = out - projOut;
+    yearIn += incomeNet; yearOut += outShown;
+
+    rows.push({
+      label: m.label, sub: factor < 1 ? 'остаток месяца: ' + m.days_left + ' дн.' : '',
+      items: bucket.items, incomeNet: incomeNet, exp: exp, outShown: outShown, bal: bal,
+    });
   });
 
-  return { rows, balances, minBal, minMonth, final: bal, monthlyBurn: salary + opex };
+  return { rows, balances, minBal, minMonth, final: bal, monthlyBurn: salary + opex,
+           yearIn: yearIn, yearOut: yearOut };
 }
 
 function drawChart(balances) {
@@ -635,11 +884,18 @@ function drawChart(balances) {
   el('chart-grid').innerHTML =
     '<svg viewBox="0 0 100 100" preserveAspectRatio="none" style="width:100%;height:100%;">' +
     '<line x1="0" y1="' + zeroY + '" x2="100" y2="' + zeroY + '" stroke="#c9c5b8" stroke-width="0.3" stroke-dasharray="1.5 1.5"/>' +
-    '<path d="' + path + '" fill="none" stroke="#2a5a94" stroke-width="0.8" vector-effect="non-scaling-stroke"/>' +
+    '<path d="' + path + '" fill="none" stroke="#27548c" stroke-width="0.8" vector-effect="non-scaling-stroke"/>' +
     pts.map(p => '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="1.6" fill="' +
-      (p[2] >= 200000 ? '#2e7d32' : (p[2] >= 0 ? '#a86400' : '#b52020')) + '"/>').join('') +
+      (p[2] >= 200000 ? '#2b7a33' : (p[2] >= 0 ? '#8f5606' : '#b32d20')) + '"/>').join('') +
     '</svg>';
 }
+
+const incomeList = (items) => !items.length ? '' : '<div class="lst">' + items.map(i =>
+  '<div>' + i.title + ' ' + fmt(i.net) + ' чистыми' + (i.schedule ? '<sup>*</sup>' : '') +
+  (i.kind === 'pipeline' ? ' <span class="tag">сценарий</span>' : '') + '</div>').join('') + '</div>';
+
+const expenseList = (items) => '<div class="lst">' + items.map(e =>
+  '<div>' + e.name + ' ' + fmt(e.amount) + '</div>').join('') + '</div>';
 
 function render() {
   const opex = parseInt(el('opex').value, 10);
@@ -657,6 +913,11 @@ function render() {
   });
 
   const toggles = toggleState();
+  D.toggles.forEach(t => {
+    const chip = el('chip-' + t.id);
+    if (chip) chip.className = 'chip' + (t.kind === 'pipeline' ? ' chip-alt' : '') + (toggles[t.id] ? ' on' : '');
+  });
+
   const r = compute(opex, oneOffs, toggles);
 
   const tbody = el('tbody');
@@ -664,27 +925,37 @@ function render() {
   r.rows.forEach(row => {
     const tr = document.createElement('tr');
     tr.innerHTML =
-      '<td>' + row.label + '</td>' +
-      '<td class="r">' + (row.income ? '+' + fmt(row.income) : '—') + '</td>' +
-      '<td class="r">−' + fmt(row.out) + '<div class="details">' + row.notes.join(' · ') + '</div></td>' +
-      '<td class="r ' + fc(row.bal) + '">' + fmt(row.bal) + '</td>' +
-      '<td>' + pill(row.bal) + '</td>';
+      '<td data-l="Месяц"><div class="mname">' + row.label + '</div>' +
+        (row.sub ? '<div class="hint">' + row.sub + '</div>' : '') + '</td>' +
+      '<td data-l="Приходы, чистыми" class="r"><div class="amt' + (row.incomeNet ? '' : ' zero') + '">' +
+        (row.incomeNet ? '+' + fmt(row.incomeNet) : '—') + '</div>' + incomeList(row.items) + '</td>' +
+      '<td data-l="Расходы" class="r"><div class="amt">−' + fmt(row.outShown) + '</div>' +
+        expenseList(row.exp) + '</td>' +
+      '<td data-l="Остаток на конец" class="r"><div class="amt ' + fc(row.bal) + '">' + fmt(row.bal) + '</div>' +
+        '<div class="lst">' + pill(row.bal) + '</div></td>';
     tbody.appendChild(tr);
   });
 
-  const setKpi = (id, valId, subId, value, cls, sub) => {
-    el(id).className = 'card ' + cls;
-    el(valId).textContent = value;
-    if (subId && sub !== undefined) el(subId).textContent = sub;
-  };
-  setKpi('kpi-min', 'kpi-min-val', 'kpi-min-sub', fmt(r.minBal),
-    r.minBal >= 300000 ? 'card-ok' : (r.minBal >= 0 ? 'card-warn' : 'card-danger'), r.minMonth);
-  setKpi('kpi-dec', 'kpi-dec-val', null, fmt(r.final),
-    r.final >= 800000 ? 'card-ok' : (r.final >= 0 ? 'card-warn' : 'card-danger'));
-  const growth = r.final - D.start_balance;
-  setKpi('kpi-flow', 'kpi-flow-val', 'kpi-flow-sub', (growth >= 0 ? '+' : '') + fmt(growth),
-    growth >= 500000 ? 'card-ok' : (growth >= 0 ? 'card-warn' : 'card-danger'),
-    'от старта ' + fmt(D.start_balance));
+  el('year-in').textContent = '+' + fmt(r.yearIn);
+  el('year-out').textContent = '−' + fmt(r.yearOut);
+  el('year-bal').textContent = fmt(r.final);
+  el('year-bal').className = 'amt ' + fc(r.final);
+
+  const next = r.rows.find(x => x.items.length);
+  if (next) {
+    const top = next.items.slice().sort((a, b) => b.net - a.net)[0];
+    el('hero-next-val').textContent = fmt(top.net);
+    el('hero-next-val').className = 'v num';
+    let sub = top.title + ' · ' + next.label.toLowerCase() + ' · чистыми' + (top.schedule ? ' (команда графиком)' : '');
+    if (next.items.length > 1) sub += ' · всего в месяце ' + fmt(next.incomeNet) + ' чистыми';
+    el('hero-next-sub').textContent = sub;
+  } else {
+    el('hero-next-val').textContent = '—';
+    el('hero-next-val').className = 'v num';
+    el('hero-next-sub').textContent = 'приходов в модели до конца года нет';
+  }
+  el('hero-eoy-val').textContent = fmt(r.final);
+  el('hero-eoy-val').className = 'v num ' + hc(r.final);
 
   drawChart(r.balances);
 
@@ -700,19 +971,19 @@ function render() {
   let cls, msg;
   const runway = (r.final / r.monthlyBurn).toFixed(1);
   if (r.minBal >= 300000) {
-    cls = 'card-ok';
+    cls = 'v-good';
     msg = 'Год закрывается на ' + fmt(r.final) + '. Минимум за период ' + fmt(r.minBal) + ' (' + r.minMonth +
           '). Runway в 2027 без новых продаж: ~' + runway + ' мес.';
   } else if (r.minBal >= 0) {
-    cls = 'card-warn';
+    cls = 'v-mid';
     msg = 'Год в плюсе (' + fmt(r.final) + '), но минимум ' + fmt(r.minBal) + ' в ' + r.minMonth +
           '. Runway: ~' + runway + ' мес.';
   } else {
-    cls = 'card-danger';
+    cls = 'v-crit';
     msg = 'Кассовый разрыв в ' + r.minMonth + ' (' + fmt(r.minBal) + '). Год закрывается на ' + fmt(r.final) + '.';
   }
-  el('verdict').innerHTML = '<div class="card ' + cls + '"><div class="clabel">Вердикт</div>' +
-    '<div style="font-size:14px;margin-top:4px;font-weight:500;">' + msg + '</div></div>';
+  el('verdict').className = 'verdict ' + cls;
+  el('verdict').innerHTML = '<b>Вердикт.</b> ' + msg;
 }
 
 ['opex'].concat(D.one_offs.map(o => 'oneoff-' + o.id)).concat(D.toggles.map(t => 't-' + t.id))
@@ -724,55 +995,88 @@ render();
 """
 
 
-def section_assets(model: dict, balances: dict[str, Any], page: dict[str, Any]) -> str:
-    crypto = model.get("crypto_reference", {}) or {}
-    if balances["verified"]:
-        liquid_sub = " + ".join(
-            f"{esc(a['title'])} {fmt_rub(a['amount'], '')}" for a in balances["rub_accounts"] if a["amount"]
-        ) or "рублёвых остатков нет"
-        liquid_sub += f" · снапшот {esc(balances['date'])}"
-    else:
-        liquid_sub = f"not verified: {esc(balances['problem'])} — цифра из handoff"
+# --- блоки страницы ----------------------------------------------------------
 
-    team_total = sum(d.get("amount", 0) for d in model.get("team_debts", []))
-    team_sub = " + ".join(
-        f"{esc(p)} {round(sum(d['amount'] for d in model['team_debts'] if d['project'] == p) / 1000)}к"
-        for p in dict.fromkeys(d["project"] for d in model.get("team_debts", []))
-    )
-    fx_note = ""
-    if balances["fx_accounts"]:
-        fx_note = " · в ПланФакте: " + ", ".join(
-            f"{esc(a['title'])} {a['amount']:,.0f} {esc(a['currency'])}".replace(",", NBSP)
-            for a in balances["fx_accounts"]
-        )
+
+def scheduled_projects(model: dict) -> list[str]:
+    """Проекты, где команда платится графиком, а не удерживается из прихода."""
+    return [d.get("project", "") for d in model.get("team_debts", []) if d.get("paid_by_schedule")]
+
+
+def section_hero(balances: dict[str, Any], page: dict[str, Any]) -> str:
+    """Три крупных числа. Первое статично, два других считает JS от сценариев."""
+    if balances["verified"]:
+        cash_note = f"снапшот ПланФакта {esc(balances['date'])} · рублёвые счета"
+    else:
+        cash_note = f"not verified: {esc(balances['problem'])} — цифра из handoff"
     return f"""
-<div class="stitle">Активы и обязательства</div>
-<div class="g4">
-  <div class="card"><div class="clabel">Ликвидные счета</div><div class="cval">{fmt_rub(page['start_balance'])}</div><div class="csub">{liquid_sub}</div></div>
-  <div class="card"><div class="clabel">Крипта (несгораемая)</div><div class="cval">~{fmt_rub(crypto.get('usd_estimate', 0), NBSP + '$')}</div><div class="csub">{esc(crypto.get('composition', ''))} · вне модели{fx_note}</div></div>
-  <div class="card card-ok"><div class="clabel">Долги бизнеса</div><div class="cval">{fmt_rub(model.get('business_debt', 0))}</div><div class="csub">погашены; личных долгов нет</div></div>
-  <div class="card card-warn"><div class="clabel">Долги команде</div><div class="cval">{fmt_rub(team_total)}</div><div class="csub">{team_sub}</div></div>
+<div class="hero">
+  <div class="box">
+    <div class="k">На счетах сейчас</div>
+    <div class="v num">{fmt_rub(page['start_balance'])}</div>
+    <div class="n">{cash_note}</div>
+  </div>
+  <div class="box">
+    <div class="k">Ближайший приход</div>
+    <div class="v num" id="hero-next-val">—</div>
+    <div class="n" id="hero-next-sub">—</div>
+  </div>
+  <div class="box">
+    <div class="k">Остаток на конец года</div>
+    <div class="v num" id="hero-eoy-val">—</div>
+    <div class="n">при текущих допущениях (сценарии ниже)</div>
+  </div>
 </div>
 """
 
 
-def section_team_debts(model: dict) -> str:
-    rows = "\n".join(
-        f'    <tr><td>{esc(d.get("project"))}</td><td>{esc(d.get("item"))}</td>'
-        f'<td class="r">{fmt_rub(d.get("amount"))}</td></tr>'
-        for d in model.get("team_debts", [])
-    )
-    total = sum(d.get("amount", 0) for d in model.get("team_debts", []))
+def section_scenarios(page: dict[str, Any]) -> str:
+    chips = "\n".join(
+        f'  <label class="chip{" chip-alt" if t["kind"] == "pipeline" else ""}" id="chip-{esc(t["id"])}">'
+        f'<input type="checkbox" id="t-{esc(t["id"])}"{" checked" if t["default"] else ""}>'
+        f'<span>{rich(t["label"])}</span></label>'
+        for t in page["toggles"]
+    ) or '  <span class="hint">сценарных переключателей в модели нет</span>'
     return f"""
-<div class="stitle">Долги команде · детализация</div>
-<table>
-  <thead><tr><th>Проект</th><th>Статья</th><th class="r">Сумма</th></tr></thead>
-  <tbody>
-{rows}
-    <tr class="total"><td colspan="2">Итого</td><td class="r">{fmt_rub(total)}</td></tr>
-  </tbody>
+<div class="stitle">Сценарии — пересчитывают всю страницу</div>
+<div class="chips">
+{chips}
+</div>
+"""
+
+
+def section_months(model: dict, page: dict[str, Any]) -> str:
+    """Главный блок: помесячная таблица. Тело строк рисует JS."""
+    sched = scheduled_projects(model)
+    footnote = ""
+    if sched:
+        total = sum(
+            d.get("amount", 0) for d in model.get("team_debts", []) if d.get("paid_by_schedule")
+        )
+        footnote = (
+            f'<div class="note"><sup>*</sup> {esc(", ".join(sched))}: команда {fmt_rub(total)} '
+            f'платится графиком до прихода денег (в расходах — отдельными строками по месяцам), '
+            f'а не удерживается из прихода. «Чистыми» здесь = смета − налог.</div>'
+        )
+    return f"""
+<div class="stitle">Помесячно до конца года</div>
+<div class="panel">
+<table class="months">
+  <thead><tr>
+    <th>Месяц</th><th class="r">Приходы, чистыми</th><th class="r">Расходы</th><th class="r">Остаток на конец</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+  <tfoot><tr class="year">
+    <td data-l="Итог"><div class="mname">Итог года</div>
+      <div class="hint">старт {fmt_rub(page['start_balance'])}</div></td>
+    <td data-l="Приходы, чистыми" class="r"><div class="amt" id="year-in">—</div></td>
+    <td data-l="Расходы" class="r"><div class="amt" id="year-out">—</div></td>
+    <td data-l="Остаток на конец" class="r"><div class="amt" id="year-bal">—</div></td>
+  </tr></tfoot>
 </table>
-<div class="note">{esc(model.get('team_debts_note', ''))}</div>
+</div>
+{footnote}
+<div id="verdict" class="verdict"></div>
 """
 
 
@@ -782,66 +1086,12 @@ def ddmm(date_str: str) -> str:
     return f"{parts[2]}.{parts[1]}" if len(parts) == 3 else str(date_str)
 
 
-def section_duplicates(report: dict[str, Any]) -> str:
-    """Блоки сторожа задвоения: жёлтый (подозрение) и зелёный (подтверждено фактом)."""
-    blocks: list[str] = []
-    if report.get("suspects"):
-        items = "\n".join(
-            "    <li>Строка прогноза «{project}» ({amount}) похожа на уже пришедший платёж: "
-            "{date}, {contragent}, {value} — проверь задвоение.{comment}</li>".format(
-                project=esc(m["row"]["project"]),
-                amount=fmt_rub(m["row"]["amount"]),
-                date=esc(ddmm(m["op"]["date"]) + "." + m["op"]["date"][:4]),
-                contragent=esc(m["op"]["contragent"]),
-                value=fmt_rub(m["op"]["value"]),
-                comment=f' <span class="dupe-note">({esc(m["op"]["comment"])})</span>'
-                        if m["op"]["comment"] else "",
-            )
-            for m in report["suspects"]
-        )
-        blocks.append(f"""
-<div class="dupe">
-  <div class="dupe-h">⚠️ Сторож задвоения: {len(report['suspects'])} совпадени(е/я) по сумме и дате</div>
-  <ul>
-{items}
-  </ul>
-  <div class="dupe-note">Матчинг детерминированный: сумма ±{round(DUPE_TOLERANCE * 100)}%, окно
-  [месяц строки −{DUPE_WINDOW_DAYS} дн … сегодня], названия не сравниваются. Строку из прогноза
-  автоматически никто не убирает — решение за Антоном.</div>
-</div>
-""")
-    if report.get("confirmed"):
-        items = "\n".join(
-            "    <li>«{project}» ({amount}) — подтверждено фактом {date}: {contragent}, {value}.</li>".format(
-                project=esc(m["row"]["project"]),
-                amount=fmt_rub(m["row"]["amount"]),
-                date=esc(ddmm(m["op"]["date"])),
-                contragent=esc(m["op"]["contragent"]),
-                value=fmt_rub(m["op"]["value"]),
-            )
-            for m in report["confirmed"]
-        )
-        blocks.append(f"""
-<div class="dupe dupe-ok">
-  <div class="dupe-h">✅ Найдено в выписке ПланФакта (строки с флагом «получен»)</div>
-  <ul>
-{items}
-  </ul>
-  <div class="dupe-note">Деньги уже в остатке — строку в прогнозе стоит закрыть, чтобы не задваивать.
-  Автоматически не убираем.</div>
-</div>
-""")
-    if report.get("problem"):
-        blocks.append(
-            f'<div class="flag">Сторож задвоения: not verified — {esc(report["problem"])}.</div>'
-        )
-    return "".join(blocks)
-
-
-def section_confirmed(model: dict, marks: dict[Any, dict[str, Any]] | None = None) -> str:
+def details_income(model: dict, marks: dict[Any, dict[str, Any]] | None = None) -> str:
+    """«Приходы подробно»: цепочка смета → команде → налог → чистыми + CRM."""
     marks = marks or {}
     details = team_detail_map(model)
-    default_pct = model.get("tax_rules", {}).get("default_pct", 12)
+    default_pct = model.get("tax_rules", {}).get("default_pct", 15)
+    sched = set(scheduled_projects(model))
     rows = []
     sum_rev = sum_team = sum_tax = sum_net = 0
     for item in model.get("confirmed_income", []):
@@ -854,25 +1104,35 @@ def section_confirmed(model: dict, marks: dict[Any, dict[str, Any]] | None = Non
         sum_tax += tax
         sum_net += net
         if item.get("off_ip"):
-            tax_cell = "—<div class=\"details\">мимо ИП</div>"
+            tax_cell = '—<div class="details">мимо ИП</div>'
         elif item.get("tax_pct") not in (default_pct, None):
             tax_cell = f'{fmt_rub(tax, "")}<div class="details">{esc(item["tax_pct"])}%</div>'
         else:
             tax_cell = fmt_rub(tax, "")
         detail = details.get(item.get("project", ""), "")
-        team_cell = (f'{fmt_rub(team, "")}<div class="details">{esc(detail)}</div>' if team
-                     else '0 ✓<div class="details">оплачено ранее</div>' if not item.get("off_ip") else "—")
+        if item.get("project") in sched:
+            team_cell = (f'по графику<div class="details">{fmt_rub(item.get("team_total", 0), "")} '
+                         f'вне прихода</div>')
+        elif team:
+            team_cell = f'{fmt_rub(team, "")}<div class="details">{esc(detail)}</div>'
+        elif not item.get("off_ip"):
+            team_cell = '0<div class="details">оплачено ранее</div>'
+        else:
+            team_cell = "—"
         mark = marks.get(item.get("id"))
         if mark and mark["status"] == "ok":
             mark_cell = (f'<div><span class="pill p-ok">подтверждено фактом {esc(ddmm(mark["op"]["date"]))}</span></div>'
                          f'<div class="details">{esc(mark["op"]["contragent"])} · {fmt_rub(mark["op"]["value"])}</div>')
         elif mark:
+            note = mark["row"].get("dupe_note")
             mark_cell = (f'<div><span class="pill p-warn">похоже на задвоение</span></div>'
-                         f'<div class="details">{esc(ddmm(mark["op"]["date"]))} · {esc(mark["op"]["contragent"])} · {fmt_rub(mark["op"]["value"])}</div>')
+                         f'<div class="details">{esc(ddmm(mark["op"]["date"]))} · {esc(mark["op"]["contragent"])} · {fmt_rub(mark["op"]["value"])}</div>'
+                         + (f'<div class="details">{esc(note)}</div>' if note else ""))
         else:
             mark_cell = ""
+        star = "<sup>*</sup>" if item.get("project") in sched else ""
         rows.append(
-            f'    <tr><td>{esc(item.get("project"))}{mark_cell}</td>'
+            f'    <tr><td>{esc(item.get("project"))}{star}{mark_cell}</td>'
             f'<td class="r">{fmt_rub(rev, "")}</td>'
             f'<td class="r">{team_cell}</td>'
             f'<td class="r">{tax_cell}</td>'
@@ -882,97 +1142,306 @@ def section_confirmed(model: dict, marks: dict[Any, dict[str, Any]] | None = Non
     flags = "\n".join(
         f'<div class="flag">{esc(n)}</div>' for n in model.get("notes", []) if "522" in n
     )
-    return f"""
-<div class="stitle">Подтверждённые приходы</div>
-<table>
-  <thead><tr><th>Проект</th><th class="r">Выручка</th><th class="r">Команде</th><th class="r">Налог</th><th class="r">Чистое</th><th>Срок</th></tr></thead>
-  <tbody>
-{chr(10).join(rows)}
-    <tr class="total"><td>Итого</td><td class="r">{fmt_rub(sum_rev, "")}</td><td class="r">{fmt_rub(sum_team, "")}</td>
-      <td class="r">{fmt_rub(sum_tax, "")}</td><td class="r bal-ok">{fmt_rub(sum_net, "")}</td><td></td></tr>
-  </tbody>
-</table>
-{flags}
-"""
 
-
-def section_pipeline(model: dict) -> str:
-    rows = "\n".join(
-        f'    <tr class="crm"><td><b>{esc(p.get("project"))}</b></td>'
-        f'<td class="r">{fmt_rub(p.get("estimate_min"), "")} — {fmt_rub(p.get("estimate_max"), "")}</td>'
+    pipe_rows = "\n".join(
+        f'    <tr><td><b>{esc(p.get("project"))}</b></td>'
+        f'<td class="r">{fmt_rub(p.get("estimate_min"), "")} — {fmt_rub(p.get("estimate_max"), "")}<div class="details">смета</div></td>'
         f'<td class="r">{esc(p.get("margin_pct"))}%</td>'
         f'<td class="r">~{fmt_rub(p.get("team_cost"), "")}<div class="details">{esc(p.get("team_cost_note", ""))}</div></td>'
         f'<td>{esc(p.get("due"))}</td>'
         f'<td><span class="pill p-warn">{esc(p.get("status"))}</span></td></tr>'
         for p in model.get("pipeline", [])
     ) or '    <tr><td colspan="6">переговоров нет</td></tr>'
+
+    star_note = ""
+    if sched:
+        star_note = (f'<sup>*</sup> {esc(", ".join(sorted(sched)))}: команда платится графиком до прихода, '
+                     f'поэтому в «чистыми» этой строки она не вычтена — сумма несопоставима с остальными строками.<br>')
+
     return f"""
-<div class="stitle">CRM · В переговорах</div>
-<table>
-  <thead><tr><th>Проект</th><th class="r">Смета</th><th class="r">Маржа</th><th class="r">Расход (оценка)</th><th>Срок денег</th><th>Статус</th></tr></thead>
+<details>
+<summary><span>Приходы подробно · смета → чистыми</span></summary>
+<div class="dbody">
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Проект</th><th class="r">Смета</th><th class="r">− Команде</th>
+    <th class="r">− Налог {esc(default_pct)}%</th><th class="r">= Чистыми</th><th>Срок денег</th></tr></thead>
   <tbody>
-{rows}
+{chr(10).join(rows)}
+    <tr class="total"><td>Итого подтверждено</td><td class="r">{fmt_rub(sum_rev, "")}</td>
+      <td class="r">{fmt_rub(sum_team, "")}</td><td class="r">{fmt_rub(sum_tax, "")}</td>
+      <td class="r bal-ok">{fmt_rub(sum_net, "")}</td><td></td></tr>
   </tbody>
 </table>
-<div class="note">{esc(model.get('pipeline_note', ''))} Тумблер ниже показывает сценарий с ним.</div>
+</div>
+<div class="note"><b>Смета</b> — сумма договора до вычетов. <b>Чистыми</b> — что остаётся после выплат
+команде и налога {esc(default_pct)}%. В помесячной таблице выше стоят именно «чистыми».<br>{star_note}</div>
+{flags}
+<div class="stitle">CRM · в переговорах (в базу не считается)</div>
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Проект</th><th class="r">Смета</th><th class="r">Маржа</th>
+    <th class="r">Расход (оценка)</th><th>Срок денег</th><th>Статус</th></tr></thead>
+  <tbody>
+{pipe_rows}
+  </tbody>
+</table>
+</div>
+<div class="note">{esc(model.get('pipeline_note', ''))} Включается тумблером в блоке «Сценарии».</div>
+</div>
+</details>
 """
 
 
-def section_one_offs(model: dict) -> str:
+def details_team_debts(model: dict) -> str:
     rows = "\n".join(
-        f'    <tr class="trip-row"><td><b>{esc(o.get("label"))}</b></td>'
+        f'    <tr><td>{esc(d.get("project"))}</td><td>{esc(d.get("item"))}</td>'
+        f'<td class="r">{fmt_rub(d.get("amount"))}</td>'
+        f'<td>{"графиком, вне прихода" if d.get("paid_by_schedule") else "из прихода проекта"}</td></tr>'
+        for d in model.get("team_debts", [])
+    )
+    total = sum(d.get("amount", 0) for d in model.get("team_debts", []))
+    return f"""
+<details>
+<summary><span>Долги команде</span><span class="tag">{fmt_rub(total)}</span></summary>
+<div class="dbody">
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Проект</th><th>Статья</th><th class="r">Сумма</th><th>Как гасится</th></tr></thead>
+  <tbody>
+{rows}
+    <tr class="total"><td colspan="2">Итого</td><td class="r">{fmt_rub(total)}</td><td></td></tr>
+  </tbody>
+</table>
+</div>
+<div class="note">{esc(model.get('team_debts_note', ''))}</div>
+</div>
+</details>
+"""
+
+
+def slider_min(value: float, low: float, step: float) -> int:
+    """Нижняя граница ползунка, при которой стартовое значение достижимо шагом.
+
+    Браузер округляет value до ближайшей валидной ступени (min + k×step), поэтому
+    124 000 при min=0/step=10 000 превращалось в 120 000 — прогноз на загрузке
+    расходился с моделью. Сдвигаем min на остаток: 124 000 становится точной ступенью.
+    """
+    try:
+        if step <= 0 or value < low:
+            return int(low)
+        return int(low + (value - low) % step)
+    except (TypeError, ValueError):
+        return int(low or 0)
+
+
+def details_spending(model: dict, page: dict[str, Any]) -> str:
+    """Разовые траты + все слайдеры (операционка и суммы поездок)."""
+    rows = "\n".join(
+        f'    <tr><td><b>{esc(o.get("label"))}</b><div class="details">{esc(o.get("note", ""))}</div></td>'
         f'<td class="r" id="oneoff-table-{esc(o.get("id"))}">{fmt_rub(o.get("amount"))}</td>'
-        f'<td>{esc(o.get("month"))}</td><td>{esc(o.get("note", ""))}</td></tr>'
+        f'<td>{esc(o.get("month"))}</td></tr>'
         for o in model.get("one_off_expenses", [])
-    ) or '    <tr><td colspan="4">разовых трат нет</td></tr>'
+    ) or '    <tr><td colspan="3">разовых трат нет</td></tr>'
     tax_rows = "\n".join(
-        f'    <tr><td>{esc(t.get("label"))}</td><td class="r">{fmt_rub(t.get("amount"))}</td>'
-        f'<td>{esc(t.get("month"))}</td><td>{esc(t.get("due", ""))}</td></tr>'
+        f'    <tr><td>{esc(t.get("label"))}<div class="details">{esc(t.get("due", ""))}</div></td>'
+        f'<td class="r">{fmt_rub(t.get("amount"))}</td><td>{esc(t.get("month"))}</td></tr>'
         for t in model.get("tax_rules", {}).get("one_off", [])
     )
+
+    opex = page["opex"]
+    o_min, o_max, o_step = opex.get("min", 30000), opex.get("max", 200000), opex.get("step", 10000)
+    o_val = opex.get("default", 50000)
+    sliders = [f"""  <div class="srow">
+    <span class="slabel">Операционка в месяц (без ЗП)</span>
+    <input type="range" min="{slider_min(o_val, o_min, o_step)}" max="{o_max}" step="{o_step}" value="{o_val}" id="opex">
+    <span class="sval num" id="opex-val">{fmt_rub(o_val)}</span>
+  </div>"""]
+    for o in model.get("one_off_expenses", []):
+        s = o.get("slider") or {}
+        s_min, s_max, s_step = s.get("min", 0), s.get("max", 500000), s.get("step", 50000)
+        amount = o.get("amount", 0)
+        sliders.append(f"""  <div class="srow">
+    <span class="slabel">{esc(o.get('label'))} ({esc(o.get('month'))})</span>
+    <input type="range" min="{slider_min(amount, s_min, s_step)}" max="{s_max}" step="{s_step}" value="{amount}" id="oneoff-{esc(o.get('id'))}">
+    <span class="sval num" id="oneoff-val-{esc(o.get('id'))}">{fmt_rub(amount)}</span>
+  </div>""")
+
     return f"""
-<div class="stitle">Разовые траты и налоги</div>
-<table>
-  <thead><tr><th>Статья</th><th class="r">Сумма</th><th>Месяц</th><th>Комментарий</th></tr></thead>
+<details>
+<summary><span>Разовые траты и слайдеры</span></summary>
+<div class="dbody">
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Статья</th><th class="r">Сумма</th><th>Месяц</th></tr></thead>
   <tbody>
 {rows}
 {tax_rows}
   </tbody>
 </table>
+</div>
+<div class="stitle">Слайдеры — двигают прогноз</div>
+{chr(10).join(sliders)}
+<div class="note">ЗП Антона {fmt_rub(page['salary'])}/мес фиксированно. Налог и выплаты команде
+удерживаются в момент прихода проекта — в помесячной таблице они уже внутри «чистыми».</div>
+</div>
+</details>
 """
 
 
-def section_controls(model: dict, page: dict[str, Any]) -> str:
-    opex = page["opex"]
-    sliders = [
-        f"""<div class="srow">
-  <span class="slabel">Операционка (без ЗП)</span>
-  <input type="range" min="{opex.get('min', 30000)}" max="{opex.get('max', 200000)}" step="{opex.get('step', 10000)}" value="{opex.get('default', 50000)}" id="opex">
-  <span class="sval" id="opex-val">{fmt_rub(opex.get('default', 50000))}</span>
-</div>"""
-    ]
-    for o in model.get("one_off_expenses", []):
-        s = o.get("slider", {})
-        sliders.append(f"""<div class="srow">
-  <span class="slabel">{esc(o.get('label'))} ({esc(o.get('month'))})</span>
-  <input type="range" min="{s.get('min', 0)}" max="{s.get('max', 500000)}" step="{s.get('step', 50000)}" value="{o.get('amount', 0)}" id="oneoff-{esc(o.get('id'))}">
-  <span class="sval" id="oneoff-val-{esc(o.get('id'))}">{fmt_rub(o.get('amount', 0))}</span>
-</div>""")
-
-    toggles = []
-    for t in page["toggles"]:
-        cls = "toggle-row toggle-pipeline" if t["kind"] == "pipeline" else "toggle-row"
-        checked = " checked" if t["default"] else ""
-        toggles.append(
-            f'<div class="{cls}"><input type="checkbox" id="t-{esc(t["id"])}"{checked}>'
-            f'<label for="t-{esc(t["id"])}">{rich(t["label"])}</label></div>'
-        )
-    salary = fmt_rub(page["salary"])
+def details_runway(model: dict, page: dict[str, Any]) -> str:
+    crypto = model.get("crypto_reference", {}) or {}
+    months_x = "".join(
+        f"<span>{esc(m.get('label', '').split()[0][:3])}</span>" for m in page["months"]
+    )
     return f"""
-<div class="stitle">Прогноз до конца года</div>
-{chr(10).join(sliders)}
-<div class="note" style="margin: 0 0 14px;">ЗП Антона {salary}/мес фиксированно. Налог и выплаты команде удерживаются в момент прихода проекта.</div>
-{chr(10).join(toggles)}
+<details>
+<summary><span>Runway и крипта</span></summary>
+<div class="dbody">
+<div class="chart">
+  <div class="chart-y" id="chart-y"></div>
+  <div class="chart-grid" id="chart-grid"></div>
+  <div class="chart-x"><span>Старт</span>{months_x}</div>
+</div>
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Сценарий 2027 (без новых продаж)</th><th class="r">Burn/мес</th>
+    <th class="r">База</th><th class="r">Хватит на</th></tr></thead>
+  <tbody id="runway-body"></tbody>
+</table>
+</div>
+<div class="stitle">Крипта · справочно, вне операционки</div>
+<div class="kv"><span>Несгораемая подушка</span>
+  <span>~{fmt_rub(crypto.get('usd_estimate', 0), NBSP + '$')} · {fmt_rub(crypto.get('rub_estimate', 0))}</span></div>
+<div class="note">{esc(crypto.get('composition', ''))} — {esc(crypto.get('note', ''))}
+Крипта в оперативный прогноз не входит, только отдельной строкой runway (Конституция модели, п.5).</div>
+</div>
+</details>
+"""
+
+
+def details_accounts(model: dict, balances: dict[str, Any], page: dict[str, Any]) -> str:
+    if balances["verified"]:
+        rows = "\n".join(
+            f'<div class="kv"><span>{esc(a["title"])}</span><span>{fmt_rub(a["amount"])}</span></div>'
+            for a in balances["rub_accounts"] if a["amount"]
+        ) or '<div class="kv"><span>рублёвых остатков нет</span><span>—</span></div>'
+        source = f'<div class="note">Источник: снапшот ПланФакта {esc(balances["date"])}.</div>'
+    else:
+        rows = f'<div class="flag">not verified: {esc(balances["problem"])} — стартовый остаток из handoff.</div>'
+        source = ""
+    fx = ""
+    if balances["fx_accounts"]:
+        fx = '<div class="note">Валютные счета (в ликвидное не входят): ' + ", ".join(
+            f'{esc(a["title"])} {a["amount"]:,.0f} {esc(a["currency"])}'.replace(",", NBSP)
+            for a in balances["fx_accounts"]
+        ) + ".</div>"
+
+    handoff_ref = (model.get("accounts", {}).get("handoff_reference", {}) or {})
+    delta_note = ""
+    if balances["verified"] and handoff_ref.get("liquid_total"):
+        delta = page["start_balance"] - handoff_ref["liquid_total"]
+        if abs(delta) >= 1:
+            delta_note = (
+                f'<div class="flag">Стартовый остаток — живой из ПланФакта: {fmt_rub(page["start_balance"])} '
+                f'против {fmt_rub(handoff_ref["liquid_total"])} в handoff от {esc(handoff_ref.get("date"))} '
+                f'(дельта {"+" if delta > 0 else ""}{fmt_rub(delta)}). Прогноз сдвинут на эту дельту — это факт, не подгонка.</div>'
+            )
+    return f"""
+<details>
+<summary><span>Счета подробно</span><span class="tag">{fmt_rub(page['start_balance'])}</span></summary>
+<div class="dbody">
+{rows}
+<div class="kv"><span>Итого ликвидные (рубли)</span><span>{fmt_rub(page['start_balance'])}</span></div>
+<div class="kv"><span>Долги бизнеса</span><span>{fmt_rub(model.get('business_debt', 0))}</span></div>
+<div class="kv"><span>Личные долги</span><span>{fmt_rub(model.get('personal_debt', 0))}</span></div>
+{source}{fx}{delta_note}
+</div>
+</details>
+"""
+
+
+def details_watchdog(report: dict[str, Any]) -> str:
+    """Сторож задвоения: срабатывания — секция раскрыта и подсвечена."""
+    suspects = report.get("suspects") or []
+    confirmed = report.get("confirmed") or []
+    body: list[str] = []
+
+    if suspects:
+        items = "\n".join(
+            "    <li>Строка прогноза «{project}» ({amount}) похожа на уже пришедший платёж: "
+            "{date}, {contragent}, {value} — проверь задвоение.{comment}{note}</li>".format(
+                project=esc(m["row"]["project"]),
+                amount=fmt_rub(m["row"]["amount"]),
+                date=esc(ddmm(m["op"]["date"]) + "." + m["op"]["date"][:4]),
+                contragent=esc(m["op"]["contragent"]),
+                value=fmt_rub(m["op"]["value"]),
+                comment=f' <span class="dupe-note">({esc(m["op"]["comment"])})</span>'
+                        if m["op"]["comment"] else "",
+                note=f'<div class="dupe-note">Пометка модели: {esc(m["row"]["dupe_note"])}</div>'
+                     if m["row"].get("dupe_note") else "",
+            )
+            for m in suspects
+        )
+        body.append(f"""<div class="dupe"><div class="dupe-h">⚠️ Совпадений по сумме и дате: {len(suspects)}</div>
+  <ul>
+{items}
+  </ul>
+  <div class="dupe-note">Матчинг детерминированный: сумма ±{round(DUPE_TOLERANCE * 100)}%, окно
+  [месяц строки −{DUPE_WINDOW_DAYS} дн … сегодня], названия не сравниваются. Строку из прогноза
+  автоматически никто не убирает — решение за Антоном.</div></div>""")
+
+    if confirmed:
+        items = "\n".join(
+            "    <li>«{project}» ({amount}) — подтверждено фактом {date}: {contragent}, {value}.</li>".format(
+                project=esc(m["row"]["project"]),
+                amount=fmt_rub(m["row"]["amount"]),
+                date=esc(ddmm(m["op"]["date"])),
+                contragent=esc(m["op"]["contragent"]),
+                value=fmt_rub(m["op"]["value"]),
+            )
+            for m in confirmed
+        )
+        body.append(f"""<div class="dupe"><div class="dupe-h dupe-ok">✅ Найдено в выписке ПланФакта (строки с флагом «получен»)</div>
+  <ul>
+{items}
+  </ul>
+  <div class="dupe-note">Деньги уже в остатке — строку в прогнозе стоит закрыть, чтобы не задваивать.
+  Автоматически не убираем.</div></div>""")
+
+    if report.get("problem"):
+        body.append(f'<div class="flag">not verified — {esc(report["problem"])}.</div>')
+    elif not suspects and not confirmed:
+        excluded = report.get("excluded_count") or 0
+        excluded_note = f" (исключено как уже разнесённые: {excluded})" if excluded else ""
+        body.append(
+            f'<div class="dupe">Совпадений нет: проверено строк {report.get("checked_rows", 0)} '
+            f'против {report.get("ops_count", 0)} фактических приходов с {esc(report.get("since") or "—")}'
+            f'{excluded_note}.'
+            f'<div class="dupe-note">Допуск по сумме ±{round(DUPE_TOLERANCE * 100)}%, '
+            f'окно −{DUPE_WINDOW_DAYS} дн от месяца строки.</div></div>'
+        )
+
+    if suspects:
+        head = f'<span>⚠️ Сторож задвоения · {len(suspects)} совпадени(е/я)</span>'
+        attrs = ' open class="alarm"'
+    elif confirmed:
+        head = f'<span>Сторож задвоения · подтверждено фактом: {len(confirmed)}</span>'
+        attrs = ""
+    elif report.get("problem"):
+        head = '<span>Сторож задвоения</span><span class="tag">not verified</span>'
+        attrs = ""
+    else:
+        head = '<span>Сторож задвоения</span><span class="tag">совпадений нет</span>'
+        attrs = ""
+
+    return f"""
+<details{attrs}>
+<summary>{head}</summary>
+<div class="dbody">
+{"".join(body)}
+</div>
+</details>
 """
 
 
@@ -985,28 +1454,19 @@ def build_html(
 ) -> str:
     dupes = dupes or {"suspects": [], "confirmed": []}
     data_json = json.dumps(page, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    months_x = "".join(
-        f"<span>{esc(m.get('label', '').split()[0][:3])}</span>" for m in page["months"]
-    )
     src_line = (
         f"данные: ПланФакт снапшот от {esc(balances.get('date') or sources.get('planfact', '—'))}"
         f" · ZenMoney снапшот от {esc(sources.get('zenmoney_date') or '—')}"
         f" · модель обновлена {esc(model.get('updated_at'))}"
         f" · собрано {esc(common.now_iso())}"
     )
-    handoff_ref = (model.get("accounts", {}).get("handoff_reference", {}) or {})
-    delta_note = ""
-    if balances["verified"] and handoff_ref.get("liquid_total"):
-        delta = page["start_balance"] - handoff_ref["liquid_total"]
-        if abs(delta) >= 1:
-            delta_note = (
-                f'<div class="flag">Стартовый остаток — живой из ПланФакта: {fmt_rub(page["start_balance"])} '
-                f'против {fmt_rub(handoff_ref["liquid_total"])} в handoff от {esc(handoff_ref.get("date"))} '
-                f'(дельта {"+" if delta > 0 else ""}{fmt_rub(delta)}). Прогноз сдвинут на эту дельту — это факт, не подгонка.</div>'
-            )
     model_notes = "".join(
-        f'<div class="note">{esc(n)}</div>' for n in model.get("notes", []) if "522" not in n
+        f'<div>{esc(n)}</div>' for n in model.get("notes", []) if "522" not in n
     )
+    watchdog = details_watchdog(dupes)
+    # срабатывание сторожа — наверх страницы, всё остальное состояние — вниз, в общий список
+    watchdog_top = watchdog if dupes.get("suspects") else ""
+    watchdog_bottom = "" if dupes.get("suspects") else watchdog
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -1020,57 +1480,26 @@ def build_html(
 <div class="wrap">
 
 <h1>Финансовая сводка</h1>
-<div class="subtitle">модель от {esc(model.get('updated_at'))} · остатки из ПланФакта {esc(balances.get('date') or '—')} · единый пул: бизнес + личное</div>
-{section_duplicates(dupes)}
-<div class="g3" style="margin-bottom:18px;">
-  <div class="card" id="kpi-min"><div class="clabel">Минимум за период</div><div class="cval-lg" id="kpi-min-val">—</div><div class="csub" id="kpi-min-sub">—</div></div>
-  <div class="card" id="kpi-dec"><div class="clabel">Баланс на 1 января 2027</div><div class="cval-lg" id="kpi-dec-val">—</div><div class="csub">без крипты</div></div>
-  <div class="card" id="kpi-flow"><div class="clabel">Чистый прирост</div><div class="cval-lg" id="kpi-flow-val">—</div><div class="csub" id="kpi-flow-sub">—</div></div>
-</div>
-{delta_note}
-{section_assets(model, balances, page)}
-{section_team_debts(model)}
-<hr class="divider">
-{section_confirmed(model, dupe_marks(dupes))}
-{section_pipeline(model)}
-<hr class="divider">
-{section_one_offs(model)}
-<hr class="divider">
-{section_controls(model, page)}
+<div class="sub">единый пул: бизнес + личное · модель от {esc(model.get('updated_at'))} ·
+остатки из ПланФакта {esc(balances.get('date') or '—')}</div>
+{watchdog_top}
+{section_hero(balances, page)}
+{section_scenarios(page)}
+{section_months(model, page)}
 
-<div style="overflow-x:auto;margin-top:14px;">
-<table>
-  <thead><tr><th>Месяц</th><th class="r">Приход</th><th class="r">Выплаты</th><th class="r">Баланс</th><th>Статус</th></tr></thead>
-  <tbody id="tbody"></tbody>
-</table>
-</div>
-
-<div class="chart">
-  <div class="chart-y" id="chart-y"></div>
-  <div class="chart-grid" id="chart-grid"></div>
-  <div class="chart-x"><span>Старт</span>{months_x}</div>
-</div>
-
-<div id="verdict" style="margin-top:14px;"></div>
-
-<div class="stitle">Runway на 2027 (без новых продаж)</div>
-<table>
-  <thead><tr><th>Сценарий</th><th class="r">Burn/мес</th><th class="r">База</th><th class="r">Хватит на</th></tr></thead>
-  <tbody id="runway-body"></tbody>
-</table>
-<div class="note">Крипта в оперативном прогнозе не участвует — только отдельной строкой runway (Конституция модели, п.5).</div>
-
-<div class="stitle">Крипта · справочно</div>
-<div class="card">
-  <div class="clabel">Несгораемая подушка</div>
-  <div class="cval">~{fmt_rub(model.get('crypto_reference', {}).get('usd_estimate', 0), NBSP + '$')} · {fmt_rub(model.get('crypto_reference', {}).get('rub_estimate', 0))}</div>
-  <div class="csub">{esc(model.get('crypto_reference', {}).get('composition', ''))} — {esc(model.get('crypto_reference', {}).get('note', ''))}</div>
-</div>
-{model_notes}
+<div class="stitle">Подробности</div>
+{details_income(model, dupe_marks(dupes))}
+{details_team_debts(model)}
+{details_spending(model, page)}
+{details_runway(model, page)}
+{details_accounts(model, balances, page)}
+{watchdog_bottom}
 
 <footer>
+  {model_notes}
   {src_line}<br>
-  Источник плана: {esc(model.get('source', ''))}. Рендер детерминированный (Scripts/render_dashboard.py), цифры не генерируются моделью.
+  Источник плана: {esc(model.get('source', ''))}. Рендер детерминированный (Scripts/render_dashboard.py),
+  цифры не генерируются моделью.
 </footer>
 
 </div>
@@ -1195,7 +1624,24 @@ def main(argv: list[str] | None = None) -> int:
     dupes = find_income_duplicates(model, incomes, today)
     log_duplicates(dupes)
 
-    page = build_page_data(model, balances)
+    # окно первого месяца прогноза считаем от даты живых остатков: всё до неё
+    # уже отражено в самом остатке, досчитывать надо только хвост месяца
+    as_of: _date | None = None
+    if balances.get("date"):
+        try:
+            as_of = _date.fromisoformat(str(balances["date"])[:10])
+        except ValueError:
+            log.warning("Дата снапшота ПланФакта нечитаема (%s) — беру сегодняшнюю", balances["date"])
+    if as_of is None:
+        as_of = _date.fromisoformat(today)
+        log.warning("Даты снапшота ПланФакта нет — окно первого месяца прогноза считаю от %s", today)
+
+    page = build_page_data(model, balances, as_of)
+    if page["months"]:
+        first = page["months"][0]
+        log.info("Прогноз: %d мес. (%s…%s); первый месяц частичный — %s из %s дн. от %s",
+                 len(page["months"]), page["months"][0]["key"], page["months"][-1]["key"],
+                 first.get("days_left"), first.get("days_total"), as_of.isoformat())
     html_text = build_html(model, balances, page, sources, dupes)
 
     target = dashboard_dir / "index.html"

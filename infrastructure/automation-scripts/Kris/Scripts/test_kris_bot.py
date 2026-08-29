@@ -253,11 +253,36 @@ def test_batch_prompt_empty_when_no_records():
     assert kb.build_batch_prompt([("-7", "Чат", [])]) == ""
 
 
+def test_batch_prompt_states_owner_already_reads_these_chats():
+    prompt = kb.build_batch_prompt(_chats(), memory_dir="/mem")
+    assert "сам состоит в этих чатах и читает их" in prompt
+    assert "пересказывать" in prompt
+
+
+def test_batch_prompt_has_two_reasons_rule():
+    prompt = kb.build_batch_prompt(_chats(), memory_dir="/mem")
+    assert "Ровно два повода написать прямо сейчас" in prompt
+    assert "СЕГОДНЯ" in prompt
+    assert "блокирует чью-то работу" in prompt
+    assert "Дефолт каждого батча" in prompt
+
+
+def test_batch_prompt_has_already_seen_test():
+    prompt = kb.build_batch_prompt(_chats(), memory_dir="/mem")
+    assert "он уже видел" in prompt
+
+
 def test_evening_prompt_asks_only_for_problems():
     prompt = kb.build_evening_prompt(memory_dir="/mem")
     assert "/mem" in prompt
     assert "просрочки" in prompt
     assert "—" not in prompt
+
+
+def test_evening_prompt_prefers_default_over_question():
+    prompt = kb.build_evening_prompt(memory_dir="/mem")
+    assert "Правило дефолта вместо вопроса" in prompt
+    assert "без движения" in prompt
 
 
 # ---------------------------------------------------------------------------
