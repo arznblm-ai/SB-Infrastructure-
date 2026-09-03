@@ -20,5 +20,6 @@
 | [[design department/references/presentation-runbook]] | Короткий runbook для deck-цикла |
 | [[design department/references/portable-setup]] | Как переносить department в другой проект |
 | [[design department/references/agency-demo-design-direction-example]] | Пример design direction из Agency Demo |
+| [[design department/references/awesome-design-md/index]] | Библиотека 74 DESIGN.md реальных брендов (VoltAgent, MIT): референсы направления и формат бренд-спек для агентной вёрстки |
 
-**Статистика:** 14 навигационных точек.
+**Статистика:** 15 навигационных точек.
