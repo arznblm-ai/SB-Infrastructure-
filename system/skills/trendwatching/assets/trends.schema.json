@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "trends.json — модель данных трендвотчинга",
+  "type": "object",
+  "required": ["meta", "signals", "trends"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["title", "object", "horizon", "date"],
+      "properties": {
+        "title": {"type": "string"},
+        "decision_questions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "question": {"type": "string"},
+              "owner": {"type": "string"},
+              "decision_date": {"type": "string"}
+            }
+          }
+        },
+        "object": {"type": "string", "description": "рынок, категория, аудитория"},
+        "boundaries": {"type": "string", "description": "что явно не входит"},
+        "horizon": {"type": "string", "description": "напр. 0-2 / 2-5 / 5-10"},
+        "geo": {"type": "string"},
+        "segments": {"type": "array", "items": {"type": "string"}},
+        "depth": {"enum": ["express", "full", "deep"]},
+        "weight_profile": {
+          "enum": ["default", "regulated", "consumer", "deeptech"],
+          "description": "профиль весов скоринга под тип рынка; по умолчанию default. Сравнение волн корректно только при одном профиле — см. references/03-scoring.md"
+        },
+        "lang": {"enum": ["ru", "en"], "description": "язык артефактов; флаг --lang сильнее этого поля"},
+        "wave": {"type": "integer", "description": "номер волны, 1 для первой"},
+        "previous_wave_file": {"type": ["string", "null"]},
+        "author": {"type": "string"},
+        "date": {"type": "string", "format": "date"},
+        "limitations": {"type": "string"}
+      }
+    },
+
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "date_event", "headline_fact", "fact", "url", "source_type", "reliability"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^sig-[0-9]+$"},
+          "date_event": {"type": "string", "description": "дата самого события"},
+          "date_capture": {"type": "string", "description": "дата обнаружения"},
+          "headline_fact": {"type": "string", "description": "заголовок-факт, не вывод"},
+          "fact": {"type": "string", "description": "[F] одно проверяемое предложение без причинного вывода; числа со знаменателем и методикой"},
+          "source": {"type": "string"},
+          "url": {"type": ["string", "null"]},
+          "source_type": {
+            "enum": ["research", "patent", "startup", "investment", "product_launch",
+                     "marketplace", "search_query", "social", "forum", "job_posting",
+                     "regulation", "official_stats", "association", "culture", "event",
+                     "consulting", "internal"]
+          },
+          "primacy": {"enum": ["primary", "secondary"]},
+          "reliability": {"enum": ["A", "B", "C"], "description": "A официальные/peer-reviewed; B первичные корпоративные; C вторичный контекст"},
+          "doc": {
+            "type": "object",
+            "description": "заполняется, когда сигнал опирается на документ, а не на веб-страницу",
+            "properties": {
+              "kind": {"enum": ["pdf", "doc", "docx", "xls", "xlsx", "dataset", "html", "api"]},
+              "publisher": {"type": "string", "description": "организация, выпустившая документ"},
+              "title": {"type": "string"},
+              "pages": {"type": ["string", "null"], "description": "страница или раздел, откуда взят факт"},
+              "retrieved": {"type": ["string", "null"], "description": "дата обращения"}
+            }
+          },
+          "tier": {
+            "enum": ["T1", "T2", "T3", "T4", null],
+            "description": "уровень доказательности; можно не задавать — validate_trends.py выведет сам. T1 первичный документ (НПА, отчётность, исследование с методикой, стандарт), T2 первичная публикация организации, T3 профессиональное медиа с собственным наблюдением, T4 пересказ или агрегатор"
+          },
+          "independent_of": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "id сигналов, от которых этот НЕ независим (общий первоисточник)"
+          },
+          "geo": {"type": "string"},
+          "segment": {"type": "string"},
+          "steep": {"enum": ["S", "T", "E", "N", "P", "B"], "description": "N = Environmental"},
+          "cipher": {"enum": ["C", "I", "P", "H", "E", "R", null]},
+          "interpretation": {"type": "string", "description": "[I] на что может указывать; драйвер"},
+          "alternative": {"type": "string", "description": "[I] минимум одно другое объяснение"},
+          "counter_evidence": {"type": ["string", "null"]},
+          "assumption": {"type": ["string", "null"], "description": "[A] если есть"},
+          "ethics": {"type": ["string", "null"], "description": "персональные/чувствительные данные, допустимость хранения"},
+          "novelty": {"type": ["integer", "null"], "minimum": 0, "maximum": 5},
+          "owner": {"type": ["string", "null"]},
+          "next_review": {"type": ["string", "null"]},
+          "trend_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+
+    "trends": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "statement", "stage", "signal_ids", "scores", "decision"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^tr-[0-9]+$"},
+          "name": {"type": "string", "description": "короткое имя, 2-4 слова"},
+          "statement": {"type": "string", "description": "кто/что меняет какое поведение и в каком направлении"},
+          "boundaries": {"type": "string"},
+          "excluded": {"type": "string", "description": "что явно не входит"},
+          "geo": {"type": "string"},
+          "segments": {"type": "array", "items": {"type": "string"}},
+          "horizon": {"enum": ["0-2", "2-5", "5-10+"]},
+          "steep": {"type": "array", "items": {"enum": ["S", "T", "E", "N", "P", "B"]}},
+          "type": {"enum": ["fad", "hype", "micro", "trend", "macro", "mega"]},
+          "stage": {
+            "type": "integer", "minimum": 0, "maximum": 7,
+            "description": "0 латентные напряжения, 1 слабые сигналы, 2 emerging issue, 3 раннее принятие, 4 ускорение, 5 mainstream, 6 фрагментация, 7 норма/спад"
+          },
+          "signal_ids": {"type": "array", "items": {"type": "string"}},
+          "excluded_signal_ids": {"type": "array", "items": {"type": "string"}},
+          "drivers": {"type": "array", "items": {"type": "string"}},
+          "enablers": {"type": "array", "items": {"type": "string"}},
+          "barriers": {"type": "array", "items": {"type": "string"}},
+          "basic_needs": {"type": "array", "items": {"type": "string"}},
+          "shifts": {"type": "array", "items": {"type": "string"}},
+          "triggers": {"type": "array", "items": {"type": "string"}},
+          "expectation_gap": {"type": ["string", "null"]},
+          "counter_trend": {"type": "string"},
+          "disconfirming": {"type": "string", "description": "минимум одно сильное контрдоказательство"},
+          "adoption_cost": {"type": "string", "description": "чем платит человек/организация: деньги, усилия, приватность, доверие, статус"},
+          "curves": {
+            "type": "object",
+            "description": "пять кривых, каждая отдельно; 0-5 или null",
+            "properties": {
+              "attention": {"type": ["integer", "null"]},
+              "capability": {"type": ["integer", "null"]},
+              "behavior": {"type": ["integer", "null"]},
+              "economics": {"type": ["integer", "null"]},
+              "institutions": {"type": ["integer", "null"]}
+            }
+          },
+          "scores": {
+            "type": "object",
+            "description": "15 критериев, 0-5 или null (= N/D, НЕ ноль)",
+            "properties": {
+              "novelty": {"type": ["number", "null"]},
+              "independent_signals": {"type": ["number", "null"]},
+              "source_quality": {"type": ["number", "null"]},
+              "momentum": {"type": ["number", "null"]},
+              "behavior_change": {"type": ["number", "null"]},
+              "persistence": {"type": ["number", "null"]},
+              "geo_breadth": {"type": ["number", "null"]},
+              "cross_industry": {"type": ["number", "null"]},
+              "investment": {"type": ["number", "null"]},
+              "driver_durability": {"type": ["number", "null"]},
+              "institutionalization": {"type": ["number", "null"]},
+              "barrier_surmountability": {"type": ["number", "null"]},
+              "counter_trend_resilience": {"type": ["number", "null"]},
+              "continuation_probability": {"type": ["number", "null"]},
+              "potential_impact": {"type": ["number", "null"]}
+            }
+          },
+          "score_evidence": {
+            "type": "object",
+            "description": "по каждому критерию — факт или ссылка, обосновавшие оценку",
+            "additionalProperties": {"type": "string"}
+          },
+          "score": {"type": ["number", "null"], "description": "считается скриптом"},
+          "coverage": {"type": ["number", "null"], "description": "считается скриптом, %"},
+          "confidence": {"enum": ["low", "medium", "high", null]},
+          "probability": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+          "probability_condition": {"type": ["string", "null"], "description": "при каких драйверах и отсутствии каких блокеров"},
+          "impact": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+          "impact_object": {"type": ["string", "null"], "description": "клиент / выручка / затраты / риск / бренд / компетенции"},
+          "urgency": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+          "decision_window": {"type": ["string", "null"]},
+          "decision": {"enum": ["ignore", "monitor", "test", "option", "scale"]},
+          "opportunities": {"type": "array", "items": {"type": "string"}},
+          "risks": {"type": "array", "items": {"type": "string"}},
+          "hypotheses": {"type": "array", "items": {"type": "string"}},
+          "experiment": {"type": ["string", "null"]},
+          "stop_rule": {"type": ["string", "null"]},
+          "indicators": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "kind": {"enum": ["leading", "lagging"]},
+                "source": {"type": "string"},
+                "baseline": {"type": ["string", "null"]},
+                "threshold": {"type": ["string", "null"]}
+              }
+            }
+          },
+          "owner": {"type": ["string", "null"]},
+          "next_review": {"type": ["string", "null"]},
+          "retirement": {"type": ["string", "null"]},
+          "delta": {
+            "type": ["string", "null"],
+            "description": "что изменилось с прошлой волны: ускорился / затух / новый / не подтвердился"
+          },
+          "version_notes": {"type": ["string", "null"]}
+        }
+      }
+    },
+
+    "rejected": {
+      "type": "array",
+      "description": "кандидаты, отклонённые в этой волне — обязательный раздел отчёта",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "reason": {"type": "string"},
+          "signal_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}
