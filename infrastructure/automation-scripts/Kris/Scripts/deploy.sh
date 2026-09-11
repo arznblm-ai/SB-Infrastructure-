@@ -40,10 +40,18 @@ echo "==> [2/9] Создаю каталоги на VPS"
 $SSH "mkdir -p /opt/kris /var/lib/kris/buffer /var/lib/kris/chatlog /var/lib/kris/workspace /root/.config/kris $MEMORY_DIR && chmod 700 /root/.config/kris"
 
 echo "==> [3/9] Копирую код"
-rsync -az -e "$RSH" "$SCRIPT_DIR/kris_bot.py" "$VPS:/opt/kris/"
+rsync -az -e "$RSH" \
+  "$SCRIPT_DIR/kris_bot.py" \
+  "$SCRIPT_DIR/brief_intake.py" \
+  "$SCRIPT_DIR/estimate_build.py" \
+  "$SCRIPT_DIR/estimate_diff.py" \
+  "$SCRIPT_DIR/gdrive.py" \
+  "$VPS:/opt/kris/"
 
 echo "==> [4/9] Готовлю venv и зависимости"
 $SSH 'test -d /opt/kris/venv || python3 -m venv /opt/kris/venv; /opt/kris/venv/bin/pip install -q --upgrade pip "python-telegram-bot[job-queue]"'
+# Сметы (ADR-027): разбор брифов, сборка xlsx, выгрузка в Drive.
+$SSH '/opt/kris/venv/bin/pip install -q --upgrade pymupdf python-docx google-auth google-auth-oauthlib google-api-python-client openpyxl'
 $SSH '/opt/kris/venv/bin/python -c "import telegram, apscheduler; print(\"ptb\", telegram.__version__)"'
 
 echo "==> [5/9] Собираю workspace/CLAUDE.md из персоны"

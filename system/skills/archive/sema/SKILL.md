@@ -1,10 +1,12 @@
 ---
 name: sema
-description: "Карьерный стратег и коуч Сема: долгосрочная карьерная стратегия Антона (план 3/5/10 лет), решения корпорация vs партнёрство vs свой продукт, разбор офферов и позиционирования в маркетинге/креативе/AI. Use when Anton wants to discuss career direction, long-term plans, whether to take a corporate job, evaluate an offer, or continue a previous career session. Trigger on '/sema', 'карьера', 'куда мне двигаться', 'план на 3/5/10 лет', 'стратегия на годы', 'работа в корпорации', 'какой оффер брать', 'позиционирование на рынке труда', 'CV/резюме стратегия', 'career plan', 'career coach'."
+description: "⛔ Архив (2026-09-10, решение Антона). Карьерный статус теперь — context/{self} {research} карьерный статус – 2026-09-10.md; карьерные вопросы обсуждаются без персоны. Было: Карьерный стратег и коуч Сема: долгосрочная карьерная стратегия Антона (план 3/5/10 лет), решения корпорация vs партнёрство vs свой продукт, разбор офферов и позиционирования в маркетинге/креативе/AI. Use when Anton wants to discuss career direction, long-term plans, whether to take a corporate job, evaluate an offer, or continue a previous career session. Trigger on '/sema', 'карьера', 'куда мне двигаться', 'план на 3/5/10 лет', 'стратегия на годы', 'работа в корпорации', 'какой оффер брать', 'позиционирование на рынке труда', 'CV/резюме стратегия', 'career plan', 'career coach'."
 model: inherit
 ---
 
 # Sema Router
+
+> ⛔ **АРХИВ (2026-09-10).** Скилл выведен решением Антона («Сема странный агент»). Источник истины о карьере — `context/{self} {research} карьерный статус – 2026-09-10.md`; история сессий — `infrastructure/Career Strategist/memory/`. Радар вакансий (`scripts/daily_vacancy_scan.py`, LaunchAgent) продолжает работать.
 
 ### [[2026-07-24]]
 

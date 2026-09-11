@@ -583,7 +583,7 @@ def build_page_data(model: dict, balances: dict[str, Any], as_of: _date) -> dict
             seen_toggles.add(tid)
             toggles.append({
                 "id": tid,
-                "label": spec.get("label", tid),
+                "label": spec.get("label") or tid,  # пустой label не должен ломать чип
                 "default": bool(spec.get("default", True)),
                 "off": spec.get("off", "shift"),
                 "kind": kind,
@@ -625,6 +625,23 @@ def build_page_data(model: dict, balances: dict[str, Any], as_of: _date) -> dict
             "schedule": item.get("project") in scheduled,
         })
 
+    # регулярные доходы (зарплата и т.п.): amount_net на руки, налог/команда не применяются;
+    # enabled=false — строка не попадает в счёт; toggle — обычный сценарный чип
+    recurring: list[dict[str, Any]] = []
+    for item in model.get("recurring_income", []) or []:
+        if item.get("enabled") is False:
+            continue
+        tid = push_toggle(item.get("toggle"), item.get("kind", "confirmed"))
+        recurring.append({
+            "id": item.get("id"),
+            "title": item.get("title", "?"),
+            "amount": item.get("amount_net", 0),
+            "start_month": item.get("start_month"),
+            "end_month": item.get("end_month"),
+            "toggle": tid,
+            "kind": item.get("kind", "confirmed"),
+        })
+
     crypto = model.get("crypto_reference", {}) or {}
     return {
         "updated_at": model.get("updated_at"),
@@ -634,6 +651,7 @@ def build_page_data(model: dict, balances: dict[str, Any], as_of: _date) -> dict
         "opex": model.get("opex", {"default": 50000, "min": 30000, "max": 200000, "step": 10000}),
         "months": build_forecast_months(model, as_of),
         "flows": flows,
+        "recurring": recurring,
         "toggles": toggles,
         # в JS уезжает только то, что нужно счёту и подписи (id, короткий ярлык, месяц,
         # стартовая сумма) — полные подписи и комментарии рендерит Python в детализации
@@ -823,6 +841,18 @@ function compute(opex, oneOffs, toggles) {
     });
   });
 
+  // регулярные доходы: каждый месяц горизонта в окне [start_month; end_month], если чип включён
+  (D.recurring || []).forEach(r => {
+    const on = r.toggle ? toggles[r.toggle] : true;
+    if (!on || !r.amount) return;
+    D.months.forEach(m => {
+      if (r.start_month && m.key < r.start_month) return;
+      if (r.end_month && m.key > r.end_month) return;
+      byMonth[m.key].income += r.amount;
+      byMonth[m.key].items.push({ title: r.title, net: r.amount, schedule: false, kind: r.kind });
+    });
+  });
+
   const rows = [];
   let bal = D.start_balance;
   const balances = [bal];
@@ -844,7 +874,7 @@ function compute(opex, oneOffs, toggles) {
 
     D.one_offs.forEach(o => {
       const value = oneOffs[o.id];
-      if (o.month === m.key && value > 0) { out += value; push(o.short, value); }
+      if (o.month === m.key && value) { out += value; push(o.short, value); }  // отрицательное = корректировка (например, ЗП уже выплачена)
     });
     D.tax_one_off.forEach(t => {
       if (t.month === m.key && t.amount) { out += t.amount; push(t.label, t.amount); }
@@ -1033,7 +1063,7 @@ def section_hero(balances: dict[str, Any], page: dict[str, Any]) -> str:
 def section_scenarios(page: dict[str, Any]) -> str:
     chips = "\n".join(
         f'  <label class="chip{" chip-alt" if t["kind"] == "pipeline" else ""}" id="chip-{esc(t["id"])}">'
-        f'<input type="checkbox" id="t-{esc(t["id"])}"{" checked" if t["default"] else ""}>'
+        f'<input type="checkbox" id="t-{esc(t["id"])}" autocomplete="off"{" checked" if t["default"] else ""}>'
         f'<span>{rich(t["label"])}</span></label>'
         for t in page["toggles"]
     ) or '  <span class="hint">сценарных переключателей в модели нет</span>'
@@ -1153,6 +1183,29 @@ def details_income(model: dict, marks: dict[Any, dict[str, Any]] | None = None) 
         for p in model.get("pipeline", [])
     ) or '    <tr><td colspan="6">переговоров нет</td></tr>'
 
+    scenario_pill = '<span class="pill p-warn">сценарий</span>'
+    recurring_rows = "\n".join(
+        f'    <tr><td><b>{esc(r.get("title"))}</b><div class="details">{esc(r.get("note", ""))}</div></td>'
+        f'<td class="r bal-ok">{fmt_rub(r.get("amount_net"), "")}</td>'
+        f'<td>{esc(r.get("start_month"))} → {esc(r.get("end_month") or "далее")}</td>'
+        f'<td>{scenario_pill if r.get("kind") == "pipeline" else "на руки, вне ИП"}</td></tr>'
+        for r in model.get("recurring_income", []) or [] if r.get("enabled") is not False
+    )
+    recurring_block = ""
+    if recurring_rows:
+        recurring_block = f"""
+<div class="stitle">Регулярные доходы · в месяц, на руки</div>
+<div class="scroll">
+<table class="data">
+  <thead><tr><th>Источник</th><th class="r">В месяц</th><th>Окно</th><th>Статус</th></tr></thead>
+  <tbody>
+{recurring_rows}
+  </tbody>
+</table>
+</div>
+<div class="note">{esc(model.get('recurring_income_note', ''))}</div>
+"""
+
     star_note = ""
     if sched:
         star_note = (f'<sup>*</sup> {esc(", ".join(sorted(sched)))}: команда платится графиком до прихода, '
@@ -1177,6 +1230,7 @@ def details_income(model: dict, marks: dict[Any, dict[str, Any]] | None = None) 
 <div class="note"><b>Смета</b> — сумма договора до вычетов. <b>Чистыми</b> — что остаётся после выплат
 команде и налога {esc(default_pct)}%. В помесячной таблице выше стоят именно «чистыми».<br>{star_note}</div>
 {flags}
+{recurring_block}
 <div class="stitle">CRM · в переговорах (в базу не считается)</div>
 <div class="scroll">
 <table class="data">

@@ -1,0 +1,19 @@
+{
+  "client": "СИБУР",
+  "project": "Мелиорация - продуктовый AI-ролик 60-75 сек",
+  "production": null,
+  "variant": "base",
+  "fee_pct": 0.05,
+  "tax_pct": 0.15,
+  "lines": [
+    {"role": "producer", "qty": 1, "days": 15},
+    {"role": "art_director", "qty": 1, "days": 10},
+    {"role": "ai_artist", "qty": 3, "days": 12},
+    {"role": "designer_2d", "qty": 1, "days": 6},
+    {"role": "editor", "qty": 1, "days": 3},
+    {"role": "sound_producer", "qty": 1},
+    {"role": "voice_over", "qty": 1},
+    {"role": "audiostock", "qty": 1}
+  ],
+  "unknown": []
+}

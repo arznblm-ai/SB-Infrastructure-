@@ -22,10 +22,17 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import tempfile
 from datetime import datetime, time as dtime, timezone
 from functools import wraps
+from pathlib import Path
+
+import brief_intake
+import estimate_build
+import estimate_diff
+import gdrive
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -67,6 +74,19 @@ LOG_FILE = os.path.join(STATE_DIR, "kris.log")
 # Белый список инструментов модели. Bash сюда не входит и входить не должен:
 # Крис регулярно читает недоверенный групповой текст.
 ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep"
+
+# --- Сметы (ADR-027) -------------------------------------------------------
+# Шаблон xlsx, поверх которого собирается смета; дефолт - эталон в memory/templates.
+ESTIMATE_TEMPLATE = os.environ.get(
+    "KRIS_ESTIMATE_TEMPLATE", str(estimate_build.DEFAULT_TEMPLATE)
+)
+# Папка Google Drive, куда уходят готовые сметы.
+DRIVE_FOLDER = os.environ.get("KRIS_DRIVE_FOLDER", "ESTIMATES")
+# Telegram не отдаёт боту файлы больше 20 МБ - проверяем до вызова модели.
+MAX_DOC_BYTES = 20 * 1024 * 1024
+# Не больше трёх вызовов модели на один бриф (ход владельца + попытки починки JSON).
+ESTIMATE_CALLS_MAX = 3
+DRIVE_NOT_CONFIGURED = "Drive не настроен (gdrive.py --auth)"
 
 CLAUDE_TIMEOUT = 900  # секунд, батч бывает длинным
 TG_LIMIT = 4000
@@ -514,6 +534,9 @@ def default_state() -> dict:
         "last_run_at": None,
         "last_batch_at": None,
         "last_evening_at": None,
+        # сметы: id папки на Drive и счётчик вызовов модели на текущий бриф
+        "drive_folder_id": None,
+        "estimate_calls": 0,
     }
 
 
@@ -694,6 +717,343 @@ async def send_to_owner(bot, text) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Сметы: вход (документы и ссылки), выход (xlsx + Drive), сверка правок
+#
+# Код - руки на входе и на выходе. Модель решает, бриф ли это и как считать;
+# код приводит вход к тексту, собирает xlsx из её estimate.json и присылает
+# владельцу машинную строку с итогом. Состояние диалога держит сама сессия.
+# ---------------------------------------------------------------------------
+URL_RE = re.compile(r"https?://\S+")
+RECONCILE_RE = re.compile(r"^\s*сверь\s+смету", re.IGNORECASE)
+
+RULES_FILE = "memory/knowledge/{alina} {rule} правила расчёта – 2026-08-18.md"
+
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def find_url(text):
+    """Первая http(s)-ссылка в тексте или None."""
+    if not text:
+        return None
+    m = URL_RE.search(str(text))
+    return m.group(0).rstrip(").,;") if m else None
+
+
+def is_reconcile(text) -> bool:
+    """Владелец просит сверить правленую смету."""
+    return bool(text) and bool(RECONCILE_RE.match(str(text)))
+
+
+def slugify(value, limit: int = 40) -> str:
+    """Кириллица -> ASCII-slug для имени файла."""
+    out = []
+    for ch in str(value or "").lower():
+        out.append(_TRANSLIT.get(ch, ch))
+    text = "".join(out)
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return text[:limit].strip("-") or "x"
+
+
+def estimate_filename(client, project, when=None) -> str:
+    """EST_<client>_<project>_<DD-MM-YY>.xlsx, ASCII, не длиннее 60 символов."""
+    stamp = (when or datetime.now()).strftime("%d-%m-%y")
+    client_slug = slugify(client, 20)
+    tail = f"_{stamp}.xlsx"
+    room = 60 - len("EST_") - len(client_slug) - 1 - len(tail)
+    project_slug = slugify(project, max(room, 4))
+    return f"EST_{client_slug}_{project_slug}{tail}"
+
+
+def build_estimate_message(name, total, subtotal, link, missing_roles=None) -> str:
+    """Машинное сообщение владельцу. Формирует код, не модель."""
+    money = estimate_diff.format_money
+    text = (
+        f"Смета: {name} · итого {money(total)} ₽ "
+        f"(subtotal {money(subtotal)}) · {link}"
+    )
+    if missing_roles:
+        text += "\nБез ставки: " + ", ".join(str(r) for r in missing_roles) + " - итог неполный"
+    return text
+
+
+def out_dir(workspace=None) -> Path:
+    return Path(workspace or WORKSPACE) / "out"
+
+
+def done_path(json_path) -> Path:
+    return Path(str(json_path) + ".done")
+
+
+def scan_estimates(workspace=None) -> list:
+    """estimate.json в workspace/out/*/ без соседнего .done, по возрасту файла."""
+    base = out_dir(workspace)
+    if not base.is_dir():
+        return []
+    found = [p for p in base.glob("*/estimate.json") if not done_path(p).exists()]
+    return sorted(found, key=lambda p: (p.stat().st_mtime, str(p)))
+
+
+def latest_done(workspace=None):
+    """Последняя собранная смета (файл .done) или None."""
+    base = out_dir(workspace)
+    if not base.is_dir():
+        return None
+    marks = list(base.glob("*/estimate.json.done"))
+    if not marks:
+        return None
+    return max(marks, key=lambda p: p.stat().st_mtime)
+
+
+def write_done(json_path, xlsx_path, link, file_id=None) -> Path:
+    mark = done_path(json_path)
+    mark.write_text(
+        json.dumps(
+            {
+                "json": str(json_path),
+                "xlsx": str(xlsx_path),
+                "link": link,
+                "file_id": file_id,
+                "at": now_iso(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return mark
+
+
+def drive_or_none():
+    """Drive, если токен на месте; иначе None. Ошибки конфигурации не роняют бота."""
+    try:
+        drive = gdrive.Drive.from_env()
+        return drive if drive.is_configured() else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Drive недоступен: %s", exc)
+        return None
+
+
+def _drive_folder_id(drive) -> str:
+    """id папки смет; кэшируем в state.json, чтобы не искать её каждый раз."""
+    state = load_state()
+    cached = state.get("drive_folder_id")
+    if cached:
+        return cached
+    folder_id = drive.ensure_folder(DRIVE_FOLDER)
+    state = load_state()
+    state["drive_folder_id"] = folder_id
+    save_state(state)
+    return folder_id
+
+
+def build_one(json_path, drive=None) -> dict:
+    """Собрать одну смету: xlsx, копия в память, выгрузка в Drive.
+
+    ValueError (невалидный JSON или схема) пробрасывается наверх - его чинит
+    модель. Ошибка Drive не отменяет смету: xlsx уже сохранён в памяти.
+    """
+    json_path = Path(json_path)
+    try:
+        estimate = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"не читается estimate.json: {exc}") from exc
+    if not isinstance(estimate, dict):
+        raise ValueError("estimate.json: ожидается объект")
+
+    name = estimate_filename(estimate.get("client"), estimate.get("project"))
+    result = estimate_build.build(estimate, Path(ESTIMATE_TEMPLATE), json_path.parent / name)
+
+    memory_copy = None
+    try:
+        target_dir = Path(MEMORY_DIR) / "estimates"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        memory_copy = target_dir / name
+        shutil.copy2(result.out_path, memory_copy)
+    except OSError as exc:
+        logger.warning("Не смог положить смету в память: %s", exc)
+        memory_copy = None
+
+    link, file_id, drive_error = DRIVE_NOT_CONFIGURED, None, None
+    if drive is not None:
+        try:
+            uploaded = drive.upload(result.out_path, _drive_folder_id(drive))
+            link = uploaded.get("webViewLink") or DRIVE_NOT_CONFIGURED
+            file_id = uploaded.get("id")
+        except Exception as exc:  # noqa: BLE001 - DriveError и сетевые сбои
+            drive_error = str(exc)
+            link = "ссылки нет (Drive не ответил)"
+            logger.warning("Drive: смета не выгружена: %s", exc)
+
+    return {
+        "name": name,
+        "result": result,
+        "link": link,
+        "file_id": file_id,
+        "drive_error": drive_error,
+        "memory_copy": str(memory_copy) if memory_copy else None,
+        "message": build_estimate_message(
+            name, result.total, result.subtotal, link, result.missing_roles
+        ),
+    }
+
+
+async def _fix_estimate_json(bot, chat_id, json_path, error) -> bool:
+    """Один повторный вызов модели: «почини estimate.json». True - можно пересканировать."""
+    state = load_state()
+    calls = int(state.get("estimate_calls") or 0)
+    if calls >= ESTIMATE_CALLS_MAX:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"Смета не собралась: {error}. Три попытки исчерпаны, "
+                f"файл {json_path} оставила как есть."
+            ),
+        )
+        return False
+
+    state["estimate_calls"] = calls + 1
+    save_state(state)
+
+    prompt = (
+        f"Файл {json_path}: estimate.json невалиден: {error}. "
+        "Исправь файл, ничего больше не делай."
+    )
+    reply, new_sid, error_kind = await run_claude(prompt, state.get("session_id"))
+    if error_kind:
+        logger.warning("Починка estimate.json не удалась: %s", error_kind)
+        await bot.send_message(chat_id=chat_id, text=human_error(reply))
+        return False
+    if new_sid:
+        fresh = load_state()
+        fresh["session_id"] = new_sid
+        save_state(fresh)
+    return True
+
+
+async def publish_estimates(bot, chat_id) -> None:
+    """Пост-хук хода владельца: собрать всё, что модель положила в workspace/out."""
+    for _ in range(ESTIMATE_CALLS_MAX + 1):
+        pending = scan_estimates()
+        if not pending:
+            return
+
+        drive = drive_or_none()
+        broken = []
+        for json_path in pending:
+            try:
+                info = await asyncio.to_thread(build_one, json_path, drive)
+            except ValueError as exc:
+                logger.warning("Смета %s невалидна: %s", json_path, exc)
+                broken.append((json_path, str(exc)))
+                continue
+            except Exception as exc:  # noqa: BLE001 - смета не должна ронять бота
+                logger.exception("Сборка сметы %s упала: %s", json_path, exc)
+                write_done(json_path, "", f"сборка не удалась: {exc}")
+                await bot.send_message(
+                    chat_id=chat_id, text=f"Смету собрать не смогла: {exc}"
+                )
+                continue
+
+            write_done(json_path, info["result"].out_path, info["link"], info["file_id"])
+            await bot.send_message(chat_id=chat_id, text=info["message"])
+            if info["drive_error"]:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"Drive: {info['drive_error']}. Файл сохранён в памяти: "
+                        f"{info['memory_copy'] or info['result'].out_path}"
+                    ),
+                )
+
+        if not broken:
+            return
+        json_path, error = broken[0]
+        if not await _fix_estimate_json(bot, chat_id, json_path, error):
+            return
+
+
+# --- Вход: документы и ссылки ---------------------------------------------
+def compose_intake_prompt(block: str, note=None) -> str:
+    """Блок брифа плюс подпись/текст владельца, если он что-то написал."""
+    note = (note or "").strip()
+    return f"{block}\n\n{note}" if note else block
+
+
+async def intake_document(bot, document, note=None) -> str:
+    """Скачать документ из Telegram и привести к тексту для модели."""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="kris-doc-"))
+    try:
+        tg_file = await bot.get_file(document.file_id)
+        dest = tmp_dir / (document.file_name or "brief.bin")
+        await tg_file.download_to_drive(custom_path=str(dest))
+        result = await asyncio.to_thread(
+            brief_intake.ingest_file, dest, Path(WORKSPACE), document.file_name
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return compose_intake_prompt(brief_intake.prompt_block(result), note)
+
+
+async def intake_link(url: str, note=None) -> str:
+    """Ссылка (Google Docs/Slides и т.п.) -> текст брифа для модели."""
+    result = await asyncio.to_thread(
+        brief_intake.ingest_url, url, Path(WORKSPACE), drive_or_none()
+    )
+    return compose_intake_prompt(brief_intake.prompt_block(result), note)
+
+
+# --- Сверка правленой сметы ------------------------------------------------
+def reconcile_prompt(diff_lines, note=None) -> str:
+    """Промпт модели по дифу правок Антона. Формирует код, чтобы урок не выдумывался."""
+    body = "\n".join(f"- {line}" for line in diff_lines) if diff_lines else "- расхождений нет"
+    text = (
+        "Антон поправил смету руками, вот диф:\n"
+        f"{body}\n"
+        f"Запиши урок в `{RULES_FILE}` (append, статус ✅ Антон, дата) "
+        "и ответь одной строкой, что записала."
+    )
+    note = (note or "").strip()
+    return f"{text}\n\nКомментарий Антона: {note}" if note else text
+
+
+def build_reconcile_prompt(note=None):
+    """(prompt, error) - синхронная часть сверки: скачать xlsx с Drive и посчитать диф."""
+    mark = latest_done()
+    if mark is None:
+        return None, "Пока нечего сверять: собранных смет нет."
+    try:
+        info = json.loads(mark.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, f"Не читается отметка о смете: {exc}"
+
+    file_id = info.get("file_id")
+    drive = drive_or_none()
+    if drive is None:
+        return None, DRIVE_NOT_CONFIGURED
+    if not file_id:
+        return None, "У последней сметы нет файла на Drive - сверять не с чем."
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="kris-diff-dl-"))
+    try:
+        local = drive.download(file_id, tmp_dir / "edited.xlsx")
+        estimate = json.loads(Path(info["json"]).read_text(encoding="utf-8"))
+        lines = estimate_diff.diff(estimate, local, Path(ESTIMATE_TEMPLATE))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Сверка сметы не удалась: %s", exc)
+        return None, f"Сверка не удалась: {exc}"
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return reconcile_prompt(lines, note), None
+
+
+# ---------------------------------------------------------------------------
 # Авторизация (только личка владельца)
 # ---------------------------------------------------------------------------
 def owner_only(func):
@@ -846,6 +1206,10 @@ async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
 
             state = load_state()
             session_id = state.get("session_id")
+            # Ход владельца - тоже вызов модели «на этот бриф»: счётчик общий
+            # с попытками починить estimate.json, лимит ESTIMATE_CALLS_MAX.
+            state["estimate_calls"] = int(state.get("estimate_calls") or 0) + 1
+            save_state(state)
 
             typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
             try:
@@ -864,10 +1228,66 @@ async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Ошибка при отправке ответа: %s", exc)
 
+            # Пост-хук: модель могла положить estimate.json - собираем xlsx,
+            # выгружаем и шлём владельцу машинную строку с итогом.
+            try:
+                await publish_estimates(bot, chat_id)
+            except Exception as exc:  # noqa: BLE001 - смета не должна ронять диалог
+                logger.exception("Пост-хук смет упал: %s", exc)
+
             if pending_queue:
                 current = pending_queue.popleft()
                 continue
             break
+
+
+async def build_owner_prompt(bot, chat_id, message) -> str:
+    """Сообщение владельца -> промпт модели.
+
+    Документ и ссылка приводятся к тексту здесь, кодом: у модели нет ни Bash,
+    ни сети. Бриф это или нет - решает модель, код не фильтрует.
+    """
+    text = message.text or message.caption
+    document = getattr(message, "document", None)
+
+    if document is not None:
+        if (getattr(document, "file_size", 0) or 0) > MAX_DOC_BYTES:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Файл слишком большой, пришли PDF до 20 МБ",
+            )
+            return None
+        try:
+            return await intake_document(bot, document, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Не разобрала документ: %s", exc)
+            await bot.send_message(
+                chat_id=chat_id, text=f"Не смогла разобрать файл: {exc}"
+            )
+            return None
+
+    if not text:
+        return None
+
+    if is_reconcile(text):
+        prompt, error = await asyncio.to_thread(build_reconcile_prompt, text)
+        if error:
+            await bot.send_message(chat_id=chat_id, text=error)
+            return None
+        return prompt
+
+    url = find_url(text)
+    if url:
+        try:
+            return await intake_link(url, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Не разобрала ссылку %s: %s", url, exc)
+            await bot.send_message(
+                chat_id=chat_id, text=f"Не смогла разобрать ссылку: {exc}"
+            )
+            return None
+
+    return text
 
 
 @owner_only
@@ -875,18 +1295,25 @@ async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     message = update.message
     if message is None:
         return
-    text = message.text or message.caption
-    if not text:
-        return
     chat_id = update.effective_chat.id
     bot = context.bot
 
+    # Новое сообщение владельца - новый бриф: счётчик вызовов модели обнуляем.
+    state = load_state()
+    if state.get("estimate_calls"):
+        state["estimate_calls"] = 0
+        save_state(state)
+
+    prompt = await build_owner_prompt(bot, chat_id, message)
+    if not prompt:
+        return
+
     if claude_lock.locked():
-        pending_queue.append(text)
+        pending_queue.append(prompt)
         await bot.send_message(chat_id=chat_id, text="В очереди, сейчас занята")
         return
 
-    await run_owner_turn(bot, chat_id, text)
+    await run_owner_turn(bot, chat_id, prompt)
 
 
 # ---------------------------------------------------------------------------
