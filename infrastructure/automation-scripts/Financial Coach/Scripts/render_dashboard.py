@@ -783,7 +783,7 @@ CSS = """
     justify-content:space-between;align-items:flex-end;font-size:10.5px;color:var(--faint)}
   footer{margin-top:26px;font-size:12.5px;color:var(--faint);line-height:1.7}
   @media (max-width:720px){
-    .hero{grid-template-columns:1fr;gap:10px}
+    .hero{grid-template-columns:repeat(2,1fr);gap:10px}
     .panel{background:transparent;border-radius:0;overflow:visible}
     .months,.months tbody,.months tr,.months td{display:block;width:100%}
     .months thead{display:none}
@@ -795,6 +795,7 @@ CSS = """
       letter-spacing:.05em;color:var(--faint);margin-bottom:3px}
     .months td:first-child::before{display:none}
   }
+  @media (max-width:560px){ .hero{grid-template-columns:1fr} }
   @media (max-width:400px){ body{padding:16px 12px 40px} .hero .v{font-size:28px} }
 """
 
@@ -817,6 +818,67 @@ const toggleState = () => {
   D.toggles.forEach(t => { const n = el('t-' + t.id); s[t.id] = n ? n.checked : t.default; });
   return s;
 };
+
+// тумблеры зарплаты Луча: для метрики «runway без зарплаты» они принудительно выключаются,
+// как бы ни стояли чипы на странице (id заданы в model.json, recurring_income.toggle)
+const SALARY_TOGGLES = ['luch-on', 'luch-bonus'];
+const MONTHS_IN = ['январе','феврале','марте','апреле','мае','июне',
+                   'июле','августе','сентябре','октябре','ноябре','декабре'];
+const num1 = (v) => v.toFixed(1).replace('.', ',');
+
+// '2027-02' -> 'феврале 2027' (год добавляем, если он не совпадает с годом снапшота)
+function monthIn(key) {
+  const y = parseInt(key.slice(0, 4), 10), m = parseInt(key.slice(5, 7), 10);
+  const baseYear = parseInt(D.months[0].key.slice(0, 4), 10);
+  const name = MONTHS_IN[m - 1] || key;
+  return y === baseYear ? name : name + ' ' + y;
+}
+
+// сдвиг ключа месяца на n месяцев вперёд (для экстраполяции за горизонт)
+function monthShift(key, n) {
+  const y = parseInt(key.slice(0, 4), 10), m = parseInt(key.slice(5, 7), 10);
+  const t = (y * 12 + (m - 1)) + n;
+  return String(Math.floor(t / 12)) + '-' + String(t % 12 + 1).padStart(2, '0');
+}
+
+// доля месяца, которая реально считается: у первого месяца это хвост от даты снапшота
+const monthSpan = (m) => (m.days_total && m.days_left != null) ? m.days_left / m.days_total : 1;
+
+// Устойчивая месячная дельта баланса по последним трём месяцам цепочки: МЕДИАНА, не среднее.
+// Среднее маскирует темп проедания, если в хвосте сидит разовая выплата (накопленный бонус):
+// дельты +50к / −100к / −100к дают среднее −50к, хотя устойчивый наклон — −100к.
+// Медиана выброс игнорирует и не требует знать, какая именно строка разовая.
+function tailSlope(r) {
+  const n = r.balances.length - 1;           // число месяцев в цепочке
+  if (n < 1) return 0;
+  const k = Math.min(3, n);
+  const deltas = [];
+  for (let i = n - k; i < n; i++) deltas.push(r.balances[i + 1] - r.balances[i]);
+  deltas.sort((a, b) => a - b);
+  const mid = Math.floor(deltas.length / 2);
+  return deltas.length % 2 ? deltas[mid] : (deltas[mid - 1] + deltas[mid]) / 2;
+}
+
+// Сколько месяцев от даты снапшота до ухода баланса ниже нуля.
+// Внутри месяца пересечения — линейная интерполяция; за горизонтом — экстраполяция
+// средней дельтой последних трёх месяцев.
+function runwayOf(r) {
+  let t = 0;
+  for (let i = 0; i < D.months.length; i++) {
+    const span = monthSpan(D.months[i]);
+    const b0 = r.balances[i], b1 = r.balances[i + 1];
+    if (b1 < 0) {
+      const frac = (b0 > 0 && b0 !== b1) ? b0 / (b0 - b1) : 0;
+      return { months: t + span * frac, key: D.months[i].key, beyond: false, melts: true };
+    }
+    t += span;
+  }
+  const slope = tailSlope(r);
+  if (slope >= 0) return { months: null, key: null, beyond: true, melts: false };
+  const last = D.months[D.months.length - 1];
+  const extra = r.balances[r.balances.length - 1] / (-slope);
+  return { months: t + extra, key: monthShift(last.key, Math.ceil(extra)), beyond: true, melts: true };
+}
 
 function compute(opex, oneOffs, toggles) {
   const salary = D.salary;
@@ -982,10 +1044,46 @@ function render() {
   } else {
     el('hero-next-val').textContent = '—';
     el('hero-next-val').className = 'v num';
-    el('hero-next-sub').textContent = 'приходов в модели до конца года нет';
+    el('hero-next-sub').textContent = 'дальше приходов в модели нет';
   }
   el('hero-eoy-val').textContent = fmt(r.final);
   el('hero-eoy-val').className = 'v num ' + hc(r.final);
+
+  // остаток на 1 января следующего года = баланс на конец декабря (строка ищется по ключу)
+  const decVal = el('hero-dec-val');
+  if (decVal) {
+    const di = D.months.findIndex(m => m.key === decVal.dataset.key);
+    if (di >= 0) {
+      const decBal = r.balances[di + 1];
+      decVal.textContent = fmt(decBal);
+      decVal.className = 'v num ' + hc(decBal);
+    }
+  }
+
+  // runway без зарплаты Луча: та же цепочка, но оба тумблера зарплаты выключены принудительно
+  const noSalary = Object.assign({}, toggles);
+  SALARY_TOGGLES.forEach(id => { if (id in noSalary) noSalary[id] = false; });
+  const rNo = compute(opex, oneOffs, noSalary);
+  const rw = runwayOf(rNo);
+  const burn = rNo.monthlyBurn;
+  if (!rw.melts) {
+    el('hero-runway-val').textContent = 'не тает';
+    el('hero-runway-val').className = 'v num v-ok';
+    el('hero-runway-sub').textContent = 'без зарплаты пул за горизонт прогноза не уходит в минус: '
+      + 'приходы перекрывают burn';
+  } else {
+    const withCrypto = burn > 0 ? rw.months + D.crypto_rub / burn : rw.months;
+    el('hero-runway-val').textContent = (rw.beyond ? '~' : '') + num1(rw.months) + ' мес';
+    el('hero-runway-val').className = 'v num ' + (rw.months >= 5 ? 'v-ok' : rw.months >= 3 ? 'v-warn' : 'v-bad');
+    el('hero-runway-sub').textContent = 'ноль в ' + monthIn(rw.key) + (rw.beyond ? ' (за горизонтом)' : '')
+      + ' · с криптой ~' + num1(withCrypto) + ' мес';
+  }
+
+  // наклон пула при текущих чипах (не runway): средняя дельта последних трёх месяцев
+  const slope = tailSlope(r);
+  el('hero-slope-val').textContent = (slope >= 0 ? '+' : '') + fmt(slope) + '/мес';
+  el('hero-slope-val').className = 'v num ' + (slope >= 0 ? 'v-ok' : 'v-warn');
+  el('hero-slope-sub').textContent = slope >= 0 ? 'пул растёт' : 'наклон пула, пока Антон работает';
 
   drawChart(r.balances);
 
@@ -1002,7 +1100,7 @@ function render() {
   const runway = (r.final / r.monthlyBurn).toFixed(1);
   if (r.minBal >= 300000) {
     cls = 'v-good';
-    msg = 'Год закрывается на ' + fmt(r.final) + '. Минимум за период ' + fmt(r.minBal) + ' (' + r.minMonth +
+    msg = 'Период закрывается на ' + fmt(r.final) + ' (' + D.months[D.months.length-1].label + '). Минимум за период ' + fmt(r.minBal) + ' (' + r.minMonth +
           '). Runway в 2027 без новых продаж: ~' + runway + ' мес.';
   } else if (r.minBal >= 0) {
     cls = 'v-mid';
@@ -1010,7 +1108,7 @@ function render() {
           '. Runway: ~' + runway + ' мес.';
   } else {
     cls = 'v-crit';
-    msg = 'Кассовый разрыв в ' + r.minMonth + ' (' + fmt(r.minBal) + '). Год закрывается на ' + fmt(r.final) + '.';
+    msg = 'Кассовый разрыв в ' + r.minMonth + ' (' + fmt(r.minBal) + '). Период закрывается на ' + fmt(r.final) + ' (' + D.months[D.months.length-1].label + ').';
   }
   el('verdict').className = 'verdict ' + cls;
   el('verdict').innerHTML = '<b>Вердикт.</b> ' + msg;
@@ -1034,11 +1132,26 @@ def scheduled_projects(model: dict) -> list[str]:
 
 
 def section_hero(balances: dict[str, Any], page: dict[str, Any]) -> str:
-    """Три крупных числа. Первое статично, два других считает JS от сценариев."""
+    """Крупные числа. Первое статично, остальные считает JS от сценариев и слайдеров."""
     if balances["verified"]:
         cash_note = f"снапшот ПланФакта {esc(balances['date'])} · рублёвые счета"
     else:
         cash_note = f"not verified: {esc(balances['problem'])} — цифра из handoff"
+    horizon = (page['months'][-1]['label'] if page.get('months') else 'конец периода')
+    horizon = horizon[:1].lower() + horizon[1:]
+
+    # карточка «на 1 января следующего года» рендерится, только если декабрь есть в горизонте
+    months = page.get("months") or []
+    base_year = int(months[0]["key"][:4]) if months else 0
+    dec_key = f"{base_year}-12"
+    dec_card = ""
+    if any(m["key"] == dec_key for m in months):
+        dec_card = f"""
+  <div class="box">
+    <div class="k">Остаток на 1 января {base_year + 1}</div>
+    <div class="v num" id="hero-dec-val" data-key="{dec_key}">—</div>
+    <div class="n">конец года</div>
+  </div>"""
     return f"""
 <div class="hero">
   <div class="box">
@@ -1052,9 +1165,19 @@ def section_hero(balances: dict[str, Any], page: dict[str, Any]) -> str:
     <div class="n" id="hero-next-sub">—</div>
   </div>
   <div class="box">
-    <div class="k">Остаток на конец года</div>
+    <div class="k">Остаток на {horizon}</div>
     <div class="v num" id="hero-eoy-val">—</div>
     <div class="n">при текущих допущениях (сценарии ниже)</div>
+  </div>{dec_card}
+  <div class="box">
+    <div class="k">Runway без зарплаты</div>
+    <div class="v num" id="hero-runway-val">—</div>
+    <div class="n" id="hero-runway-sub">—</div>
+  </div>
+  <div class="box">
+    <div class="k">С зарплатой</div>
+    <div class="v num" id="hero-slope-val">—</div>
+    <div class="n" id="hero-slope-sub">—</div>
   </div>
 </div>
 """
@@ -1088,8 +1211,12 @@ def section_months(model: dict, page: dict[str, Any]) -> str:
             f'платится графиком до прихода денег (в расходах — отдельными строками по месяцам), '
             f'а не удерживается из прихода. «Чистыми» здесь = смета − налог.</div>'
         )
+    horizon = (page['months'][-1]['label'] if page.get('months') else 'конец периода')
+    horizon = horizon[:1].lower() + horizon[1:]
+    first_month = (page['months'][0]['label'] if page.get('months') else '')
+    first_month = first_month[:1].lower() + first_month[1:]
     return f"""
-<div class="stitle">Помесячно до конца года</div>
+<div class="stitle">Помесячно: {first_month} — {horizon}</div>
 <div class="panel">
 <table class="months">
   <thead><tr>
@@ -1097,7 +1224,7 @@ def section_months(model: dict, page: dict[str, Any]) -> str:
   </tr></thead>
   <tbody id="tbody"></tbody>
   <tfoot><tr class="year">
-    <td data-l="Итог"><div class="mname">Итог года</div>
+    <td data-l="Итог"><div class="mname">Итог периода</div>
       <div class="hint">старт {fmt_rub(page['start_balance'])}</div></td>
     <td data-l="Приходы, чистыми" class="r"><div class="amt" id="year-in">—</div></td>
     <td data-l="Расходы" class="r"><div class="amt" id="year-out">—</div></td>

@@ -5,7 +5,7 @@ track_key.py — ключ `track:` во frontmatter заметок (ADR-024/025)
 Ключ отвечает на вопрос «к какому делу относится заметка» и заменяет догадку по прозе.
 Закрытый словарь (источник истины — `context/{self} {plan} карта треков – 2026-08-19.md`):
 
-    consulting | producer | ugsee | archive | none
+    zekiro | producer | luch | ugsee | archive | none
 
 Режимы:
   --apply-map <file.json>   проставить ключ по карте {"meetings/файл.md": "consulting", ...}
@@ -25,7 +25,7 @@ from pathlib import Path
 
 VAULT = Path("/Users/anton/AI AGENT FOLDER/Second Brain")
 FOLDERS = ["meetings", "education"]
-VOCAB = {"consulting", "producer", "ugsee", "archive", "none"}
+VOCAB = {"zekiro", "producer", "luch", "ugsee", "archive", "none"}
 SKIP = {"index.md", "README.md"}
 
 
