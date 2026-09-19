@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Шпаргалка с телефона: проверить авторизацию Claude и перезапустить группового Марко.
+set -uo pipefail
+ENV_FILE=/root/.config/marco-group/.env
+set -a; . "$ENV_FILE"; set +a
+echo "== Проверка Claude (до 90 с)"
+OUT="$(cd /var/lib/marco-group/workspace && timeout 90 /root/.local/bin/claude -p 'ответь одним словом: ок' --model "${MARCO_MODEL:-opus}" --output-format json 2>&1)"
+if printf '%s' "$OUT" | grep -q '"is_error":false'; then echo "   Claude отвечает"; else echo "   Claude НЕ отвечает:"; printf '%s' "$OUT" | grep -o '"result":"[^"]*"' | head -1; fi
+echo "== Перезапуск бота"
+systemctl restart marco-group; sleep 4
+systemctl is-active marco-group
+journalctl -u marco-group -n 5 --no-pager | cut -c1-160

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Одна команда: выпускает долгоживущий токен Claude и сама кладёт его в конфиг Марко.
+# Токен никуда копировать не надо: он вынимается из вывода setup-token на сервере.
+set -uo pipefail
+ENV_FILE=/root/.config/marco-group/.env
+LOG="$(mktemp /root/.config/marco-group/.setup.XXXXXX)"
+chmod 600 "$LOG"
+trap 'shred -u "$LOG" 2>/dev/null || rm -f "$LOG"' EXIT
+echo "Сейчас откроется вход Claude: открой ссылку в браузере, войди, нажми Copy code, вставь код сюда."
+script -qfc "/root/.local/bin/claude setup-token" "$LOG"
+TOKEN="$(python3 - "$LOG" <<'PY'
+import re, sys
+text = open(sys.argv[1], errors="ignore").read()
+text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r", "", text)
+found = re.findall(r"(sk-ant-oat[\w-]+)[ \t]*(?:\n[ \t]*([\w-]+)[ \t]*(?=\n))?", text)
+print("".join(found[-1]) if found else "")
+PY
+)"
+if [ -z "$TOKEN" ]; then echo "Не нашёл токен в выводе setup-token. Ничего не менял."; exit 1; fi
+sed -i '/^CLAUDE_CODE_OAUTH_TOKEN=/d;/^# Долгоживущий токен Claude/d' "$ENV_FILE"
+printf '\n# Долгоживущий токен Claude (claude setup-token), не зависит от /login\nCLAUDE_CODE_OAUTH_TOKEN=%s\n' "$TOKEN" >> "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+clear
+echo "Токен записан в конфиг (${#TOKEN} символов)."
+exec /usr/local/bin/marco-fix

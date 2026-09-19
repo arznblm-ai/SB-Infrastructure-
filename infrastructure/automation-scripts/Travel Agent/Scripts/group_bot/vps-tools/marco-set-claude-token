@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Кладёт долгоживущий токен Claude (claude setup-token) в конфиг группового Марко.
+# Токен вводится скрыто, в историю shell и в логи не попадает.
+set -euo pipefail
+ENV_FILE=/root/.config/marco-group/.env
+printf '\e[?2004l'   # выключаем bracketed paste: иначе терминал добавляет к вставке служебные символы
+read -r -s -p "Вставь токен (sk-ant-oat...) и нажми Enter: " RAW; echo
+# токен мог вставиться в две строки - дочитываем хвост, если он есть
+while read -r -s -t 1 MORE; do RAW="$RAW$MORE"; done
+TOKEN="$(printf '%s' "$RAW" | tr -d '[:space:]' | grep -oE 'sk-ant-oat[A-Za-z0-9_-]+' | head -1 || true)"
+[ -n "$TOKEN" ] || { echo "Не нашёл во вставленном токен вида sk-ant-oat... (получено символов: ${#RAW})"; exit 1; }
+echo "Токен принят (${#TOKEN} символов)."
+sed -i '/^CLAUDE_CODE_OAUTH_TOKEN=/d' "$ENV_FILE"
+printf '\n# Долгоживущий токен Claude (claude setup-token), не зависит от /login\nCLAUDE_CODE_OAUTH_TOKEN=%s\n' "$TOKEN" >> "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+systemctl restart marco-group
+echo "Токен записан, бот перезапущен. Проверяю модель..."
+exec /usr/local/bin/marco-fix

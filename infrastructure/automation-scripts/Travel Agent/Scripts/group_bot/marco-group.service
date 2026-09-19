@@ -1,0 +1,18 @@
+[Unit]
+Description=Marco Group - тревел-компаньон в групповом чате (Telegram + claude CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/marco-group/workspace
+Environment=HOME=/root
+Environment=MARCO_YTDLP_BIN=/opt/marco-group/venv/bin/yt-dlp
+EnvironmentFile=/root/.config/marco-group/.env
+ExecStart=/opt/marco-group/venv/bin/python /opt/marco-group/marco_group_bot.py
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
