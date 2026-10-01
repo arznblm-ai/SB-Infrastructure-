@@ -38,6 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import gcal_sync
 import media_intake
 import reel_meta
 
@@ -111,6 +112,11 @@ REF_SOURCES = [
 
 # Bash не выдаём: модель читает недоверенный текст чата и подписи рилсов.
 ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,WebSearch,WebFetch"
+
+# Google Calendar: модель ведёт group/calendar.json, код раскладывает его в один
+# выделенный календарь. Пустой id или отсутствующий ключ = синк молча выключен.
+GCAL_CALENDAR_ID = (os.environ.get("GCAL_CALENDAR_ID") or "").strip()
+GCAL_KEY_FILE = os.environ.get("GCAL_KEY_FILE", gcal_sync.DEFAULT_KEY_FILE)
 
 def _env_flag(name, default="1"):
     return (os.environ.get(name, default) or default).strip().lower() not in {
@@ -1136,6 +1142,11 @@ def default_state():
         "last_segments": [],
         "last_run_at": None,
         "last_tick_at": None,
+        # {slug: hash} успешно уехавших в Google событий + витрина для /status.
+        "gcal_synced": {},
+        "gcal_last_sync": None,
+        "gcal_events": 0,
+        "gcal_errors": 0,
     }
 
 
@@ -1404,6 +1415,64 @@ async def sync_pin(bot, group_dir=None):
 
 
 # ---------------------------------------------------------------------------
+# Пост-хук календаря: group/calendar.json -> Google Calendar
+# ---------------------------------------------------------------------------
+_gcal_client = None
+
+
+def gcal_enabled():
+    """Читается каждый раз: ключ могли положить на сервер уже после старта."""
+    return gcal_sync.enabled(GCAL_CALENDAR_ID, GCAL_KEY_FILE)
+
+
+def get_gcal_client():
+    global _gcal_client
+    if _gcal_client is None:
+        _gcal_client = gcal_sync.GCalClient(GCAL_CALENDAR_ID, GCAL_KEY_FILE)
+    return _gcal_client
+
+
+def _sync_calendar_blocking(client=None):
+    """Синхронный кусок (сеть + диск) - вызывается из потока."""
+    state = load_state()
+    report = gcal_sync.sync(
+        gcal_sync.calendar_path(GROUP_DIR), state, client or get_gcal_client()
+    )
+    state["gcal_last_sync"] = now_iso()
+    state["gcal_events"] = report.get("events", 0)
+    state["gcal_errors"] = len(report["errors"]) + len(report["skipped_invalid"])
+    save_state(state)
+    return report
+
+
+async def sync_calendar(client=None):
+    """Пост-хук: раскладывает calendar.json в календарь. Бота не роняет."""
+    if not gcal_enabled():
+        return None
+    try:
+        report = await asyncio.to_thread(_sync_calendar_blocking, client)
+    except Exception as exc:  # noqa: BLE001 - календарь не должен ронять бота
+        logger.exception("Синк календаря упал: %s", exc)
+        return None
+
+    if report["skipped_invalid"] or report["errors"]:
+        logger.warning(
+            "Синк календаря с проблемами: невалидных %d %s, ошибок %d %s",
+            len(report["skipped_invalid"]),
+            report["skipped_invalid"],
+            len(report["errors"]),
+            report["errors"],
+        )
+    elif report["upserted"] or report["deleted"]:
+        logger.info(
+            "Календарь обновлён: записано %d, удалено %d",
+            report["upserted"],
+            report["deleted"],
+        )
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Один ход: сообщение -> модель -> ответ в группу
 # ---------------------------------------------------------------------------
 async def run_turn(bot, prompt, reply_to=None, log_reply=True, segment=None, show_typing=True):
@@ -1461,6 +1530,8 @@ async def run_turn(bot, prompt, reply_to=None, log_reply=True, segment=None, sho
             except Exception as exc:  # noqa: BLE001 - закреп не должен ронять бота
                 logger.exception("Пост-хук закрепа упал: %s", exc)
 
+            await sync_calendar()
+
             if not pending_queue:
                 break
             prompt, reply_to = pending_queue.popleft()
@@ -1500,6 +1571,8 @@ async def run_passive_turn(bot, prompt, reply_to=None, segment=None):
             await sync_pin(bot)
         except Exception as exc:  # noqa: BLE001 - закреп не должен ронять бота
             logger.exception("Пост-хук закрепа упал: %s", exc)
+
+        await sync_calendar()
 
 
 def cancel_passive_job(job_queue):
@@ -1909,6 +1982,8 @@ async def tick_job(context):
             await sync_pin(context.bot)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Сверка закрепа упала: %s", exc)
+    # calendar.json могли поправить руками (Syncthing) - тик сверяет сам.
+    await sync_calendar()
     try:
         gone = media_intake.cleanup_inbox(INBOX_MAX_AGE_DAYS, inbox=INBOX_DIR)
         if gone:
@@ -2010,6 +2085,7 @@ def status_text(
     passive_debounce=None,
     passive_pending=None,
     inbox_files=None,
+    gcal_on=None,
 ):
     """Текст /status. Чистая, чтобы её можно было прочитать глазами и тестом."""
     state = state or {}
@@ -2045,6 +2121,18 @@ def status_text(
         media_intake.count_inbox(INBOX_DIR) if inbox_files is None else int(inbox_files)
     )
     lines.append("Вложений в inbox: %d" % files)
+    calendar_on = gcal_enabled() if gcal_on is None else bool(gcal_on)
+    if calendar_on:
+        lines.append(
+            "Календарь: вкл, событий %d, последняя синхронизация %s, ошибок %d"
+            % (
+                int(state.get("gcal_events") or 0),
+                state.get("gcal_last_sync") or "никогда",
+                int(state.get("gcal_errors") or 0),
+            )
+        )
+    else:
+        lines.append("Календарь: выкл")
     return "\n".join(lines)
 
 
@@ -2102,6 +2190,15 @@ def main():  # pragma: no cover - рантайм
         logger.warning("GROUP_CHAT_ID пуст: работаю в режиме настройки, модель не зову.")
     if not BOT_USERNAME:
         logger.warning("BOT_USERNAME пуст: тег @имя работать не будет, только reply и «Марко».")
+    if gcal_enabled():
+        logger.info(
+            "Синк календаря включён: %s (ключ %s)", GCAL_CALENDAR_ID, GCAL_KEY_FILE
+        )
+    else:
+        logger.info(
+            "Синк календаря выключен: нет GCAL_CALENDAR_ID или файла ключа %s",
+            GCAL_KEY_FILE,
+        )
     ensure_dirs()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()

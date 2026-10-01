@@ -34,6 +34,7 @@ for f in \
   "$SCRIPT_DIR/marco_group_bot.py" \
   "$SCRIPT_DIR/reel_meta.py" \
   "$SCRIPT_DIR/media_intake.py" \
+  "$SCRIPT_DIR/gcal_sync.py" \
   "$SCRIPT_DIR/marco-group.service" \
   "$PROJECT_DIR/persona/marco-group.md" \
   "$PROJECT_DIR/config/group-workspace-footer.md" \
@@ -42,7 +43,7 @@ do
   [ -f "$f" ] || fail "нет файла $f"
 done
 python3 -m py_compile "$SCRIPT_DIR/marco_group_bot.py" "$SCRIPT_DIR/reel_meta.py" \
-  "$SCRIPT_DIR/media_intake.py" \
+  "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/gcal_sync.py" \
   || fail "код бота не компилируется — чини до деплоя"
 echo "    ок"
 
@@ -64,8 +65,11 @@ $SSH "test -d '$REMOTE_CODE/venv' || python3 -m venv '$REMOTE_CODE/venv'; '$REMO
 $SSH "'$REMOTE_CODE/venv/bin/pip' install -q --upgrade yt-dlp"
 # faster-whisper ставим один раз: он тянет CUDA-агностичный ctranslate2 на сотни МБ,
 # гонять --upgrade каждый деплой незачем. Модель small уже в кэше ~/.cache/huggingface.
+# google-auth + requests: синк group/calendar.json в Google Calendar.
+# Ставим один раз (версии стабильные, гонять --upgrade каждый деплой незачем).
+$SSH "'$REMOTE_CODE/venv/bin/pip' show google-auth >/dev/null 2>&1 || '$REMOTE_CODE/venv/bin/pip' install -q google-auth requests"
 $SSH "'$REMOTE_CODE/venv/bin/pip' show faster-whisper >/dev/null 2>&1 || '$REMOTE_CODE/venv/bin/pip' install -q faster-whisper"
-$SSH "'$REMOTE_CODE/venv/bin/python' -c 'import telegram, apscheduler, yt_dlp, faster_whisper; print(\"ptb\", telegram.__version__, \"yt-dlp\", yt_dlp.version.__version__, \"faster-whisper ок\")'"
+$SSH "'$REMOTE_CODE/venv/bin/python' -c 'import telegram, apscheduler, yt_dlp, faster_whisper, google.auth, requests; print(\"ptb\", telegram.__version__, \"yt-dlp\", yt_dlp.version.__version__, \"faster-whisper ок\", \"google-auth ок\")'"
 
 echo "==> [6/9] Собираю workspace/CLAUDE.md из персоны"
 TMP_CLAUDE_MD="$(mktemp -t marco-group-claude-md)"
