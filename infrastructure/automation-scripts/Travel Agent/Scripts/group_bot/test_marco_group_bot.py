@@ -87,6 +87,16 @@ def test_passive_flag_defaults_to_global(monkeypatch):
     assert classify(text="просто болтаем", passive_enabled=None)["route"] == bot.ROUTE_PASSIVE
 
 
+def test_always_reply_turns_plain_message_into_direct(monkeypatch):
+    monkeypatch.setattr(bot, "ALWAYS_REPLY", True)
+    verdict = classify(text="взяли воду в дорогу")
+    assert verdict["route"] == bot.ROUTE_MODEL
+    assert verdict["triggers"] == ["always"]
+    # чужой человек и пустое сообщение - по-прежнему без модели
+    assert classify(text="привет", user_id=777)["route"] != bot.ROUTE_MODEL
+    assert classify(text="   ")["route"] != bot.ROUTE_MODEL
+
+
 def test_passive_needs_non_empty_text():
     for text in (None, "", "   "):
         assert classify(text=text)["route"] == bot.ROUTE_LOG, repr(text)

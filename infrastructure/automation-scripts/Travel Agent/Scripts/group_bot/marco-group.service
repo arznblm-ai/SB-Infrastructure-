@@ -8,6 +8,7 @@ Type=simple
 WorkingDirectory=/var/lib/marco-group/workspace
 Environment=HOME=/root
 Environment=MARCO_YTDLP_BIN=/opt/marco-group/venv/bin/yt-dlp
+Environment=MARCO_ALWAYS_REPLY=1
 EnvironmentFile=/root/.config/marco-group/.env
 ExecStart=/opt/marco-group/venv/bin/python /opt/marco-group/marco_group_bot.py
 Restart=on-failure

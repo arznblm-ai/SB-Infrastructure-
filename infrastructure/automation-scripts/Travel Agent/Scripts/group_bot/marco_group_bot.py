@@ -147,6 +147,8 @@ def _env_float(name, default):
 PASSIVE_ENABLED = _env_flag("MARCO_PASSIVE", "1")
 PASSIVE_DEBOUNCE_SECONDS = _env_int("MARCO_PASSIVE_DEBOUNCE", 25)
 PASSIVE_JOB_NAME = "passive"
+# Всегда отвечать: любое непустое сообщение своих - прямой триггер (решение Антона 05.10).
+ALWAYS_REPLY = _env_flag("MARCO_ALWAYS_REPLY", "0")
 
 # Grace-окно прямого триггера: Telegram доставляет подпись раньше пересылок,
 # поэтому после триггера ждём «хвост» и отвечаем на всё разом.
@@ -396,8 +398,10 @@ def classify_update(
         triggers.append("name")
     if reel:
         triggers.append("reel")
-    result["triggers"] = triggers
     is_allowed = user_id in allowed_users(anton_id, ralina_id)
+    if not triggers and ALWAYS_REPLY and is_allowed and str(text or "").strip():
+        triggers.append("always")
+    result["triggers"] = triggers
     result["allowed"] = is_allowed
 
     if not triggers:
