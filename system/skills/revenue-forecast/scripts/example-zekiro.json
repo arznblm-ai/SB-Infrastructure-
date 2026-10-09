@@ -1,0 +1,53 @@
+{
+  "currency": "₽",
+  "fx": 90,
+  "months": 24,
+  "pricing": {
+    "license_base": 39900,
+    "included_users": 25,
+    "extra_user_price": 1490
+  },
+  "defaults": {
+    "ramp_months": 6,
+    "impl_capacity": 6,
+    "onboarding_hours": 12,
+    "support_hours_monthly": 2,
+    "pilot_hours": 4,
+    "team_hours_capacity": 240,
+    "hour_cost": 4000,
+    "tax": 0.06
+  },
+  "scenarios": {
+    "Осторожный": {
+      "pilots_by_halfyear": [1, 1, 1.5, 1.5],
+      "conversion": 0.4,
+      "pilot_months": 3,
+      "churn_monthly": 0.03,
+      "users": 20,
+      "support_monthly": 9000,
+      "hire_month": 13,
+      "seller_pilots": 1.5
+    },
+    "Базовый": {
+      "pilots_by_halfyear": [1.5, 2, 2.5, 3],
+      "conversion": 0.6,
+      "pilot_months": 2,
+      "churn_monthly": 0.02,
+      "users": 30,
+      "support_monthly": 9000,
+      "hire_month": 10,
+      "seller_pilots": 2
+    },
+    "Смелый": {
+      "pilots_by_halfyear": [2, 3, 4, 4],
+      "conversion": 0.75,
+      "pilot_months": 2,
+      "churn_monthly": 0.01,
+      "users": 45,
+      "support_monthly": 12000,
+      "hire_month": 7,
+      "seller_pilots": 3,
+      "impl_capacity": 8
+    }
+  }
+}
