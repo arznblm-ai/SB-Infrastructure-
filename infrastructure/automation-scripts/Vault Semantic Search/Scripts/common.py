@@ -196,3 +196,120 @@ def save_cache(cfg, cache):
     keys = np.array(list(cache.keys()), dtype=object)
     vecs = np.array(list(cache.values()), dtype=np.float32)
     np.savez(sp["cache"], keys=keys, vecs=vecs)
+
+
+# ------------------------------------------------------------ keyword / BM25 ----
+TOKEN_RE = re.compile(r"\w+")
+BM25_CACHE_NAME = "bm25.npz"
+BM25_VERSION = 1  # bump when tokenisation / layout changes -> cache rebuilds
+
+
+def tokenize(text):
+    """Lowercase Unicode word tokens (RU + EN), no stemming."""
+    return TOKEN_RE.findall(text.lower())
+
+
+def load_meta(cfg):
+    """Read only meta.jsonl (no vectors) — enough for keyword search."""
+    sp = store_paths(cfg)
+    if not sp["meta"].exists():
+        return None
+    meta = []
+    with open(sp["meta"], "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                meta.append(json.loads(line))
+    return meta
+
+
+class BM25:
+    """Okapi BM25 over the chunk texts in meta.jsonl.
+
+    Inverted index (CSR: term -> chunk ids + tf) is cached in the store dir
+    (outside the vault) and rebuilt automatically when meta.jsonl changes.
+    """
+
+    def __init__(self, vocab, indptr, doc_ids, tfs, doc_len, k1=1.5, b=0.75):
+        self.term_id = {t: i for i, t in enumerate(vocab)}
+        self.indptr, self.doc_ids, self.tfs = indptr, doc_ids, tfs
+        self.doc_len = doc_len.astype(np.float32)
+        self.n = len(doc_len)
+        self.avgdl = float(self.doc_len.mean()) if self.n else 1.0
+        self.k1, self.b = k1, b
+
+    # -- build / cache ------------------------------------------------------
+    @staticmethod
+    def _key(meta_path):
+        st = os.stat(meta_path)
+        return np.array([BM25_VERSION, st.st_size, st.st_mtime_ns], dtype=np.int64)
+
+    @classmethod
+    def build(cls, meta):
+        postings = {}
+        doc_len = np.zeros(len(meta), dtype=np.int32)
+        for d, m in enumerate(meta):
+            toks = tokenize(m["text"])
+            doc_len[d] = len(toks)
+            tf = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+            for t, c in tf.items():
+                postings.setdefault(t, []).append((d, c))
+        vocab = list(postings.keys())
+        indptr = np.zeros(len(vocab) + 1, dtype=np.int64)
+        total = sum(len(p) for p in postings.values())
+        doc_ids = np.empty(total, dtype=np.int32)
+        tfs = np.empty(total, dtype=np.int32)
+        pos = 0
+        for i, t in enumerate(vocab):
+            p = postings[t]
+            arr = np.array(p, dtype=np.int32)
+            doc_ids[pos:pos + len(p)] = arr[:, 0]
+            tfs[pos:pos + len(p)] = arr[:, 1]
+            pos += len(p)
+            indptr[i + 1] = pos
+        return vocab, indptr, doc_ids, tfs, doc_len
+
+    @classmethod
+    def load(cls, cfg, meta, k1=1.5, b=0.75):
+        sp = store_paths(cfg)
+        cache_path = sp["dir"] / BM25_CACHE_NAME
+        key = cls._key(sp["meta"])
+        if cache_path.exists():
+            try:
+                z = np.load(cache_path, allow_pickle=False)
+                if np.array_equal(z["key"], key) and int(z["doc_len"].shape[0]) == len(meta):
+                    vocab = z["vocab"].tobytes().decode("utf-8").split("\n")
+                    return cls(vocab, z["indptr"], z["doc_ids"], z["tfs"], z["doc_len"], k1, b)
+            except Exception:
+                pass  # corrupt / old cache -> rebuild
+        vocab, indptr, doc_ids, tfs, doc_len = cls.build(meta)
+        try:  # \w+ tokens never contain "\n", so it is a safe separator
+            blob = np.frombuffer("\n".join(vocab).encode("utf-8"), dtype=np.uint8)
+            tmp = cache_path.with_name(cache_path.stem + ".tmp.npz")
+            np.savez(tmp, key=key, vocab=blob, indptr=indptr,
+                     doc_ids=doc_ids, tfs=tfs, doc_len=doc_len)
+            os.replace(tmp, cache_path)
+        except Exception:
+            pass  # cache is an optimisation only
+        return cls(vocab, indptr, doc_ids, tfs, doc_len, k1, b)
+
+    # -- query --------------------------------------------------------------
+    def scores(self, query):
+        """Return BM25 score per chunk (np.float32[N]); 0 = no term match."""
+        out = np.zeros(self.n, dtype=np.float32)
+        qtf = {}
+        for t in tokenize(query):
+            qtf[t] = qtf.get(t, 0) + 1
+        for t, qc in qtf.items():
+            i = self.term_id.get(t)
+            if i is None:
+                continue
+            s, e = self.indptr[i], self.indptr[i + 1]
+            docs, tf = self.doc_ids[s:e], self.tfs[s:e].astype(np.float32)
+            df = e - s
+            idf = np.log(1.0 + (self.n - df + 0.5) / (df + 0.5))
+            norm = self.k1 * (1.0 - self.b + self.b * self.doc_len[docs] / self.avgdl)
+            out[docs] += qc * idf * tf * (self.k1 + 1.0) / (tf + norm)
+        return out
