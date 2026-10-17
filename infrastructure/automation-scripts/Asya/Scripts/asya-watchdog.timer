@@ -1,0 +1,12 @@
+# asya-watchdog.timer — каждые 10 минут проверять бота Аси (ADR-030).
+[Unit]
+Description=Run asya-watchdog every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+RandomizedDelaySec=30
+Unit=asya-watchdog.service
+
+[Install]
+WantedBy=timers.target

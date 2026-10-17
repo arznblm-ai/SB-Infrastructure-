@@ -1,0 +1,21 @@
+# asya-watchdog.service — алерт Антону, если бот Аси лежит (ADR-030).
+# Ставится деплоем Scripts/deploy.sh в /etc/systemd/system/.
+# Скрипт: Scripts/asya_watchdog.sh → /usr/local/bin/asya-watchdog.
+# Состояние «уже алертил»: /var/lib/asya-watchdog/down-since.
+[Unit]
+Description=Asya watchdog — alert Anton if the asya bot is down (ADR-030)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/asya-watchdog
+StateDirectory=asya-watchdog
+StateDirectoryMode=0700
+# до ~2 мин ожидания, если юнит в переходном состоянии, + curl
+TimeoutStartSec=300
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

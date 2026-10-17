@@ -337,8 +337,7 @@ def load_delivery_channel() -> Optional[Channel]:
         name for name, value in (
             ("MEETING_NOTES_TG_TOKEN|_FILE", token),
             ("MEETING_NOTES_CHAT_ID", chat_id),
-            ("MEETING_NOTES_THREAD_ID", thread_id),
-        ) if not value
+        ) if not value  # thread необязателен: без него — в личный чат бота (Ася, ADR-030)
     ]
     if missing:
         log(f"delivery: в {DELIVERY_ENV_FILE.name} не хватает {', '.join(missing)} → прежний канал")

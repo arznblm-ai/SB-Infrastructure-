@@ -1,0 +1,19 @@
+[Unit]
+Description=Asya - личный ассистент Антона (Telegram + claude CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/asya/workspace
+Environment=HOME=/root
+Environment=ASYA_HOME=/var/lib/asya
+Environment=ASYA_VAULT_DIR=/root/second-brain
+EnvironmentFile=/root/.config/asya/.env
+ExecStart=/opt/asya/venv/bin/python /opt/asya/asya_bot.py
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
