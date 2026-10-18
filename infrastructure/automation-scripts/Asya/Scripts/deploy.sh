@@ -263,6 +263,10 @@ else
     TOKEN=""
   fi
 fi
+# claude -p под systemd авторизуется долгоживущим токеном (как Марко/Крис); без него — «OAuth session expired» (17.10)
+if [ -f "$ENV_FILE" ] && ! grep -q '^CLAUDE_CODE_OAUTH_TOKEN=.' "$ENV_FILE"; then
+  grep '^CLAUDE_CODE_OAUTH_TOKEN=.' /root/.config/marco-group/.env >> "$ENV_FILE" 2>/dev/null && ok "CLAUDE_CODE_OAUTH_TOKEN скопирован из .env Марко" && CHANGED=1 || bad "нет CLAUDE_CODE_OAUTH_TOKEN — claude -p не авторизуется (claude setup-token → $ENV_FILE)"
+fi
 
 # ── [4] Todoist MCP ─────────────────────────────────────────────────────────
 echo "[4] Todoist MCP server.py (тулзы «Мои»)"

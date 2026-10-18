@@ -13,6 +13,31 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
+KRISP_ENV_FILE = os.path.expanduser("~/.config/second-brain/krisp.env")
+
+
+def _load_krisp_env(path: str = KRISP_ENV_FILE) -> None:
+    """Подгружает KEY=value из krisp.env в os.environ (уже заданные переменные не трогает)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and not os.environ.get(key):
+            os.environ[key] = value
+
+
+_load_krisp_env()
+
 CLIENT_ID = os.environ.get("KRISP_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("KRISP_CLIENT_SECRET", "")
 REDIRECT_URI = "http://localhost:3399/callback"
@@ -68,7 +93,7 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 def main():
     if not CLIENT_ID or not CLIENT_SECRET:
-        raise SystemExit("Set KRISP_CLIENT_ID and KRISP_CLIENT_SECRET before running this script.")
+        raise SystemExit(f"KRISP_CLIENT_ID/KRISP_CLIENT_SECRET not set: add them to {KRISP_ENV_FILE} (KEY=value) or the environment before running this script.")
 
     # Build auth URL
     params = {

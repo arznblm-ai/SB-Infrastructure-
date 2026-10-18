@@ -203,35 +203,62 @@ def summary_filename(path: Path, title: str, folder_name: str) -> str:
     return f"{prefix} {{summary}} {topic} – {date}.md"
 
 
+# Закрытый словарь трека — источник истины:
+# context/{self} {plan} карта треков – 2026-08-19.md (ревизия 2026-09-18).
+TRACK_VOCAB = ("producer", "luch", "zekiro", "ugsee", "archive", "none")
+# Что эвристика вправе присвоить НОВОЙ встрече: ugsee закрыт 2026-09-18
+# (только история), archive ставит только человек.
+ASSIGNABLE_TRACKS = ("zekiro", "luch", "producer")
+
+# Ключевые слова — регулярки с границами слов (регистронезависимо).
+TRACK_KEYWORDS = {
+    "zekiro": [
+        r"зекиро", r"zekiro", r"виталик\w*", r"vitalik", r"макс\w* пономар\w*",
+        r"friends", r"борода проджект", r"иинизаци\w*", r"консалтинг\w*",
+        r"гермес\w*", r"hermes", r"fleetbox", r"сублицензи\w*",
+        r"лицензи\w* за место", r"ассистент\w* для бизнеса",
+    ],
+    "luch": [
+        r"луч(?:а|у|ом|е)?", r"luch", r"луч\.?\s?ай", r"артур\w*",
+        r"лен(?:а|ы|е|у|ой)",
+    ],
+    "producer": [
+        r"portal", r"портал\w*", r"смет\w*", r"тендер\w*", r"раскадровк\w*",
+        r"продакшн\w*", r"ролик\w*", r"яндекс\w*", r"магнит\w*", r"втб",
+        r"брусник\w*", r"icom",
+    ],
+}
+_TRACK_PATTERNS = {
+    track: re.compile(r"\b(?:" + "|".join(kws) + r")\b", re.IGNORECASE)
+    for track, kws in TRACK_KEYWORDS.items()
+}
+
+
 def infer_track(content: str, title: str) -> str:
-    """Детерминированная эвристика трека (ADR-025): consulting|producer|ugsee|none.
+    """Детерминированная эвристика трека (ADR-025, словарь ревизии 2026-09-18).
 
-    Считает совпадения ключевых слов в тексте+заголовке (регистронезависимо);
-    при конфликте побеждает больший счёт, при равенстве — фиксированный
-    приоритет consulting > ugsee > producer.
+    Возвращает zekiro|luch|producer|none. Считает совпадения ключевых слов
+    в тексте+заголовке; побеждает единственный максимальный счёт. Ничья
+    между треками (спорная встреча) или ноль совпадений -> none.
+    ugsee/archive новым встречам не присваиваются.
     """
-    text = f"{title}\n{content}".lower()
+    text = f"{title}\n{content}"
+    scores = {t: len(_TRACK_PATTERNS[t].findall(text)) for t in ASSIGNABLE_TRACKS}
+    # «пилот» — сигнал Зекиро только рядом с темой ассистентов/лицензии
+    low = text.lower()
+    if "пилот" in low and ("ассистент" in low or "лицензи" in low):
+        scores["zekiro"] += 1
 
-    consulting_keywords = [
-        "vitalik", "виталик", "макс пономар", "friends", "иинизация", "консалтинг",
-    ]
-    ugsee_keywords = ["ugsee", "минаев", "ugc media", "creative hub"]
-    producer_keywords = ["portal", "смет", "тендер", "раскадровк", "продакшн"]
+    best = max(scores.values())
+    if best == 0:
+        return "none"
+    leaders = [t for t, v in scores.items() if v == best]
+    return leaders[0] if len(leaders) == 1 else "none"
 
-    scores = {
-        "consulting": sum(text.count(kw) for kw in consulting_keywords),
-        "ugsee": sum(text.count(kw) for kw in ugsee_keywords),
-        "producer": sum(text.count(kw) for kw in producer_keywords),
-    }
-    # «пилот» считается сигналом консалтинга только рядом с агентской темой
-    if "пилот" in text and "агентств" in text:
-        scores["consulting"] += 1
 
-    # Порядок перебора задаёт приоритет при равном счёте
-    for track in ("consulting", "ugsee", "producer"):
-        if scores[track] > 0 and scores[track] == max(scores.values()):
-            return track
-    return "none"
+def safe_track(value: str) -> str:
+    """Гарантия закрытого словаря: всё вне ASSIGNABLE_TRACKS/none -> none."""
+    return value if value in ASSIGNABLE_TRACKS or value == "none" else "none"
 
 
 def build_local_summary(path: Path, content: str, preferred_folder: Optional[str]) -> tuple[str, str, str]:
@@ -258,7 +285,7 @@ def build_local_summary(path: Path, content: str, preferred_folder: Optional[str
         "  - status/active",
         f"date: {date}",
         "status: active",
-        f"track: {infer_track(content, title)}",
+        f"track: {safe_track(infer_track(content, title))}",
         f"source: \"[[{Path(source).stem}]]\"",
         "generated_by: local-transcript-summarizer",
         "---",

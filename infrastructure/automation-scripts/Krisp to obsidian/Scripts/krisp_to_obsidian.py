@@ -10,9 +10,13 @@ import base64
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
+import sys
+import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -24,6 +28,36 @@ from typing import Optional
 KRISP_CALLINFO    = Path.home() / "Library/Application Support/Krisp/callinfo.json"
 VAULT_MEETINGS    = Path("/Users/anton/AI AGENT FOLDER/Second Brain/transcripts")
 TOKEN_FILE        = Path.home() / ".claude/krisp_token.json"
+# Статус здоровья синка (ok | auth_error | reauth_soon). Едет Syncthing'ом на VPS,
+# там его читает watchdog Аси и пишет Антону в TG. Секретов в файле нет.
+HEALTH_FILE       = Path("/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Krisp to obsidian/health/krisp-health.json")
+REAUTH_WARN_DAYS  = 30  # refresh_token истекает ближе — статус reauth_soon
+_LAST_MCP_OK      = False  # последний mcp_call получил HTTP 200 (для --check-auth)
+
+KRISP_ENV_FILE = os.path.expanduser("~/.config/second-brain/krisp.env")
+
+
+def _load_krisp_env(path: str = KRISP_ENV_FILE) -> None:
+    """Подгружает KEY=value из krisp.env в os.environ (уже заданные переменные не трогает)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and not os.environ.get(key):
+            os.environ[key] = value
+
+
+_load_krisp_env()
 
 OAUTH_CLIENT_ID     = os.environ.get("KRISP_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("KRISP_CLIENT_SECRET", "")
@@ -68,6 +102,91 @@ def _ssl_ctx():
 
 # ── OAuth токен ───────────────────────────────────────────────────────────────
 
+def _atomic_write_text(path: Path, text: str, mode: int = 0o600):
+    """tmp-файл в той же папке + os.replace: читатель никогда не видит полуфайл."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _safe_err(e: BaseException) -> str:
+    """Тип ошибки без тела ответа/секретов: HTTPError → код, остальное → имя класса."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTPError {e.code}"
+    if isinstance(e, urllib.error.URLError):
+        return f"URLError {type(e.reason).__name__}"
+    if isinstance(e, KeyError):
+        return f"KeyError {e.args[0] if e.args else ''}".strip()  # имя поля, не значение
+    return type(e).__name__
+
+
+def write_health(status: str, detail: str = "", mark_ok: bool = False):
+    """Пишет health-файл атомарно. since меняется только при смене статуса.
+    Сбой записи не валит синк — только строка в лог."""
+    try:
+        prev = json.loads(HEALTH_FILE.read_text(encoding="utf-8")) if HEALTH_FILE.exists() else {}
+        if not isinstance(prev, dict):
+            prev = {}
+    except Exception:
+        prev = {}
+    now = _now_iso()
+    same = prev.get("status") == status and prev.get("since")
+    # тот же статус и detail — переписываем не чаще раза в 6 ч: файл в vault, его коммитит git-sync каждые 5 мин
+    try:
+        fresh = datetime.now(tz=timezone.utc) - datetime.fromisoformat(prev.get("updated_at", "")) < timedelta(hours=6)
+    except Exception:
+        fresh = False
+    if same and prev.get("detail", "") == (detail or "")[:200] and fresh:
+        return
+    data = {
+        "status":     status,
+        "since":      prev["since"] if same else now,
+        "last_ok":    now if mark_ok else prev.get("last_ok"),
+        "detail":     (detail or "")[:200],
+        "updated_at": now,
+        "host":       socket.gethostname(),
+    }
+    try:
+        _atomic_write_text(HEALTH_FILE, json.dumps(data, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+    except Exception as e:
+        print(f"  [health] не удалось записать {HEALTH_FILE.name}: {_safe_err(e)}")
+    if status != prev.get("status"):
+        print(f"  [health] статус: {prev.get('status') or '—'} → {status}" + (f" ({detail})" if detail else ""))
+
+
+def reauth_soon_detail(token: dict) -> Optional[str]:
+    """Если refresh_token истекает ближе REAUTH_WARN_DAYS — текст для detail, иначе None."""
+    raw = token.get("refresh_token_expires_at") or ""
+    if not raw:
+        return None
+    try:
+        exp = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    left = exp - datetime.now(tz=timezone.utc)
+    if left.total_seconds() < REAUTH_WARN_DAYS * 86400:
+        return f"refresh_token истекает {exp.astimezone().date().isoformat()} — нужна переавторизация"
+    return None
+
+
 def load_token() -> dict:
     if TOKEN_FILE.exists():
         return json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
@@ -75,13 +194,13 @@ def load_token() -> dict:
 
 
 def save_token(token: dict):
-    TOKEN_FILE.write_text(json.dumps(token, indent=2), encoding="utf-8")
+    _atomic_write_text(TOKEN_FILE, json.dumps(token, indent=2), mode=0o600)
 
 
 def refresh_access_token(token: dict) -> dict:
     """Обновляет access_token через refresh_token."""
     if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
-        raise RuntimeError("Set KRISP_CLIENT_ID and KRISP_CLIENT_SECRET before refreshing Krisp tokens.")
+        raise RuntimeError(f"KRISP_CLIENT_ID/KRISP_CLIENT_SECRET not set: add them to {KRISP_ENV_FILE} (KEY=value) or the environment before refreshing Krisp tokens.")
     data = urllib.parse.urlencode({
         "grant_type":    "refresh_token",
         "refresh_token": token["refresh_token"],
@@ -103,25 +222,47 @@ def refresh_access_token(token: dict) -> dict:
 
 
 def get_access_token() -> Optional[str]:
-    token = load_token()
+    """access_token или None. Сбой refresh больше не глотается молча (кейс 23.09–17.10):
+    строка в лог + статус auth_error, старый токен не возвращаем."""
+    try:
+        token = load_token()
+    except Exception as e:
+        print(f"  [MCP] не читается {TOKEN_FILE.name}: {_safe_err(e)}")
+        write_health("auth_error", f"token file unreadable: {_safe_err(e)}")
+        return None
     if not token:
         print("  [MCP] токен не найден — запустите krisp_oauth.py")
+        write_health("auth_error", "token file missing")
         return None
     # Проверяем срок действия с запасом 5 минут
     expires_at = token.get("expires_at", "")
     if expires_at:
         try:
             exp = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-            if (exp - datetime.now(tz=timezone.utc)).total_seconds() < 300:
+            needs_refresh = (exp - datetime.now(tz=timezone.utc)).total_seconds() < 300
+        except (ValueError, AttributeError) as e:
+            print(f"  [MCP] не разобрать expires_at ({_safe_err(e)}) — пробую refresh")
+            needs_refresh = True
+        if needs_refresh:
+            try:
                 token = refresh_access_token(token)
-        except Exception:
-            pass
-    return token.get("access_token")
+            except Exception as e:
+                print(f"  [MCP] ✗ refresh токена не удался: {_safe_err(e)}")
+                write_health("auth_error", f"refresh failed: {_safe_err(e)}")
+                return None
+    access = token.get("access_token")
+    if not access:
+        print("  [MCP] в токене нет access_token — запустите krisp_oauth.py")
+        write_health("auth_error", "no access_token in token file")
+        return None
+    return access
 
 
 # ── MCP запросы ───────────────────────────────────────────────────────────────
 
 def mcp_call(method: str, arguments: dict) -> Optional[dict]:
+    global _LAST_MCP_OK
+    _LAST_MCP_OK = False
     access_token = get_access_token()
     if not access_token:
         return None
@@ -144,10 +285,20 @@ def mcp_call(method: str, arguments: dict) -> Optional[dict]:
             raw = resp.read().decode()
     except urllib.error.HTTPError as e:
         print(f"  [MCP] HTTP ошибка {e.code}")
+        if e.code in (401, 403):
+            write_health("auth_error", f"MCP {e.code}")
         return None
     except Exception as e:
         print(f"  [MCP] ошибка соединения: {e}")
         return None
+
+    # MCP ответил → синк жив; но если refresh_token скоро истечёт — reauth_soon
+    _LAST_MCP_OK = True
+    try:
+        soon = reauth_soon_detail(load_token())
+    except Exception:
+        soon = None
+    write_health("reauth_soon" if soon else "ok", soon or "", mark_ok=True)
 
     # SSE формат: ищем строку "data: {...}"
     for line in raw.splitlines():
@@ -974,5 +1125,32 @@ def main():
     )
 
 
+def check_auth() -> int:
+    """--check-auth: ensure-token + один лёгкий MCP-вызов, заметки не создаются."""
+    if not get_access_token():
+        print("✗ Krisp auth: токена нет или refresh не удался (см. строки выше)")
+        return 1
+    today = datetime.now().date().isoformat()
+    result = mcp_call("search_meetings", {"query": today, "limit": 1})
+    try:
+        health = json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        health = {}
+    status = health.get("status", "unknown")
+    if _LAST_MCP_OK:
+        extra = f" — {health.get('detail')}" if health.get("detail") else ""
+        print(f"✓ Krisp auth: {status}{extra} (MCP ответил, ответ {'получен' if result else 'без data-строки'})")
+        if status not in ("ok", "reauth_soon"):
+            print(f"  ⚠ health-файл не обновился ({HEALTH_FILE})")
+        return 0
+    if status == "auth_error":
+        print(f"✗ Krisp auth: auth_error — {health.get('detail') or '?'}")
+    else:
+        print(f"✗ Krisp auth: MCP не ответил (сеть/сервер?), последний статус в health: {status}")
+    return 1
+
+
 if __name__ == "__main__":
+    if "--check-auth" in sys.argv[1:]:
+        sys.exit(check_auth())
     main()
