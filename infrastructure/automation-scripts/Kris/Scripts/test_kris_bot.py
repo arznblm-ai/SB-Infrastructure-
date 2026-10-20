@@ -491,3 +491,65 @@ def test_run_owner_turn_none_and_empty_queue_skips_claude(isolated_state, monkey
     assert called["flag"] is False
     assert bot.sent == []
     assert not kb.claude_lock.locked()
+
+
+# ---------------------------------------------------------------------------
+# Автовосстановление пропавшей сессии (--resume -> "No conversation found")
+# ---------------------------------------------------------------------------
+def test_owner_turn_recovers_from_dead_session(isolated_state, monkeypatch):
+    kb.save_state({"session_id": "dead-sid"})
+    kb.pending_queue.append("привет")
+
+    calls = []
+
+    async def fake_run_claude(prompt, session_id=None):
+        calls.append(session_id)
+        if session_id == "dead-sid":
+            return ("", None, "no_session")
+        return ("ответ модели", "new-sid", None)
+
+    monkeypatch.setattr(kb, "run_claude", fake_run_claude)
+    bot = FakeBot()
+    asyncio.run(kb.run_owner_turn(bot, kb.ALLOWED_USER, None))
+
+    assert calls == ["dead-sid", None]
+    assert bot.sent == [(kb.ALLOWED_USER, "ответ модели")]
+    assert kb.load_state()["session_id"] == "new-sid"
+
+
+class _FakeProc:
+    def __init__(self, stdout, stderr, rc):
+        self._out, self._err, self.returncode = stdout, stderr, rc
+
+    async def communicate(self):
+        return (self._out, self._err)
+
+
+def test_run_claude_classifies_no_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(kb, "WORKSPACE", str(tmp_path / "ws"))
+
+    async def fake_exec(*cmd, **kwargs):
+        return _FakeProc(b"", b"Error: No conversation found with session ID: abc", 1)
+
+    monkeypatch.setattr(kb.asyncio, "create_subprocess_exec", fake_exec)
+
+    _r, _s, kind = asyncio.run(kb.run_claude("hi", "abc"))
+    assert kind == "no_session"
+    _r, _s, kind = asyncio.run(kb.run_claude("hi", None))
+    assert kind == "error"
+
+
+def test_run_claude_resume_retries_only_once(isolated_state, monkeypatch):
+    kb.save_state({"session_id": "dead-sid"})
+    calls = []
+
+    async def fake_run_claude(prompt, session_id=None):
+        calls.append(session_id)
+        return ("", None, "no_session")
+
+    monkeypatch.setattr(kb, "run_claude", fake_run_claude)
+    result = asyncio.run(kb.run_claude_resume("hi", "dead-sid"))
+
+    assert result == ("", None, "no_session")
+    assert calls == ["dead-sid", None]
+    assert kb.load_state()["session_id"] is None

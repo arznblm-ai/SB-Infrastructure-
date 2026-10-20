@@ -594,10 +594,14 @@ def build_claude_cmd(prompt: str, session_id=None) -> list:
     return cmd
 
 
+NO_SESSION_MARKER = "no conversation found"
+
+
 async def run_claude(prompt: str, session_id=None):
     """Возвращает (reply_text, new_session_id, error_kind).
 
-    error_kind: None | "quota" | "timeout" | "error".
+    error_kind: None | "quota" | "timeout" | "no_session" | "error".
+    "no_session": --resume указал на пропавшую сессию (см. run_claude_resume).
     """
     cmd = build_claude_cmd(prompt, session_id)
 
@@ -649,6 +653,9 @@ async def run_claude(prompt: str, session_id=None):
         if any(marker in combined for marker in QUOTA_MARKERS):
             logger.warning("Claude quota: rc=%s mode=%s dur=%.1fs", rc, mode, dur)
             return ("", None, "quota")
+        if session_id and NO_SESSION_MARKER in combined:
+            logger.warning("Claude: сессия %s не найдена (rc=%s)", session_id[:8], rc)
+            return ("", None, "no_session")
         tail_src = stderr if stderr.strip() else stdout
         reply = tail_src[-500:] if tail_src else "неизвестная ошибка"
         logger.warning("Claude error: rc=%s mode=%s dur=%.1fs", rc, mode, dur)
@@ -659,6 +666,9 @@ async def run_claude(prompt: str, session_id=None):
     is_error = bool(parsed.get("is_error")) if isinstance(parsed, dict) else False
 
     if is_error:
+        if session_id and NO_SESSION_MARKER in (result_text or "").lower():
+            logger.warning("Claude: сессия %s не найдена (is_error)", session_id[:8])
+            return ("", None, "no_session")
         logger.warning("Claude is_error=true: mode=%s dur=%.1fs", mode, dur)
         return (result_text or "ошибка выполнения", None, "error")
 
@@ -670,6 +680,21 @@ async def run_claude(prompt: str, session_id=None):
         (new_sid[:8] if new_sid else "none"),
     )
     return (result_text or "", new_sid, None)
+
+
+async def run_claude_resume(prompt: str, session_id):
+    """run_claude с одним автоповтором: если сохранённая сессия пропала,
+    сбрасываем её в state и повторяем новой сессией (ровно один раз)."""
+    reply, new_sid, error_kind = await run_claude(prompt, session_id)
+    if error_kind == "no_session":
+        state = load_state()
+        state["session_id"] = None
+        save_state(state)
+        logger.warning(
+            "Сессия %s пропала, повторяю новой сессией", (session_id or "")[:8]
+        )
+        return await run_claude(prompt, None)
+    return (reply, new_sid, error_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -924,7 +949,7 @@ async def _fix_estimate_json(bot, chat_id, json_path, error) -> bool:
         f"Файл {json_path}: estimate.json невалиден: {error}. "
         "Исправь файл, ничего больше не делай."
     )
-    reply, new_sid, error_kind = await run_claude(prompt, state.get("session_id"))
+    reply, new_sid, error_kind = await run_claude_resume(prompt, state.get("session_id"))
     if error_kind:
         logger.warning("Починка estimate.json не удалась: %s", error_kind)
         await bot.send_message(chat_id=chat_id, text=human_error(reply))
@@ -1213,7 +1238,7 @@ async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
 
             typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
             try:
-                reply_text, new_sid, error_kind = await run_claude(prompt, session_id)
+                reply_text, new_sid, error_kind = await run_claude_resume(prompt, session_id)
             finally:
                 typing_task.cancel()
                 try:
