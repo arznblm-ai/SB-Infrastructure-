@@ -5,8 +5,11 @@ ADR-027: модель Claude в боте Крис не имеет Bash и сет
 конвертация и рендер делает код — модуль кладёт результат в
 ``workdir/inbox/<stamp>/`` и отдаёт готовый блок для промпта.
 
-Модуль НЕ ходит в сеть. Google-файлы забираются через переданный объект
-``drive`` (duck typing: метод ``export(file_id, mime) -> Path``).
+Сеть: единственный HTTP-запрос — публичный экспорт Google-файлов
+(``docs.google.com/.../export``, «доступ: все, у кого есть ссылка»), без
+авторизации, только для ссылок Google и только когда ``drive`` не передан
+или его экспорт упал. Иначе Google-файлы забираются через объект ``drive``
+(duck typing: метод ``export(file_id, mime) -> Path``). Модель сети не имеет.
 
 CLI:
     python3 Scripts/brief_intake.py <file|url|-> --workdir DIR
@@ -19,6 +22,8 @@ import json
 import re
 import shutil
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +34,9 @@ MAX_PAGES = 40
 MAX_PNG = 15
 IMAGE_PAGE_TEXT_THRESHOLD = 200  # < этого числа символов → страница-картинка
 PNG_DPI = 110
+
+PUBLIC_EXPORT_TIMEOUT = 60  # секунд
+PUBLIC_EXPORT_MAX_BYTES = 50 * 1024 * 1024
 
 TEXT_SUFFIXES = {".txt", ".md", ".markdown", ".rst", ".csv", ".tsv", ".json", ".yaml", ".yml"}
 
@@ -271,49 +279,123 @@ def ingest_url(url: str, workdir: Path, drive=None) -> IntakeResult:
             summary=f"Неизвестная ссылка {url.strip()}: содержимое не получено, попроси файл вложением.",
         )
 
-    # Google-файлы
-    if drive is None:
+    # Google-файлы: сначала Drive (если настроен), при отсутствии/ошибке —
+    # публичный экспорт по ссылке.
+    label = _GOOGLE_LABELS[kind]
+    drive_error: str | None = None
+    if drive is not None:
+        try:
+            exported = Path(drive.export(file_id, _DRIVE_MIME[kind]))
+            target = out_dir / f"source.{_EXT[kind]}"
+            if exported.resolve() != target.resolve():
+                shutil.copy2(exported, target)
+            return _finish_google(kind, target, out_dir, f"{label} → {_EXT[kind].upper()}. ")
+        except Exception as exc:  # noqa: BLE001 — любой сбой Drive → пробуем публичный экспорт
+            drive_error = f"Drive-экспорт не удался ({type(exc).__name__}: {exc}); пробую публичную ссылку."
+
+    try:
+        data = fetch_public_export(kind, file_id)
+    except PublicExportError as exc:
+        warnings = [w for w in (drive_error,) if w]
+        if drive is None:
+            warnings.append("Google Drive не настроен — пробовала публичный экспорт.")
+        warnings.append(f"Публичный экспорт не удался: {exc}")
         return IntakeResult(
             kind="unknown_link",
             dir=out_dir,
             paths=[out_dir / "source.url"],
-            warnings=["Google Drive не настроен — файл не выгружен."],
+            warnings=warnings,
             summary=(
-                f"Google-ссылка ({kind}, id {file_id}): Drive не настроен, "
-                "содержимое не получено — попроси файл вложением."
+                f"{label} (id {file_id}) закрыт — содержимое не получено. "
+                "Попроси Антона открыть доступ по ссылке "
+                "(«Доступ: все, у кого есть ссылка») или прислать PDF вложением."
             ),
         )
 
-    if kind == "gdoc":
-        exported = Path(drive.export(file_id, "text/plain"))
-        target = out_dir / "source.txt"
-        if exported.resolve() != target.resolve():
-            shutil.copy2(exported, target)
-        text = target.read_text(encoding="utf-8", errors="replace")
-        res = _write_text_result(text, out_dir, "gdoc", "Google Doc")
-        res.paths.insert(0, target)
-        return res
-
-    if kind == "gsheet":
-        exported = Path(drive.export(file_id, "text/csv"))
-        target = out_dir / "source.csv"
-        if exported.resolve() != target.resolve():
-            shutil.copy2(exported, target)
-        text = target.read_text(encoding="utf-8", errors="replace")
-        res = _write_text_result(text, out_dir, "gsheet", "Google Sheet (CSV)")
-        res.paths.insert(0, target)
-        return res
-
-    # gslides → PDF → как PDF
-    exported = Path(drive.export(file_id, "application/pdf"))
-    target = out_dir / "source.pdf"
-    if exported.resolve() != target.resolve():
-        shutil.copy2(exported, target)
-    res = _pdf_to_pages(target, out_dir)
-    res.kind = "gslides"
-    res.paths.insert(0, target)
-    res.summary = "Google Slides → PDF. " + res.summary
+    target = out_dir / f"source.{_EXT[kind]}"
+    target.write_bytes(data)
+    res = _finish_google(
+        kind, target, out_dir, f"{label} (публичная ссылка) → {_EXT[kind].upper()}. "
+    )
+    if drive_error:
+        res.warnings.insert(0, drive_error)
     return res
+
+
+_GOOGLE_LABELS = {"gdoc": "Google Doc", "gsheet": "Google Sheet", "gslides": "Google Slides"}
+_DRIVE_MIME = {"gdoc": "text/plain", "gsheet": "text/csv", "gslides": "application/pdf"}
+_EXT = {"gdoc": "txt", "gsheet": "csv", "gslides": "pdf"}
+
+
+def _finish_google(kind: str, target: Path, out_dir: Path, prefix: str) -> IntakeResult:
+    """Выгруженный Google-файл → результат, как у соответствующего формата."""
+    if kind == "gslides":
+        res = _pdf_to_pages(target, out_dir)
+        res.kind = "gslides"
+        res.paths.insert(0, target)
+        res.summary = prefix + res.summary
+        return res
+    text = target.read_text(encoding="utf-8", errors="replace")
+    label = "Google Doc" if kind == "gdoc" else "Google Sheet (CSV)"
+    res = _write_text_result(text, out_dir, kind, label)
+    res.paths.insert(0, target)
+    res.summary = prefix + res.summary
+    return res
+
+
+# --- Публичный экспорт Google (единственный HTTP модуля) ---------------------
+
+_PUBLIC_EXPORT_URLS = {
+    "gslides": "https://docs.google.com/presentation/d/{id}/export/pdf",
+    "gdoc": "https://docs.google.com/document/d/{id}/export?format=txt",
+    "gsheet": "https://docs.google.com/spreadsheets/d/{id}/export?format=csv",
+}
+
+
+class PublicExportError(Exception):
+    """Публичный экспорт не удался: файл закрыт, HTTP-ошибка, таймаут, не тот тип."""
+
+
+def _http_get(url: str, timeout: float, max_bytes: int) -> tuple[bytes, str]:
+    """GET без авторизации (redirects — штатно urllib). Возвращает (тело, Content-Type).
+
+    Вынесено на уровень модуля, чтобы тесты подменяли сеть.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (KrisBot brief intake)"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — фиксированный хост docs.google.com
+        ctype = resp.headers.get("Content-Type", "") or ""
+        length = resp.headers.get("Content-Length")
+        if length and length.isdigit() and int(length) > max_bytes:
+            raise PublicExportError(f"файл больше {max_bytes // (1024 * 1024)} МБ")
+        data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise PublicExportError(f"файл больше {max_bytes // (1024 * 1024)} МБ")
+    return data, ctype
+
+
+def fetch_public_export(kind: str, file_id: str) -> bytes:
+    """Скачать публичный экспорт Google-файла и проверить, что это не страница логина."""
+    url = _PUBLIC_EXPORT_URLS[kind].format(id=file_id)
+    try:
+        data, ctype = _http_get(url, PUBLIC_EXPORT_TIMEOUT, PUBLIC_EXPORT_MAX_BYTES)
+    except PublicExportError:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise PublicExportError(f"HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PublicExportError(f"сеть: {exc}") from exc
+
+    ctype_l = ctype.lower()
+    if kind == "gslides":
+        if not data.startswith(b"%PDF"):
+            raise PublicExportError(
+                "вместо PDF пришла страница входа Google — файл не открыт по ссылке"
+                if "text/html" in ctype_l or data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html"))
+                else f"ответ не PDF (Content-Type: {ctype or '?'})"
+            )
+    elif "text/html" in ctype_l:
+        raise PublicExportError("пришла страница входа Google — файл не открыт по ссылке")
+    return data
 
 
 # --- Публичные входы --------------------------------------------------------

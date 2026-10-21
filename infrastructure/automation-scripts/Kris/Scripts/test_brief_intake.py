@@ -12,6 +12,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import brief_intake as bi  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Ни один тест не ходит в сеть: по умолчанию публичный экспорт «падает»."""
+
+    def _fail(url, timeout, max_bytes):
+        raise bi.urllib.error.URLError("network disabled in tests")
+
+    monkeypatch.setattr(bi, "_http_get", _fail)
+
+
 # --- classify_url -----------------------------------------------------------
 
 
@@ -67,6 +77,34 @@ def test_ingest_url_gdoc_without_drive(tmp_path):
     assert res.kind == "unknown_link"
     assert res.warnings
     assert any("Drive" in w for w in res.warnings)
+    assert "все, у кого есть ссылка" in res.summary
+
+
+def test_ingest_url_gdoc_public_export(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_get(url, timeout, max_bytes):
+        calls.append(url)
+        return "Публичный текст брифа".encode("utf-8"), "text/plain; charset=utf-8"
+
+    monkeypatch.setattr(bi, "_http_get", fake_get)
+    res = bi.ingest_url("https://docs.google.com/document/d/1AbC_dEf-123/edit", tmp_path, drive=None)
+    assert res.kind == "gdoc"
+    assert calls == ["https://docs.google.com/document/d/1AbC_dEf-123/export?format=txt"]
+    assert (res.dir / "source.txt").exists()
+    assert "публичная ссылка" in res.summary
+    assert "Публичный текст брифа" in (res.dir / "pages.md").read_text(encoding="utf-8")
+
+
+def test_ingest_url_gsheet_login_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bi, "_http_get", lambda url, timeout, max_bytes: (b"<!DOCTYPE html><html>Sign in</html>", "text/html; charset=utf-8")
+    )
+    res = bi.ingest_url("https://docs.google.com/spreadsheets/d/3Sheet_id-77/edit", tmp_path, drive=None)
+    assert res.kind == "unknown_link"
+    assert "все, у кого есть ссылка" in res.summary
+    assert "PDF" in res.summary
+    assert not (res.dir / "source.csv").exists()
 
 
 def test_ingest_url_other(tmp_path):
@@ -130,3 +168,62 @@ def test_ingest_unsupported(tmp_path):
     res = bi.ingest_file(f, tmp_path / "wd")
     assert res.kind == "unsupported"
     assert res.warnings
+
+
+# --- Публичный экспорт Google Slides -----------------------------------------
+
+SLIDES_URL = "https://docs.google.com/presentation/d/2XyZ_pres-99/edit#slide=id.p"
+
+
+def test_ingest_url_gslides_public_export(tmp_path, monkeypatch):
+    pdf_bytes = _make_pdf(tmp_path / "deck.pdf").read_bytes()
+    calls = []
+
+    def fake_get(url, timeout, max_bytes):
+        calls.append((url, timeout, max_bytes))
+        return pdf_bytes, "application/pdf"
+
+    monkeypatch.setattr(bi, "_http_get", fake_get)
+    res = bi.ingest_url(SLIDES_URL, tmp_path / "wd", drive=None)
+    assert res.kind == "gslides"
+    assert calls[0][0] == "https://docs.google.com/presentation/d/2XyZ_pres-99/export/pdf"
+    assert calls[0][1] == bi.PUBLIC_EXPORT_TIMEOUT
+    assert (res.dir / "source.pdf").read_bytes() == pdf_bytes
+    assert res.summary.startswith("Google Slides (публичная ссылка) → PDF. ")
+    body = (res.dir / "pages.md").read_text(encoding="utf-8")
+    assert "Kapelnoe oroshenie" in body
+
+
+def test_ingest_url_gslides_login_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bi, "_http_get", lambda url, timeout, max_bytes: (b"<html><body>Sign in - Google Accounts</body></html>", "text/html")
+    )
+    res = bi.ingest_url(SLIDES_URL, tmp_path / "wd", drive=None)
+    assert res.kind == "unknown_link"
+    assert "Доступ: все, у кого есть ссылка" in res.summary
+    assert any("страница входа" in w for w in res.warnings)
+    assert not (res.dir / "source.pdf").exists()
+
+
+def test_ingest_url_gslides_http_error(tmp_path, monkeypatch):
+    def fake_get(url, timeout, max_bytes):
+        raise bi.urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr(bi, "_http_get", fake_get)
+    res = bi.ingest_url(SLIDES_URL, tmp_path / "wd", drive=None)
+    assert res.kind == "unknown_link"
+    assert any("HTTP 404" in w for w in res.warnings)
+
+
+def test_ingest_url_gslides_drive_raises_falls_back(tmp_path, monkeypatch):
+    pdf_bytes = _make_pdf(tmp_path / "deck.pdf").read_bytes()
+    monkeypatch.setattr(bi, "_http_get", lambda url, timeout, max_bytes: (pdf_bytes, "application/pdf"))
+
+    class BrokenDrive:
+        def export(self, file_id, mime):
+            raise PermissionError("403 insufficient permissions")
+
+    res = bi.ingest_url(SLIDES_URL, tmp_path / "wd", drive=BrokenDrive())
+    assert res.kind == "gslides"
+    assert "публичная ссылка" in res.summary
+    assert any("Drive-экспорт не удался" in w for w in res.warnings)
