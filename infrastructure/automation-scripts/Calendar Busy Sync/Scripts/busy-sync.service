@@ -1,0 +1,21 @@
+# busy-sync.service — синк занятости: личные календари → рабочий anton@looch.ai.
+# Ставится деплоем Scripts/deploy.sh в /etc/systemd/system/.
+# Скрипт: Scripts/busy_sync.py → /opt/busy-sync/busy_sync.py.
+# Токен: /root/.config/second-brain/busy-sync-work-token.json (600), выпускает auth_work.py на маке.
+# Health и дедуп алертов: /var/lib/busy-sync/health.json.
+[Unit]
+Description=Busy sync — personal calendars free/busy → anton@looch.ai
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /opt/busy-sync/busy_sync.py
+StateDirectory=busy-sync
+StateDirectoryMode=0700
+TimeoutStartSec=120
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

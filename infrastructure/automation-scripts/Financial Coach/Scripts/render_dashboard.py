@@ -648,6 +648,9 @@ def build_page_data(model: dict, balances: dict[str, Any], as_of: _date) -> dict
         "start_balance": start,
         "start_verified": balances["verified"],
         "salary": model.get("salary_monthly", 400000),
+        # траты Антона на жизнь (схема с 21.10.2026: бизнес-счёт — копилка, доплачивает
+        # разницу между тратами и доходом Луча); нет поля — fallback на salary_monthly
+        "personal": model.get("personal_spending_monthly", model.get("salary_monthly", 400000)),
         "opex": model.get("opex", {"default": 50000, "min": 30000, "max": 200000, "step": 10000}),
         "months": build_forecast_months(model, as_of),
         "flows": flows,
@@ -729,6 +732,8 @@ CSS = """
   .months .zero{color:var(--faint);font-weight:400}
   .months .lst{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.7}
   .months tr.year td{background:var(--soft)}
+  .piggy td{padding:12px 8px}.piggy th{padding:12px 8px 8px}
+  .piggy .amt{font-size:14px}.piggy .mname{font-size:14.5px}
   details{background:var(--card);border-radius:var(--r);margin-top:10px;overflow:hidden}
   summary{cursor:pointer;list-style:none;padding:14px 16px;font-size:14.5px;font-weight:600;
     display:flex;align-items:center;justify-content:space-between;gap:10px}
@@ -882,8 +887,10 @@ function runwayOf(r) {
 
 function compute(opex, oneOffs, toggles) {
   const salary = D.salary;
+  const personal = (D.personal != null) ? D.personal : salary;
   const byMonth = {};
-  D.months.forEach(m => { byMonth[m.key] = { income: 0, out: 0, items: [] }; });
+  // luch — регулярные доходы (зарплата Луча), biz — проектные приходы чистыми (бизнес-счёт)
+  D.months.forEach(m => { byMonth[m.key] = { income: 0, out: 0, items: [], luch: 0, biz: 0 }; });
 
   D.flows.forEach(f => {
     const spec = D.toggles.find(t => t.id === f.toggle);
@@ -897,6 +904,7 @@ function compute(opex, oneOffs, toggles) {
     if (!byMonth[month]) return;
     byMonth[month].income += f.revenue;
     byMonth[month].out += f.tax + f.team;
+    byMonth[month].biz += f.revenue - f.tax - f.team;
     byMonth[month].items.push({
       title: f.title, net: f.revenue - f.tax - f.team,
       schedule: !!f.schedule, kind: f.kind,
@@ -911,6 +919,7 @@ function compute(opex, oneOffs, toggles) {
       if (r.start_month && m.key < r.start_month) return;
       if (r.end_month && m.key > r.end_month) return;
       byMonth[m.key].income += r.amount;
+      byMonth[m.key].luch += r.amount;
       byMonth[m.key].items.push({ title: r.title, net: r.amount, schedule: false, kind: r.kind });
     });
   });
@@ -924,7 +933,11 @@ function compute(opex, oneOffs, toggles) {
     const bucket = byMonth[m.key];
     // days_left === 0 (снапшот в последний день месяца) — тоже валидное окно, не «нет окна»
     const factor = (m.days_total && m.days_left != null) ? m.days_left / m.days_total : 1;
-    const fixed = Math.round((salary + opex) * factor);
+    // burn = траты на жизнь + операционка; сумма округляется одним куском, как раньше,
+    // а «операционка» — остаток от неё (так переразметка не сдвигает баланс ни на рубль)
+    const fixed = Math.round((personal + opex) * factor);
+    const living = Math.round(personal * factor);
+    const opexPart = fixed - living;
     let out = bucket.out + fixed;
 
     const exp = [];
@@ -932,14 +945,17 @@ function compute(opex, oneOffs, toggles) {
       const hit = exp.find(e => e.name === name);
       if (hit) hit.amount += amount; else exp.push({ name: name, amount: amount });
     };
-    push(factor < 1 ? 'burn (ЗП + операционка), ' + m.days_left + ' дн' : 'burn (ЗП + операционка)', fixed);
+    const daysTag = factor < 1 ? ', ' + m.days_left + ' дн' : '';
+    push('траты на жизнь' + daysTag, living);
+    push('операционка бизнеса' + daysTag, opexPart);
 
+    let oneOffSum = 0;  // разовые траты месяца (команда графиком, налоги) — уходят с бизнес-счёта
     D.one_offs.forEach(o => {
       const value = oneOffs[o.id];
-      if (o.month === m.key && value) { out += value; push(o.short, value); }  // отрицательное = корректировка (например, ЗП уже выплачена)
+      if (o.month === m.key && value) { out += value; oneOffSum += value; push(o.short, value); }  // отрицательное = корректировка (например, ЗП уже выплачена)
     });
     D.tax_one_off.forEach(t => {
-      if (t.month === m.key && t.amount) { out += t.amount; push(t.label, t.amount); }
+      if (t.month === m.key && t.amount) { out += t.amount; oneOffSum += t.amount; push(t.label, t.amount); }
     });
 
     bal = bal + bucket.income - out;
@@ -956,11 +972,41 @@ function compute(opex, oneOffs, toggles) {
     rows.push({
       label: m.label, sub: factor < 1 ? 'остаток месяца: ' + m.days_left + ' дн.' : '',
       items: bucket.items, incomeNet: incomeNet, exp: exp, outShown: outShown, bal: bal,
+      key: m.key, luch: bucket.luch, biz: bucket.biz, oneOffSum: oneOffSum,
+      living: living, opexPart: opexPart,
     });
   });
 
   return { rows, balances, minBal, minMonth, final: bal, monthlyBurn: salary + opex,
            yearIn: yearIn, yearOut: yearOut };
+}
+
+// Бизнес-счёт как копилка (схема с 21.10.2026). Поверх той же цепочки compute():
+// ЗП из бизнеса = max(0, траты на жизнь − доход Луча месяца); излишек Луча остаётся в личном.
+// Бизнес-счёт стартует с живого остатка пула, личное — с нуля; их сумма обязана совпасть
+// с остатком пула в основной таблице (проверяется здесь же, расхождение — в r.mismatch).
+function piggyOf(r) {
+  let biz = D.start_balance, personalAcc = 0;
+  const rows = r.rows.map(row => {
+    const zp = Math.max(0, row.living - row.luch);
+    const saved = row.biz - row.oneOffSum - row.opexPart - zp;
+    const personalDelta = row.luch + zp - row.living;
+    biz += saved; personalAcc += personalDelta;
+    return { key: row.key, label: row.label, sub: row.sub, portal: row.biz, oneOff: row.oneOffSum,
+             opex: row.opexPart, zp: zp, saved: saved, bizBal: biz, luch: row.luch,
+             living: row.living, personalDelta: personalDelta, personalAcc: personalAcc,
+             pool: row.bal, ok: Math.abs(biz + personalAcc - row.bal) < 0.5 };
+  });
+  return { rows: rows, ok: rows.every(x => x.ok) };
+}
+
+const MONTHS_FROM = ['января','февраля','марта','апреля','мая','июня',
+                     'июля','августа','сентября','октября','ноября','декабря'];
+function monthFrom(key) {
+  const y = parseInt(key.slice(0, 4), 10), m = parseInt(key.slice(5, 7), 10);
+  const baseYear = parseInt(D.months[0].key.slice(0, 4), 10);
+  const name = MONTHS_FROM[m - 1] || key;
+  return y === baseYear ? name : name + ' ' + y;
 }
 
 function drawChart(balances) {
@@ -1087,6 +1133,67 @@ function render() {
 
   drawChart(r.balances);
 
+  // бизнес-счёт как копилка: та же цепочка r, разложенная на бизнес и личное
+  const pg = piggyOf(r);
+  const pgBody = el('piggy-body');
+  if (pgBody) {
+    // sign '+' — приход, '−' — расход (отрицательный расход = корректировка, показываем как +)
+    const cell = (l, v, sign) => {
+      let txt = '—';
+      if (v) txt = sign === '−' ? (v > 0 ? '−' : '+') + fmt(Math.abs(v)) : (v > 0 ? '+' : '') + fmt(v);
+      return '<td data-l="' + l + '" class="r"><div class="amt' + (v ? '' : ' zero') + '">' + txt + '</div></td>';
+    };
+    pgBody.innerHTML = pg.rows.map(x =>
+      '<tr><td data-l="Месяц"><div class="mname">' + x.label + '</div>' +
+        (x.sub ? '<div class="hint">' + x.sub + '</div>' : '') + '</td>' +
+      cell('Портал чистыми', x.portal, '+') +
+      cell('Команда и налоги', x.oneOff, '−') +
+      cell('Операционка', x.opex, '−') +
+      cell('ЗП из бизнеса', x.zp, '−') +
+      '<td data-l="Накопил за месяц" class="r"><div class="amt ' + (x.saved >= 0 ? 'bal-ok' : 'bal-crit') + '">' +
+        (x.saved > 0 ? '+' : '') + fmt(x.saved) + '</div></td>' +
+      '<td data-l="Бизнес-счёт на конец" class="r"><div class="amt ' + fc(x.bizBal) + '">' + fmt(x.bizBal) + '</div>' +
+        '<div class="lst">личное за месяц ' + (x.personalDelta > 0 ? '+' : '') + fmt(x.personalDelta) +
+        '<br>Луч ' + fmt(x.luch) + ' + из бизнеса ' + fmt(x.zp) + ' − траты ' + fmt(x.living) + '</div></td></tr>'
+    ).join('');
+    const last = pg.rows[pg.rows.length - 1];
+    if (last) {
+      el('piggy-personal').innerHTML = '<b>Личное за период:</b> ' + (last.personalAcc > 0 ? '+' : '') + fmt(last.personalAcc) +
+        ' (Луч + ЗП из бизнеса − траты на жизнь, нарастающим итогом). Бизнес-счёт ' + fmt(last.bizBal) +
+        ' + личное ' + fmt(last.personalAcc) + ' = пул ' + fmt(last.pool) +
+        (pg.ok ? ' — сходится с таблицей выше.' : ' — <b>не сходится с таблицей выше, проверить модель.</b>');
+      el('piggy-personal').className = pg.ok ? 'note' : 'flag';
+    }
+  }
+
+  // hero «ЗП из бизнеса»: ближайший месяц, где Луч платит; дальше — смены значения
+  const zpVal = el('hero-zp-val');
+  if (zpVal && pg.rows.length) {
+    let i0 = pg.rows.findIndex(x => x.luch > 0);
+    const luchOff = i0 < 0;
+    if (luchOff) i0 = 0;
+    const head = pg.rows[i0];
+    // доля частичного месяца сюда не попадает: показываем полную месячную сумму
+    const full = (x) => Math.max(0, (D.personal != null ? D.personal : D.salary) - x.luch);
+    zpVal.textContent = fmt(full(head));
+    zpVal.className = 'v num';
+    if (luchOff) {
+      el('hero-zp-sub').textContent = 'Луч выключен — траты на жизнь целиком из бизнеса';
+    } else {
+      const runs = [];
+      for (let i = i0 + 1; i < pg.rows.length; i++) {
+        const v = full(pg.rows[i]);
+        const prev = runs.length ? runs[runs.length - 1].v : full(head);
+        if (v !== prev) runs.push({ key: pg.rows[i].key, v: v, len: 1 });
+        else if (runs.length) runs[runs.length - 1].len++;
+      }
+      const parts = runs.map((x, k) => (k < runs.length - 1 && x.len === 1 ? 'в ' + monthIn(x.key) : 'с ' + monthFrom(x.key)) +
+        ' — ' + fmt(x.v));
+      el('hero-zp-sub').textContent = 'с ' + monthFrom(head.key) + ' (Луч ' + fmt(head.luch) + ')' +
+        (parts.length ? '; ' + parts.join('; ') : '');
+    }
+  }
+
   el('runway-body').innerHTML = D.runway_variants.map(v => {
     const burn = v.salary + opex;
     const base = r.final + (v.with_crypto ? D.crypto_rub : 0);
@@ -1179,6 +1286,11 @@ def section_hero(balances: dict[str, Any], page: dict[str, Any]) -> str:
     <div class="v num" id="hero-slope-val">—</div>
     <div class="n" id="hero-slope-sub">—</div>
   </div>
+  <div class="box">
+    <div class="k">ЗП из бизнеса</div>
+    <div class="v num" id="hero-zp-val">—</div>
+    <div class="n" id="hero-zp-sub">—</div>
+  </div>
 </div>
 """
 
@@ -1233,6 +1345,21 @@ def section_months(model: dict, page: dict[str, Any]) -> str:
 </table>
 </div>
 {footnote}
+<div class="stitle">Бизнес-счёт как копилка</div>
+<div class="panel">
+<table class="months piggy">
+  <thead><tr>
+    <th>Месяц</th><th class="r">Портал чистыми</th><th class="r">Команда и налоги</th>
+    <th class="r">Операционка</th><th class="r">ЗП из бизнеса</th><th class="r">Накопил за месяц</th>
+    <th class="r">Бизнес-счёт на конец</th>
+  </tr></thead>
+  <tbody id="piggy-body"></tbody>
+</table>
+</div>
+<div class="note">ЗП из бизнеса = траты на жизнь {fmt_rub(page['personal'])}/мес минус доход Луча
+в этом месяце (не меньше нуля); излишек Луча остаётся в личном. Бизнес-счёт стартует
+с живого остатка {fmt_rub(page['start_balance'])}.</div>
+<div id="piggy-personal" class="note"></div>
 <div id="verdict" class="verdict"></div>
 """
 
