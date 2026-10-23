@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# Деплой синка занятости (личные календари → anton@looch.ai) с мака на VPS 163.5.29.10:
+# Деплой синка занятости (личные календари → приглашения в anton@looch.ai) с мака на VPS 163.5.29.10:
 #   bash "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Calendar Busy Sync/Scripts/deploy.sh"
 #
 # Идемпотентно: гонять сколько угодно раз, повтор говорит «= уже». Ничего не удаляет.
-# Секреты не печатаются и не едут с VPS на мак: токен looch.ai кладёт на VPS auth_work.py (H3),
-# токен Аси для алертов скрипт читает на VPS из /root/.config/asya/.env.
+# Секреты не печатаются и не едут с VPS на мак: токен tony@portalcg.us — уже лежащий на VPS
+# /root/.config/second-brain/google-calendar-token.json (его же читает gcal-mcp Аси; деплой и синк
+# файл не трогают — ни содержимое, ни права). Токен Аси для алертов — /root/.config/asya/.env.
+# Ревизия 2026-10-22: OAuth looch.ai заблокирован админом, auth_work.py в Scripts/archive/.
 #
 # Шаги:
 #   [0] мак: файлы на месте, py_compile, bash -n, unit-тесты, ssh до VPS; заливка в /opt/busy-sync/.staging
 #   [1] код в /opt/busy-sync, юниты в /etc/systemd/system, daemon-reload
-#   [2] нет токен-файла → таймер НЕ включаем («сначала auth_work.py»); есть → --check, успех → enable --now timer
+#   [2] нет google-calendar-token.json → таймер НЕ включаем; есть → --check:
+#       rc 0 → enable --now timer; rc 2 (degraded: primary ok, gmail не расшарен) → enable + предупреждение;
+#       rc 1 → таймер не включаем
 #   [3] смоук: статус таймера, последний журнал прогона
 #
 # Откат — в комментарии в конце файла.
@@ -27,11 +31,11 @@ STAGING="/opt/busy-sync/.staging"
 fail() { echo "  ✗ $*" >&2; exit 1; }
 
 echo "[0] Проверяю локальные файлы (до любых изменений на сервере)"
-for f in "$SCRIPT_DIR/busy_sync.py" "$SCRIPT_DIR/test_busy_sync.py" "$SCRIPT_DIR/auth_work.py" \
+for f in "$SCRIPT_DIR/busy_sync.py" "$SCRIPT_DIR/test_busy_sync.py" \
          "$SCRIPT_DIR/busy-sync.service" "$SCRIPT_DIR/busy-sync.timer" "$SCRIPT_DIR/deploy.sh"; do
   [ -s "$f" ] || fail "нет файла $f"
 done
-python3 -m py_compile "$SCRIPT_DIR/busy_sync.py" "$SCRIPT_DIR/auth_work.py" "$SCRIPT_DIR/test_busy_sync.py" \
+python3 -m py_compile "$SCRIPT_DIR/busy_sync.py" "$SCRIPT_DIR/test_busy_sync.py" \
   || fail "код не компилируется — чини до деплоя"
 bash -n "$SCRIPT_DIR/deploy.sh" || fail "deploy.sh: синтаксическая ошибка"
 ( cd "$SCRIPT_DIR" && python3 -m unittest -q test_busy_sync 2>&1 | tail -3 ) | sed 's/^/    /'
@@ -56,7 +60,7 @@ umask 022
 
 STAGING=/opt/busy-sync/.staging
 CODE=/opt/busy-sync
-TOKEN_FILE=/root/.config/second-brain/busy-sync-work-token.json
+TOKEN_FILE=/root/.config/second-brain/google-calendar-token.json   # общий с gcal-mcp Аси — только читаем
 ASYA_ENV=/root/.config/asya/.env
 
 PROBLEMS=()
@@ -89,21 +93,25 @@ python3 -m py_compile "$CODE/busy_sync.py" && ok "py_compile на VPS: OK ($(pyt
   && ok "токен Аси для алертов есть в $ASYA_ENV" \
   || warn "нет TELEGRAM_BOT_TOKEN в $ASYA_ENV — синк будет работать, но алерты не уйдут"
 
-# ── [2] Токен looch.ai → check → таймер ─────────────────────────────────────
-echo "[2] Токен anton@looch.ai, проверка доступа, таймер"
+# ── [2] Токен tony@portalcg.us → check → таймер ─────────────────────────────
+echo "[2] Токен tony@portalcg.us (общий с Асей), проверка доступа, таймер"
 if [ ! -f "$TOKEN_FILE" ]; then
   warn "нет $TOKEN_FILE — таймер НЕ включаю."
-  warn "Сначала auth_work.py на маке (H3), потом снова deploy.sh:"
-  warn "  python3 \"/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Calendar Busy Sync/Scripts/auth_work.py\""
+  warn "Это токен gcal-mcp Аси (tony@portalcg.us): проверь, что Ася на VPS на месте и путь не менялся."
   if systemctl is-enabled --quiet busy-sync.timer 2>/dev/null; then
     warn "при этом busy-sync.timer уже enabled — токен пропал? прогоны будут падать с алертом"
   fi
 else
-  chmod 600 "$TOKEN_FILE"
+  # файл не chmod-им и не трогаем: им владеет gcal-mcp Аси
   CHECK_OUT=$(timeout 90 python3 "$CODE/busy_sync.py" --check 2>&1); CHECK_RC=$?
   printf '%s\n' "$CHECK_OUT" | redact | sed 's/^/    /'
-  if [ "$CHECK_RC" = 0 ]; then
-    ok "--check: доступ есть"
+  if [ "$CHECK_RC" = 0 ] || [ "$CHECK_RC" = 2 ]; then
+    if [ "$CHECK_RC" = 0 ]; then
+      ok "--check: доступ есть, все источники ok"
+    else
+      warn "--check: degraded — токен и primary ok, но не все источники отвечают (см. ⚠ выше)."
+      warn "Таймер включаю: блоки по живым источникам ставятся, удалений не будет до починки шаринга (H1')."
+    fi
     if systemctl is-enabled --quiet busy-sync.timer 2>/dev/null && systemctl is-active --quiet busy-sync.timer; then
       skip "busy-sync.timer уже enabled и active"
     else
@@ -112,7 +120,7 @@ else
     fi
     TIMER_ON=1
   else
-    bad "--check провален (rc=$CHECK_RC) — таймер не включаю; чини по строкам ✗ выше (H1/H2 — шаринг, H3 — токен)"
+    bad "--check провален (rc=$CHECK_RC) — таймер не включаю; чини по строкам ✗ выше (токен, primary, BLOCK_CALENDAR)"
   fi
 fi
 
@@ -132,16 +140,15 @@ echo
 if [ ${#PROBLEMS[@]} -eq 0 ] && [ "$TIMER_ON" = 1 ]; then
   echo "Итог: ✓ синк занятости развёрнут, таймер каждые 10 мин."
 elif [ ${#PROBLEMS[@]} -eq 0 ]; then
-  echo "Итог: = код и юниты на месте, таймер ждёт токена (auth_work.py)."
+  echo "Итог: = код и юниты на месте, таймер ждёт токена google-calendar-token.json."
 else
   echo "Итог: ✗ проблем: ${#PROBLEMS[@]}"
   for p in "${PROBLEMS[@]}"; do echo "  ✗ $p"; done
 fi
 echo
 echo "Руками (Антон), если ещё не сделано:"
-echo "  H1. a.rznblm@gmail.com → настройки календаря → доступ → anton@looch.ai «только свободно/занято»."
-echo "  H2. То же в tony@portalcg.us."
-echo "  H3. На маке: auth_work.py → вход как anton@looch.ai → согласие (токен сам ляжет на VPS)."
+echo "  H1'. a.rznblm@gmail.com → настройки календаря → «Доступ» → tony@portalcg.us «только свободно/занято»."
+echo "  (H2, H3 больше не нужны — ревизия 2026-10-22: tony@portalcg.us читает свой primary сам, OAuth looch.ai не нужен.)"
 echo "Логи: journalctl -u busy-sync -n 50 · план без записи: python3 $CODE/busy_sync.py --dry-run"
 [ ${#PROBLEMS[@]} -eq 0 ]
 REMOTE
@@ -156,5 +163,5 @@ exit $RC
 #   python3 /opt/busy-sync/busy_sync.py --purge --dry-run   # сколько блоков «Busy» удалит
 #   python3 /opt/busy-sync/busy_sync.py --purge             # удалить все наши блоки в окне
 #
-# Код /opt/busy-sync, токен /root/.config/second-brain/busy-sync-work-token.json и
+# Код /opt/busy-sync, токен /root/.config/second-brain/google-calendar-token.json (Асин) и
 # /var/lib/busy-sync откат не трогает. Блоки в прошлом --purge не удаляет (история).

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""auth_work.py — разовая авторизация anton@looch.ai для синка занятости (шаг H3).
+"""⛔ АРХИВ 2026-10-22: админ looch.ai заблокировал OAuth для anton@looch.ai; синк перешёл на
+приглашения от tony@portalcg.us (см. CLAUDE.md, «Ревизия 2026-10-22»). Не запускать.
+
+auth_work.py — разовая авторизация anton@looch.ai для синка занятости (шаг H3).
 
 Запускает Антон на маке (нужен google-auth-oauthlib):
     python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Calendar Busy Sync/Scripts/auth_work.py"

@@ -1,7 +1,8 @@
 # busy-sync.service — синк занятости: личные календари → рабочий anton@looch.ai.
 # Ставится деплоем Scripts/deploy.sh в /etc/systemd/system/.
 # Скрипт: Scripts/busy_sync.py → /opt/busy-sync/busy_sync.py.
-# Токен: /root/.config/second-brain/busy-sync-work-token.json (600), выпускает auth_work.py на маке.
+# Токен: /root/.config/second-brain/google-calendar-token.json (tony@portalcg.us, общий с gcal-mcp Аси) —
+# только читается, файл синк никогда не перезаписывает. Блоки — приглашения из служебного календаря «Busy → Луч».
 # Health и дедуп алертов: /var/lib/busy-sync/health.json.
 [Unit]
 Description=Busy sync — personal calendars free/busy → anton@looch.ai

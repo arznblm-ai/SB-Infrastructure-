@@ -1,0 +1,17 @@
+[Unit]
+Description=Rocky - коуч по питанию и тренировкам в групповом чате (Telegram + claude CLI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rocky
+Environment=HOME=/root
+EnvironmentFile=/root/.config/rocky/.env
+ExecStart=/opt/rocky/venv/bin/python /opt/rocky/rocky_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
