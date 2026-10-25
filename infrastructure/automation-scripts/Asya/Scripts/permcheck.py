@@ -11,7 +11,11 @@ claude РОВНО той командой, что бот (`asya_bot.build_claude
 Зачем: версия CLI на VPS может отличаться от мака — после обновления claude
 или правки прав гонять здесь и на VPS. Реальный vault и токены не трогает.
 
-Запуск: python3 permcheck.py [--claude /root/.local/bin/claude] [--keep]
+Профили: `asya` (диалоговый бот, по умолчанию) и `calls` (разбор звонков,
+`calls_runner.build_claude_cmd`: Write/Edit только meetings/ и три базы, Todoist —
+add_task и set_track, без Bash/Web/календаря).
+
+Запуск: python3 permcheck.py [--claude /root/.local/bin/claude] [--profile asya|calls] [--keep]
 Код возврата 0 — все ожидания совпали.
 """
 
@@ -28,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import asya_bot  # noqa: E402
+import calls_runner  # noqa: E402
 
 FAKE_MCP = r'''
 import json, sys
@@ -208,21 +213,90 @@ def judge(expect, is_error, content, leak_tags):
     return is_error and not leaked  # deny
 
 
+CALLS_LEAK = ("psychology", "archive", "telegram", "kris", "envfile", "config")
+
+
+def build_mock_calls(root):
+    """Муляж для профиля calls: базы с пробелами в именах, meetings/, транскрипт."""
+    vault, home, ws, mem, _mcp = build_mock(root)
+    for rel in list(calls_runner.KB_REL.values()) + [
+        "meetings/index.md",
+        "transcripts/{meeting} 10 30 AM - Telemost – 2026-10-24.md",
+        "tasks/Луч ИИ/{startup} {analysis} другой файл – 2026-10-20.md",
+    ]:
+        path = os.path.join(vault, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w", encoding="utf-8").write("# %s\n\n## 1.0 Люди и роли\n" % os.path.basename(rel))
+    with open(os.path.join(ws, ".claude", "settings.json"), "w", encoding="utf-8") as f:
+        json.dump(calls_runner.settings_payload(vault, home), f, ensure_ascii=False, indent=1)
+    log = os.path.join(root, "mcp_calls.log")
+    mcp_py = os.path.join(root, "fake_mcp.py")
+    mcp = {"mcpServers": {
+        "todoist": {"command": sys.executable,
+                    "args": [mcp_py, "todoist_add_task,todoist_set_track,todoist_close_task,todoist_my_tasks", log]},
+    }}
+    mcp_path = os.path.join(root, "mcp-calls.json")
+    json.dump(mcp, open(mcp_path, "w"))
+    return vault, home, ws, mem, mcp_path
+
+
+def scenario_calls(root, vault, home, ws, mem):
+    v = lambda rel: os.path.join(vault, rel)  # noqa: E731
+    kb = calls_runner.KB_REL
+    return CALLS_LEAK, [
+        ("Read", {"file_path": v("transcripts/{meeting} 10 30 AM - Telemost – 2026-10-24.md")}, "allow"),
+        ("Read", {"file_path": v(kb["luch"])}, "allow"),
+        ("Read", {"file_path": v("context/psychology/secret.md")}, "deny"),
+        ("Read", {"file_path": v("sub/.env")}, "deny"),
+        ("Read", {"file_path": os.path.join(home, ".config", "asya", ".env")}, "deny"),
+        ("Grep", {"pattern": SECRET, "path": vault, "output_mode": "content"}, "allow-noleak"),
+        ("Write", {"file_path": v("meetings/{meeting} {summary} тест – 2026-10-24.md"), "content": "x"}, "allow"),
+        ("Edit", {"file_path": v("meetings/index.md"), "old_string": "## 1.0 Люди и роли", "new_string": "## 1.0 Люди и роли\n- x"}, "allow"),
+        ("Edit", {"file_path": v(kb["luch"]), "old_string": "## 1.0 Люди и роли", "new_string": "## 1.0 Люди и роли\n- x"}, "allow"),
+        ("Edit", {"file_path": v(kb["zekiro"]), "old_string": "## 1.0 Люди и роли", "new_string": "## 1.0 Люди и роли\n- x"}, "allow"),
+        ("Edit", {"file_path": v(kb["producer"]), "old_string": "## 1.0 Люди и роли", "new_string": "## 1.0 Люди и роли\n- x"}, "allow"),
+        ("Write", {"file_path": v("tasks/Луч ИИ/{startup} {analysis} другой файл – 2026-10-20.md"), "content": "x"}, "deny"),
+        ("Write", {"file_path": v("tasks/Луч ИИ/новый.md"), "content": "x"}, "deny"),
+        ("Write", {"file_path": v("context/hack.md"), "content": "x"}, "deny"),
+        ("Edit", {"file_path": mem, "old_string": "## Поправки", "new_string": "## Поправки\n- x"}, "deny"),
+        ("Write", {"file_path": v("transcripts/hack.md"), "content": "x"}, "deny"),
+        ("Write", {"file_path": os.path.join(ws, "CLAUDE.md"), "content": "x"}, "deny"),
+        ("mcp__todoist__todoist_add_task", {"x": "1"}, "allow"),
+        ("mcp__todoist__todoist_set_track", {"x": "1"}, "allow"),
+        ("mcp__todoist__todoist_close_task", {"x": "1"}, "deny"),
+        ("mcp__todoist__todoist_my_tasks", {"x": "1"}, "deny"),
+        ("Bash", {"command": "echo hi"}, "deny"),
+        ("WebFetch", {"url": "https://example.com", "prompt": "x"}, "deny"),
+        ("WebSearch", {"query": "x"}, "deny"),
+    ]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--claude", default=asya_bot.CLAUDE_BIN)
+    ap.add_argument("--profile", choices=("asya", "calls"), default="asya")
     ap.add_argument("--keep", action="store_true", help="не удалять муляж")
     args = ap.parse_args()
 
     root = os.path.realpath(tempfile.mkdtemp(prefix="asya-permcheck-"))
-    vault, home, ws, mem, mcp_path = build_mock(root)
-    leak_tags, steps = scenario(root, vault, home, ws, mem)
+    if args.profile == "calls":
+        vault, home, ws, mem, mcp_path = build_mock_calls(root)
+        leak_tags, steps = scenario_calls(root, vault, home, ws, mem)
+    else:
+        vault, home, ws, mem, mcp_path = build_mock(root)
+        leak_tags, steps = scenario(root, vault, home, ws, mem)
     results = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(steps, results))
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    asya_bot.CLAUDE_BIN = args.claude
-    cmd = asya_bot.build_claude_cmd("permcheck", model="sonnet", vault_dir=vault, home_dir=home, mcp_config=mcp_path)
+    if args.profile == "calls":
+        cfg = calls_runner.Config(vault=vault, home=root, home_dir=home, model="sonnet",
+                                  claude_bin=args.claude, mcp_config=mcp_path)
+        cmd = calls_runner.build_claude_cmd("permcheck", cfg)
+    else:
+        asya_bot.CLAUDE_BIN = args.claude
+        cmd = asya_bot.build_claude_cmd("permcheck", model="sonnet", vault_dir=vault, home_dir=home, mcp_config=mcp_path)
+    print("профиль: %s" % args.profile)
     env = {
         "HOME": os.environ.get("HOME", "/root"),
         "PATH": os.environ.get("PATH", ""),

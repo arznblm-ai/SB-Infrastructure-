@@ -1,0 +1,23 @@
+# asya-calls.service — Ася разбирает звонки в базы проектов (ADR-033).
+# Один тик: очередь вопросов о треке + новые транскрипты -> claude -p (sonnet) -> отчёт Антону.
+# Ставится ранбуком Scripts/deploy_calls.sh в /etc/systemd/system/. Запускается таймером.
+[Unit]
+Description=Asya calls - разбор звонков в базы проектов (ADR-033)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/var/lib/asya-calls/workspace
+Environment=HOME=/root
+Environment=ASYA_VAULT_DIR=/root/second-brain
+Environment=ASYA_CALLS_HOME=/var/lib/asya-calls
+Environment=ASYA_CALLS_PROMPT=/opt/asya/calls_prompt.md
+Environment=ASYA_CALLS_MCP_CONFIG=/var/lib/asya-calls/workspace/mcp.json
+Environment=ASYA_CHATLOG_DIR=/var/lib/asya/chatlog
+EnvironmentFile=/root/.config/asya/.env
+ExecStart=/opt/asya/venv/bin/python /opt/asya/calls_runner.py
+# один звонок ~2-10 мин на sonnet; claude таймаут 20 мин на звонок
+TimeoutStartSec=3600
+Nice=10

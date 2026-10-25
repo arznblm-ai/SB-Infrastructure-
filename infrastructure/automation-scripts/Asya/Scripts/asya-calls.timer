@@ -1,0 +1,12 @@
+# asya-calls.timer — каждые 10 минут разбирать свежие звонки (ADR-033).
+[Unit]
+Description=Run asya-calls every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+RandomizedDelaySec=30
+Unit=asya-calls.service
+
+[Install]
+WantedBy=timers.target

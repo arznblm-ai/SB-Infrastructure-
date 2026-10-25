@@ -871,8 +871,9 @@ def append_todos(summary: dict, note_path: str, meeting_date: str, dry_run: bool
         area_label = area if area != NO_AREA else None
         title_short = clean_title_short(task.get("title_short"), task["what"])
         due_suggested = clean_due(task.get("due_suggested"))
-        if owner == "other":
-            # Чужие задачи в Todoist не переносятся (решение Антона 2026-07-31):
+        if owner == "other" or os.environ.get("MEETING_NOTES_TODOIST", "").strip().lower() == "off":
+            # Чужие задачи в Todoist не переносятся (решение Антона 2026-07-31);
+            # с ADR-033 (MEETING_NOTES_TODOIST=off) задачи Антона ставит asya-calls в «Мои».
             # они остаются в vault-сторе и в shareable-сообщении встречи.
             (print if dry_run else log)(f"todoist: skip other-owned task {todo_id}")
         elif dry_run:
@@ -1271,7 +1272,8 @@ def process_meeting(
         return
 
     try:
-        send_to(note_channel, shareable)
+        if os.environ.get("MEETING_NOTES_DELIVERY", "").strip().lower() != "off":  # ADR-033: ноутс заменён отчётом asya-calls
+            send_to(note_channel, shareable)
     except Exception as exc:
         log(f"telegram send failed (will retry): {path.name}: {exc}")
         return
