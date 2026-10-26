@@ -213,11 +213,11 @@ def test_max_per_tick(env):
 
 def test_errors_retry_twice_then_failure_message(env):
     add_transcript(env, NAME, full_transcript())
-    fake = Fake([("", "timeout", None), ("мусор без json", None, 0.05), ("", "error", None)])
+    fake = Fake([("", "timeout", None), ("", "empty", 0.05), ("", "error", None)])
     tick(env, fake)
     assert cr.load_state(env)["calls"][NAME]["status"] == cr.ST_ERROR and fake.sent == []
     tick(env, fake, now=NOW + timedelta(minutes=10))
-    assert cr.load_state(env)["calls"][NAME]["error"] == "bad_json"
+    assert cr.load_state(env)["calls"][NAME]["error"] == "empty"
     tick(env, fake, now=NOW + timedelta(minutes=20))
     assert cr.load_state(env)["calls"][NAME]["status"] == cr.ST_FAILED
     assert len(fake.sent) == 1 and "Не смогла разобрать" in fake.sent[0]
@@ -394,3 +394,65 @@ def test_units_and_prompt_and_footer():
 def test_runner_messages_have_no_yo_and_long_dash():
     for text in (cr.QUESTION_TAIL,):
         assert "ё" not in text and "—" not in text
+
+
+# ---------------------------------------------------------------------------
+# Устойчивый JSON, raw, done_unparsed (сбой 24.10 на звонке 17.10)
+# ---------------------------------------------------------------------------
+def _full_obj(**kw):
+    obj = {"track": "zekiro", "confidence": 0.9, "secondary_tracks": [],
+           "summary_path": "meetings/x.md", "kb_updates": [],
+           "tasks": [{"title": "прислать прайс", "track": "zekiro", "due": ""}],
+           "report_text": "Зекиро, цена за место"}
+    obj.update(kw)
+    return obj
+
+
+def test_extract_fenced_json_with_nested_track_in_tasks():
+    text = "Готово, записала.\n```json\n" + json.dumps(_full_obj(), ensure_ascii=False, indent=2) + "\n```\n"
+    obj = cr.extract_result_json(text)
+    assert obj["report_text"] == "Зекиро, цена за место" and obj["track"] == "zekiro"
+
+
+def test_extract_text_around_json_and_braces_in_prose():
+    text = ("Саммари: meetings/{meeting} {summary} тест – 2026-10-17.md\n"
+            + json.dumps(_full_obj(), ensure_ascii=False) + "\nЕсли что, пиши. {не json}")
+    assert cr.extract_result_json(text)["report_text"] == "Зекиро, цена за место"
+
+
+def test_extract_from_cli_result_wrapper():
+    inner = "Итог:\n```json\n" + json.dumps(_full_obj(), ensure_ascii=False) + "\n```"
+    wrapper = json.dumps({"type": "result", "is_error": False, "result": inner, "total_cost_usd": 0.4})
+    assert cr.extract_result_json(wrapper)["track"] == "zekiro"
+
+
+def test_garbage_done_unparsed_no_rerun_fallback_sent_and_raw_saved(env):
+    add_transcript(env, NAME, full_transcript())
+    fake = Fake([("мусор без json", None, 0.44, "rc=0\n--- stdout ---\nRAW-MARKER")])
+    tick(env, fake)
+    entry = cr.load_state(env)["calls"][NAME]
+    assert entry["status"] == cr.ST_UNPARSED
+    assert len(fake.prompts) == 1
+    assert len(fake.sent) == 1 and "не смогла собрать отчет" in fake.sent[0] and "meetings/" in fake.sent[0]
+    assert entry["raw"] and entry["raw"] in fake.sent[0]
+    assert open(entry["raw"], encoding="utf-8").read().endswith("RAW-MARKER")
+    assert os.path.dirname(entry["raw"]) == env.raw_dir
+    log = [json.loads(ln) for ln in open(env.log_file, encoding="utf-8")]
+    assert log[-1]["error"] == "bad_json" and log[-1]["raw"] == entry["raw"]
+    # следующие тики не трогают звонок
+    tick(env, fake, now=NOW + timedelta(minutes=10))
+    tick(env, fake, now=NOW + timedelta(minutes=20))
+    assert len(fake.prompts) == 1 and len(fake.sent) == 1
+
+
+def test_raw_saved_on_success(env):
+    add_transcript(env, NAME, full_transcript())
+    fake = Fake()
+    tick(env, fake)
+    files = os.listdir(env.raw_dir)
+    assert len(files) == 1 and files[0].startswith("2026-10-24-") and files[0].endswith(".txt")
+    assert "10-30-am-telemost" in files[0]
+
+
+def test_fallback_message_style():
+    assert "ё" not in "Разобрала звонок, но не смогла собрать отчет. Проверь саммари в meetings/ и базу проекта."

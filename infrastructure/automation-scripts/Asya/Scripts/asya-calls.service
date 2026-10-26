@@ -13,6 +13,7 @@ WorkingDirectory=/var/lib/asya-calls/workspace
 Environment=HOME=/root
 Environment=ASYA_VAULT_DIR=/root/second-brain
 Environment=ASYA_CALLS_HOME=/var/lib/asya-calls
+Environment=ASYA_CALLS_MAX=20
 Environment=ASYA_CALLS_PROMPT=/opt/asya/calls_prompt.md
 Environment=ASYA_CALLS_MCP_CONFIG=/var/lib/asya-calls/workspace/mcp.json
 Environment=ASYA_CHATLOG_DIR=/var/lib/asya/chatlog

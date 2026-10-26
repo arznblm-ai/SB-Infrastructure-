@@ -1,13 +1,14 @@
 # Index: skills
 
 > Автоматически сгенерировано Obsidian Manager.
-> Последнее обновление: 2026-10-19 06:16.
+> Последнее обновление: 2026-10-26 10:22.
 > Не редактировать вручную — будет перезаписан при следующей индексации.
 
 | Скил | Описание |
 |------|----------|
 | [[adizes]] | Ментор Адизес по проблемам внутри коллектива (по лекциям Ицхака Адизеса и soft-skills-курсам Eduson «MBA: Лидерство»): команда, партнёры, роли, конфликты, доверие, доли и вклад, делегирование, найм, обратная связь, подготовка тяжёлых разговоров, стиль руководителя (PAEI), стадия компании как контекст; решения про людей с decision log; в каждом ответе — адреса уроков. НЕ бизнес-тренер (рамка с 2026-10-15): рынок, цена, сегмент, выручка → Research Dept / /forecast / /offer. Заменил Strategic Board. Use when Anton has a team/partner/people problem or decision. Trigger on '/adizes', 'Адизес', 'команда', 'партнёры', 'конфликт', 'кто за что отвечает', 'кого не хватает', 'доли', 'делегирование', 'найм', 'обратная связь', 'как поговорить с', 'PAEI', 'мой стиль', 'разбери команду Зекиро/Луча', 'проанализируй' про людей. |
 | [[agent-evaluator]] | Review, evaluate, and improve AI agents, Codex skills, CLAUDE.md/AGENTS.md files, multi-agent departments, Telegram bots, scheduled automations, VPS orchestration, research departments, planning assistants, and prompt-based workflows. Use when the user asks to "проверь агента", "оцени департамент", "улучши скил", "проверь промпт", "почему агент работает плохо", "напиши промт с правками", "review automation", "evaluate agent", or wants objective QA of agent behavior, token cost, source quality, safety, routing, eval loops, confirmations, or operating procedures. |
+| [[asya]] | Ася в сессии vault — тот же личный ассистент, что TG-бот @rznblm_inbox_bot: задачи Антона в Todoist «Мои», встречи в Google Calendar, «что по проекту», заметки «держи в голове»; общий журнал с TG-Асей |
 | [[cleanmymac]] | Регулярная чистка мака вместо подписки CleanMyMac — диагностика фризов (CPU/память/своп), скан и удаление безопасных кэшей, отчёт по крупным файлам, проверка автозапуска. Use when Anton asks to clean the Mac, free disk space, diagnose slowness/freezes, or runs /cleanmymac. |
 | [[contract-filler]] | Заполняет договор ИП Розенблюм для нового клиента по .docx-шаблону — реквизиты юрлица (из PDF/текста/фото), предмет под конкретную услугу, сроки, стоимость, порядок оплаты, Приложение №1 — и отдаёт готовый файл. Use when Антон просит "заполни договор", "подготовь договор для клиента", "сделай договор на <услугу>", "поправь формулировки в договоре", или кидает шаблон договора + реквизиты клиента. НЕ для NDA и confidential-документов (это Doc Manager). |
 | [[design department]] | Operating system for presentation design: use Design Department when a request should enter through `design-orchestrator`, be classified into the right workflow mode, routed through specialist roles, and return with explicit artifacts plus review status. |
@@ -40,4 +41,4 @@
 | [[video-transcribe]] | Transcribe local video files into Markdown notes with parakeet (GPU, default) or faster-whisper. Save course/meeting raw transcripts into `transcripts/` for transcript-summarizer, but save short external videos, reels, X/Twitter videos, TikToks, YouTube Shorts, and similar internet clips into `transcripts/external resources/` unless the user asks otherwise. |
 | [[youtube-transcribe]] | Transcribe public YouTube videos from a URL into Markdown notes, then optionally run `transcript-summarizer` and save the resulting summary into Second Brain. Use when the user pastes a YouTube link and wants the external-resource transcript stored in `/Users/anton/AI AGENT FOLDER/Second Brain/transcripts/external resources` unless they explicitly route it to a course, meeting, or project folder. |
 
-**Статистика:** 33 скилов.
+**Статистика:** 34 скилов.

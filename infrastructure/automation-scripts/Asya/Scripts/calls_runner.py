@@ -98,7 +98,9 @@ ST_ERROR = "error_retry"  # сбой claude, повтор следующим т�
 ST_TRACK = "pending_track"  # ждём ответа Антона о треке
 ST_FAILED = "failed"
 ST_NO_TRANSCRIPT = "no_transcript"
-FINAL = (ST_DONE, ST_FAILED, ST_NO_TRANSCRIPT)
+ST_UNPARSED = "done_unparsed"  # модель отработала (файлы могли быть записаны), но JSON не разобран — не повторять
+FINAL = (ST_DONE, ST_FAILED, ST_NO_TRANSCRIPT, ST_UNPARSED)
+RAW_DIRNAME = "raw"  # сырой вывод claude на каждый вызов: <home>/raw/<дата>-<slug>.txt
 
 
 def _env_int(name, default):
@@ -136,6 +138,10 @@ class Config:
     @property
     def log_file(self):
         return os.path.join(self.home, "log.jsonl")
+
+    @property
+    def raw_dir(self):
+        return os.path.join(self.home, RAW_DIRNAME)
 
     @property
     def run_log(self):
@@ -334,20 +340,41 @@ def normalize_track(value):
     return TRACK_ALIASES.get(key)
 
 
-def extract_result_json(text):
-    """Последний JSON-объект с ключом track в выводе модели (с ```json или без)."""
-    if not text:
-        return None
+def _top_level_objects(text):
+    """JSON-объекты верхнего уровня в тексте по порядку (вложенные не отдельно)."""
     decoder = json.JSONDecoder()
-    idx = text.rfind("{")
+    out, idx = [], text.find("{")
     while idx != -1:
         try:
-            obj, _end = decoder.raw_decode(text[idx:])
+            obj, end = decoder.raw_decode(text, idx)
         except ValueError:
-            obj = None
-        if isinstance(obj, dict) and "track" in obj:
-            return obj
-        idx = text.rfind("{", 0, idx)
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+        idx = text.find("{", end)
+    return out
+
+
+def extract_result_json(text, _depth=0):
+    """Последний JSON-объект ВЕРХНЕГО уровня с ключом track (фенсы и текст вокруг не мешают).
+
+    Вложенные объекты с track (элементы tasks) не берутся — 24.10 на этом падал разбор
+    звонка 17.10. Обёртка `claude -p --output-format json` ({"result": "..."}) разворачивается.
+    Объект с report_text предпочтительнее голого {"track": ...}.
+    """
+    if not text or _depth > 2:
+        return None
+    objs = _top_level_objects(str(text))
+    with_track = [o for o in objs if "track" in o]
+    full = [o for o in with_track if "report_text" in o]
+    if full or with_track:
+        return (full or with_track)[-1]
+    for o in reversed(objs):  # обёртка CLI
+        if isinstance(o.get("result"), str):
+            inner = extract_result_json(o["result"], _depth + 1)
+            if inner is not None:
+                return inner
     return None
 
 
@@ -379,8 +406,32 @@ def claude_cost(stdout):
         return None
 
 
+def _slug(name):
+    base = re.sub(r"\.md$", "", os.path.basename(name or "call"))
+    base = re.sub(r"^\{meeting\}\s*", "", base)
+    base = re.sub(r"[^\w]+", "-", base, flags=re.U).strip("-").lower()
+    return base[:80] or "call"
+
+
+def save_raw(cfg, name, raw, now):
+    """Сырой вывод модели на диск (для разбора bad_json). Путь или None."""
+    try:
+        os.makedirs(cfg.raw_dir, exist_ok=True)
+        stamp = now.astimezone(MSK).strftime("%Y-%m-%d-%H%M%S")
+        path = os.path.join(cfg.raw_dir, "%s-%s.txt" % (stamp, _slug(name)))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(raw or "")
+        return path
+    except OSError as exc:
+        logger.warning("raw не сохранён: %s", exc)
+        return None
+
+
 def run_claude(prompt, cfg):
-    """(текст, error_kind, cost_usd). error_kind: None | quota | timeout | error."""
+    """(текст, error_kind, cost_usd, raw). error_kind: None | quota | timeout | error.
+
+    raw — stdout целиком (+ stderr, если не пуст), для сохранения в <home>/raw/.
+    """
     cmd = build_claude_cmd(prompt, cfg)
     env = os.environ.copy()
     env.setdefault("HOME", cfg.home_dir)
@@ -390,15 +441,21 @@ def run_claude(prompt, cfg):
             cmd, cwd=cfg.workspace, env=env, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=CLAUDE_TIMEOUT,
         )
-    except subprocess.TimeoutExpired:
-        return "", "timeout", None
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        return "", "timeout", None, "TIMEOUT %ss\n%s" % (CLAUDE_TIMEOUT, out)
     except OSError as exc:
         logger.warning("claude не запустился: %s", exc)
-        return "", "error", None
+        return "", "error", None, "OSError: %s" % exc
     text, kind = asya_bot.parse_claude_output(proc.returncode, proc.stdout, proc.stderr)
+    if not kind and not (text or "").strip():
+        kind = "empty"  # пустой ответ = сбой процесса, повтор допустим
     if kind:
         logger.warning("claude %s rc=%s tail=%s", kind, proc.returncode, (proc.stderr or proc.stdout)[-400:])
-    return text, kind, claude_cost(proc.stdout)
+    raw = "rc=%s\n--- stdout ---\n%s" % (proc.returncode, proc.stdout or "")
+    if (proc.stderr or "").strip():
+        raw += "\n--- stderr ---\n%s" % proc.stderr
+    return text, kind, claude_cost(proc.stdout), raw
 
 
 # ---------------------------------------------------------------------------
@@ -716,17 +773,30 @@ class Tick:
         entry["attempts"] = attempt
         started = time.monotonic()
         prompt = build_prompt(self.cfg, cand, forced_track, existing_summary, self.now)
-        text, kind, cost = self.claude_fn(prompt, self.cfg)
+        res = self.claude_fn(prompt, self.cfg)
+        text, kind, cost = res[0], res[1], res[2]
+        raw = res[3] if len(res) > 3 else text
+        raw_path = save_raw(self.cfg, name, raw, self.now)
         result = None
         if not kind:
             result = validate_result(extract_result_json(text))
             if not result or not result["report_text"] or (forced_track is None and result["track"] is None):
-                kind, result = "bad_json", None
+                result = None
         log = {
             "ts": _iso(self.now), "transcript": name, "attempt": attempt, "model": self.cfg.model,
-            "forced_track": forced_track, "error": kind, "cost_usd": cost,
-            "duration_s": round(time.monotonic() - started, 1),
+            "forced_track": forced_track, "error": kind if kind else (None if result else "bad_json"),
+            "cost_usd": cost, "duration_s": round(time.monotonic() - started, 1), "raw": raw_path,
         }
+        if not kind and result is None:
+            # Модель отработала: саммари и базы могли быть уже записаны. Повтор = риск дублей.
+            append_log(self.cfg, log)
+            entry.update(status=ST_UNPARSED, error="bad_json", raw=raw_path, updated_at=_iso(self.now))
+            self.send(
+                "Разобрала звонок «%s», но не смогла собрать отчет. Проверь саммари в meetings/ и базу проекта.\n"
+                "Сырой ответ: %s" % (_short(name), raw_path or "не сохранен")
+            )
+            append_journal(self.cfg, "📞 звонок «%s»: разобран, отчет не собран (raw на VPS)" % _short(name), self.now)
+            return True
         if kind:
             append_log(self.cfg, log)
             if attempt >= MAX_ATTEMPTS:
