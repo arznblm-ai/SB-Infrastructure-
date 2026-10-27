@@ -33,6 +33,7 @@ import brief_intake
 import estimate_build
 import estimate_diff
 import gdrive
+import hermes_reserve
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -673,10 +674,11 @@ async def run_claude(prompt: str, session_id=None):
         return (result_text or "ошибка выполнения", None, "error")
 
     logger.info(
-        "Claude ok: mode=%s dur=%.1fs reply_len=%d sid=%s",
+        "engine=claude model=default mode=%s dur=%.1fs reply_len=%d cost_usd=%s sid=%s",
         mode,
         dur,
         len(result_text or ""),
+        parsed.get("total_cost_usd") if isinstance(parsed, dict) else None,
         (new_sid[:8] if new_sid else "none"),
     )
     return (result_text or "", new_sid, None)
@@ -695,6 +697,34 @@ async def run_claude_resume(prompt: str, session_id):
         )
         return await run_claude(prompt, None)
     return (reply, new_sid, error_kind)
+
+
+# Резерв Hermes (ADR-034): права как у Claude - rw workspace и память, без Bash и сети.
+RESERVE = hermes_reserve.Reserve(
+    "KRIS", os.path.join(STATE_DIR, "engine.json"), os.path.join(KRIS_HOME, "hermes"), WORKSPACE,
+    read_roots=[WORKSPACE, MEMORY_DIR], write_roots=[WORKSPACE, MEMORY_DIR],
+    deny=["/root/.config", "/root/.claude", "/root/.ssh", "/root/.hermes"],
+    deny_globs=["*.env", ".env"],
+    toolsets=["file", "vision"], timeout=CLAUDE_TIMEOUT, logger=logger)
+
+
+async def run_model(prompt: str, session_id=None):
+    """run_claude_resume с резервом Hermes. Тот же контракт (reply, new_sid, error_kind).
+
+    На резерве сессии нет: new_sid=None, сохранённая сессия Claude не трогается.
+    """
+    holder = {"sid": None}
+
+    async def claude_fn():
+        reply, new_sid, kind = await run_claude_resume(prompt, session_id)
+        holder["sid"] = new_sid
+        holder["raw"] = reply
+        return reply, kind
+
+    reply, kind = await RESERVE.call(prompt, claude_fn)
+    if kind and not reply:
+        reply = holder.get("raw") or kind  # для human_error
+    return (reply, holder["sid"] if kind is None else None, kind)
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +979,7 @@ async def _fix_estimate_json(bot, chat_id, json_path, error) -> bool:
         f"Файл {json_path}: estimate.json невалиден: {error}. "
         "Исправь файл, ничего больше не делай."
     )
-    reply, new_sid, error_kind = await run_claude_resume(prompt, state.get("session_id"))
+    reply, new_sid, error_kind = await run_model(prompt, state.get("session_id"))
     if error_kind:
         logger.warning("Починка estimate.json не удалась: %s", error_kind)
         await bot.send_message(chat_id=chat_id, text=human_error(reply))
@@ -1238,7 +1268,7 @@ async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
 
             typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
             try:
-                reply_text, new_sid, error_kind = await run_claude_resume(prompt, session_id)
+                reply_text, new_sid, error_kind = await run_model(prompt, session_id)
             finally:
                 typing_task.cancel()
                 try:
@@ -1402,7 +1432,7 @@ async def batch_job(context: ContextTypes.DEFAULT_TYPE):
             total = sum(len(r) for _c, _t, r in chats)
             logger.info("Батч: чатов=%d сообщений=%d", len(chats), total)
 
-            reply_text, _sid, error_kind = await run_claude(prompt, None)
+            reply_text, _sid, error_kind = await run_model(prompt)
 
             if error_kind is not None:
                 logger.warning("Батч не удался (%s), возвращаю буферы", error_kind)
@@ -1435,7 +1465,7 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         async with claude_lock:
             logger.info("Вечерний статус: старт")
-            reply_text, _sid, error_kind = await run_claude(build_evening_prompt(), None)
+            reply_text, _sid, error_kind = await run_model(build_evening_prompt())
             if error_kind is not None:
                 logger.warning("Вечерний статус не удался: %s", error_kind)
                 return
@@ -1590,6 +1620,7 @@ def main() -> None:
     ensure_dirs()
 
     app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    RESERVE.notify = lambda text: app.bot.send_message(chat_id=ALLOWED_USER, text=text)
 
     private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("start", cmd_start, filters=private))

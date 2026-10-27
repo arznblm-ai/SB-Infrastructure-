@@ -31,6 +31,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import hermes_reserve
 import journal
 import media_intake
 
@@ -723,14 +724,28 @@ async def run_claude(prompt):
             cost = json.loads(stdout).get("total_cost_usd")
         except (ValueError, AttributeError):
             pass
-        logger.info("Claude ok: dur=%.1fs reply_len=%d cost_usd=%s", dur, len(text), cost)
+        logger.info("engine=claude model=%s dur=%.1fs reply_len=%d cost_usd=%s", ROCKY_MODEL, dur, len(text), cost)
     return text, kind
 
 
+def make_reserve(home_dir=None):
+    """Резерв Hermes (ADR-034): права как у Claude - только чтение workspace и data."""
+    home = home_dir or HOME_DIR
+    return hermes_reserve.Reserve(
+        "ROCKY", os.path.join(STATE_DIR, "engine.json"), os.path.join(ROCKY_HOME, "hermes"), WORKSPACE,
+        read_roots=[WORKSPACE, DATA_DIR],
+        deny=[os.path.join(home, rel) for rel in SECRET_DIRS_REL],
+        deny_globs=["*.env", ".env"],
+        toolsets=["file", "vision"], timeout=CLAUDE_TIMEOUT, logger=logger)
+
+
+RESERVE = make_reserve()
+
+
 async def call_model(prompt):
-    """run_claude, который никогда не бросает."""
+    """run_claude (с резервом Hermes), который никогда не бросает."""
     try:
-        return await run_claude(prompt)
+        return await RESERVE.call(prompt, lambda: run_claude(prompt))
     except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
         logger.exception("run_claude упал: %s", exc)
         return "", "error"
@@ -1092,6 +1107,7 @@ def status_text(state, entries, busy=False, waiting=0, inbox_files=0):
     counts = {who: len([e for e in entries or () if e.get("who") == who]) for who in journal.WHO}
     return "\n".join([
         "Роки на связи. Модель %s, окно склейки %.0f с." % (ROCKY_MODEL, BATCH_SECONDS),
+        RESERVE.status_line(),
         "Записей сегодня: Антон %d, Ралина %d." % (counts["anton"], counts["ralina"]),
         "Последний ответ: %s" % (state.get("last_run_at") or "никогда"),
         "Последний сбой: %s" % (
@@ -1154,6 +1170,8 @@ def main():  # pragma: no cover - рантайм
     ensure_dirs()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    if GROUP_CHAT_ID is not None:
+        RESERVE.notify = lambda text: app.bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
     groups = filters.ChatType.GROUPS
     app.add_handler(CommandHandler("status", cmd_status, filters=groups))
     app.add_handler(CommandHandler("today", cmd_today, filters=groups))

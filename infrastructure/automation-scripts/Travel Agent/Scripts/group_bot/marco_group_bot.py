@@ -39,6 +39,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import gcal_sync
+import hermes_reserve
 import media_intake
 import reel_meta
 
@@ -1302,8 +1303,31 @@ async def run_claude(prompt, group_dir=None):
         return parsed.get("result") or "", "error"
 
     result_text = parsed.get("result") or ""
-    logger.info("Claude ok: dur=%.1fs reply_len=%d", dur, len(result_text))
+    logger.info("engine=claude model=%s dur=%.1fs reply_len=%d cost_usd=%s",
+                MARCO_MODEL, dur, len(result_text), parsed.get("total_cost_usd"))
     return result_text, None
+
+
+def make_reserve():
+    """Резерв Hermes (ADR-034): права как у Claude - rw workspace и group/, web, без Bash."""
+    return hermes_reserve.Reserve(
+        "MARCO", os.path.join(STATE_DIR, "engine.json"), os.path.join(MARCO_HOME, "hermes"), WORKSPACE,
+        read_roots=[WORKSPACE, GROUP_DIR], write_roots=[WORKSPACE, GROUP_DIR],
+        deny=["/root/.config", "/root/.claude", "/root/.ssh", "/root/.hermes"],
+        deny_globs=["*.env", ".env"],
+        toolsets=["file", "vision", "web"], timeout=CLAUDE_TIMEOUT, logger=logger)
+
+
+RESERVE = make_reserve()
+
+
+async def run_model(prompt):
+    """run_claude с резервом Hermes. ref/ обновляем и для резерва."""
+    try:
+        refresh_ref()
+    except Exception as exc:  # noqa: BLE001 - ref не должен ронять прогон
+        logger.warning("refresh_ref упал: %s", exc)
+    return await RESERVE.call(prompt, lambda: run_claude(prompt))
 
 
 # ---------------------------------------------------------------------------
@@ -1489,7 +1513,7 @@ async def run_turn(bot, prompt, reply_to=None, log_reply=True, segment=None, sho
                 else None
             )
             try:
-                reply, error_kind = await run_claude(prompt)
+                reply, error_kind = await run_model(prompt)
             finally:
                 if typing is not None:
                     typing.cancel()
@@ -1545,7 +1569,7 @@ async def run_passive_turn(bot, prompt, reply_to=None, segment=None):
     """Пассивный прогон: без «печатает…», ошибки только в лог, NOTHING - молчим."""
     async with claude_lock:
         try:
-            reply, error_kind = await run_claude(prompt)
+            reply, error_kind = await run_model(prompt)
         except Exception as exc:  # noqa: BLE001 - пассивный прогон не роняет бота
             logger.exception("Пассивный прогон упал: %s", exc)
             reply, error_kind = "", "error"
@@ -2206,6 +2230,8 @@ def main():  # pragma: no cover - рантайм
     ensure_dirs()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    if GROUP_CHAT_ID is not None:
+        RESERVE.notify = lambda text: app.bot.send_message(chat_id=GROUP_CHAT_ID, text=text)
     groups = filters.ChatType.GROUPS
     app.add_handler(CommandHandler("status", cmd_status, filters=groups))
     app.add_handler(CommandHandler("plan", cmd_plan, filters=groups))

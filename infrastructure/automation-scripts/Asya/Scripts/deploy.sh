@@ -38,7 +38,7 @@ fail() { echo "  ✗ $*" >&2; exit 1; }
 
 echo "[0] Проверяю локальные файлы (до любых изменений на сервере)"
 for f in \
-  "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/permcheck.py" \
+  "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" "$SCRIPT_DIR/permcheck.py" \
   "$SCRIPT_DIR/asya.service" "$SCRIPT_DIR/asya_watchdog.sh" \
   "$SCRIPT_DIR/asya-watchdog.service" "$SCRIPT_DIR/asya-watchdog.timer" \
   "$PROJECT_DIR/persona/asya.md" "$PROJECT_DIR/config/workspace-footer.md" \
@@ -47,7 +47,7 @@ for f in \
 do
   [ -s "$f" ] || fail "нет файла $f"
 done
-python3 -m py_compile "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/permcheck.py" "$TODOIST_SRC" \
+python3 -m py_compile "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" "$SCRIPT_DIR/permcheck.py" "$TODOIST_SRC" \
   || fail "код не компилируется — чини до деплоя"
 bash -n "$SCRIPT_DIR/asya_watchdog.sh" || fail "asya_watchdog.sh: синтаксическая ошибка"
 python3 -c 'import json,sys; [json.load(open(p)) for p in sys.argv[1:]]' \
@@ -65,7 +65,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
   echo
   cat "$PROJECT_DIR/config/workspace-footer.md"
 } > "$TMP_DIR/CLAUDE.md"
-cp "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/permcheck.py" \
+cp "$SCRIPT_DIR/asya_bot.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" "$SCRIPT_DIR/permcheck.py" \
    "$SCRIPT_DIR/asya.service" "$SCRIPT_DIR/asya_watchdog.sh" \
    "$SCRIPT_DIR/asya-watchdog.service" "$SCRIPT_DIR/asya-watchdog.timer" \
    "$PROJECT_DIR/config/env.example" "$PROJECT_DIR/config/settings.json" "$PROJECT_DIR/config/mcp.json" \
@@ -199,7 +199,7 @@ fi
 echo "[2] Код Аси в $CODE, venv, workspace"
 mkdir -p "$CODE" "$WS/.claude" "$WS/inbox" "$HOME_DIR/chatlog" "$CFG"
 chmod 700 "$CFG"
-for f in asya_bot.py media_intake.py permcheck.py; do
+for f in asya_bot.py media_intake.py hermes_reserve.py permcheck.py; do
   if install_if_changed "$STAGING/$f" "$CODE/$f" 0644; then ok "$f обновлён"; CHANGED=1; else skip "$f без изменений"; fi
 done
 if [ -x "$VENV/bin/python" ]; then

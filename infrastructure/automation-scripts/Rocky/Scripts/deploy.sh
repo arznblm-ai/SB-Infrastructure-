@@ -41,13 +41,13 @@ fail() { echo "  ✗ $*" >&2; exit 1; }
 
 echo "[0] Мак: проверки до любых изменений на сервере"
 for f in \
-  "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/permcheck.py" \
+  "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" "$SCRIPT_DIR/permcheck.py" \
   "$SCRIPT_DIR/rocky.service" "$PROJECT_DIR/persona/rocky.md" "$PROJECT_DIR/config/workspace-footer.md" \
   "$PROJECT_DIR/config/env.example"
 do
   [ -s "$f" ] || fail "нет файла $f"
 done
-python3 -m py_compile "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" \
+python3 -m py_compile "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" \
   "$SCRIPT_DIR/permcheck.py" || fail "код не компилируется"
 bash -n "$0" || fail "deploy.sh: синтаксическая ошибка"
 (cd "$PROJECT_DIR" && python3 -m pytest Scripts -q) || fail "pytest красный — чини до деплоя"
@@ -60,7 +60,7 @@ trap 'rm -rf "$TMP_DIR"' EXIT
   echo
   cat "$PROJECT_DIR/config/workspace-footer.md"
 } > "$TMP_DIR/CLAUDE.md"
-cp "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/permcheck.py" \
+cp "$SCRIPT_DIR/rocky_bot.py" "$SCRIPT_DIR/journal.py" "$SCRIPT_DIR/media_intake.py" "$SCRIPT_DIR/hermes_reserve.py" "$SCRIPT_DIR/permcheck.py" \
    "$SCRIPT_DIR/rocky.service" "$PROJECT_DIR/config/env.example" "$TMP_DIR/"
 echo "  ✓ workspace/CLAUDE.md собран: $(wc -l < "$TMP_DIR/CLAUDE.md" | tr -d ' ') строк"
 
@@ -140,7 +140,7 @@ chmod 700 "$CFG" "$DATA"
 ok "$CODE, $WS/inbox, $DATA/{journal,reports}, $HOME_DIR/chatlog, $CFG"
 
 echo "[3] Код, venv, CLAUDE.md"
-for f in rocky_bot.py journal.py media_intake.py permcheck.py rocky.service; do
+for f in rocky_bot.py journal.py media_intake.py hermes_reserve.py permcheck.py rocky.service; do
   install -m 0644 "$STAGING/$f" "$CODE/$f"
 done
 install -m 0644 "$STAGING/CLAUDE.md" "$WS/CLAUDE.md"

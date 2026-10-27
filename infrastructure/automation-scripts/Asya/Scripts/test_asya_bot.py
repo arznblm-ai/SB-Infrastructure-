@@ -501,6 +501,17 @@ def runtime(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setattr(bot, "INBOX_DIR", str(tmp_path / "inbox"))
     monkeypatch.setattr(bot, "VAULT_DIR", str(tmp_path / "vault"))
+    # резерв Hermes: свой стейт и «сломанный» hermes (exit 1), без сети
+    fake = tmp_path / "hermes"
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    fake.chmod(0o755)
+    (tmp_path / "ws").mkdir()
+    monkeypatch.setattr(bot.RESERVE, "state_path", str(tmp_path / "engine.json"))
+    monkeypatch.setattr(bot.RESERVE, "hermes_home", str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(bot.RESERVE, "workspace", str(tmp_path / "ws"))
+    monkeypatch.setattr(bot.RESERVE, "hermes_bin", str(fake))
+    monkeypatch.setattr(bot.RESERVE, "provider", "test")
+    monkeypatch.setattr(bot.RESERVE, "notify", None)
     return tmp_path
 
 
@@ -512,12 +523,14 @@ def test_process_batch_error_sends_short_reply(monkeypatch, runtime, kind):
     monkeypatch.setattr(bot, "run_claude", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("поставь синк", 1)]))
-    assert fb.sent == [(ANTON, bot.error_reply(kind))]
-    assert len(bot.error_reply(kind)) < 120
+    # quota/error уходят в резерв Hermes; он тут тоже падает -> короткая строка о сбое
+    shown = "timeout" if kind == "timeout" else "error"
+    assert fb.sent == [(ANTON, bot.error_reply(shown))]
+    assert len(bot.error_reply(shown)) < 120
     tail = bot.read_chatlog_tail(limit=0)
     assert tail[0].endswith("Антон: поставь синк")
-    assert ("Ася [сбой: %s]" % kind) in tail[-1]
-    assert bot.load_state()["last_error"] == kind
+    assert ("Ася [сбой: %s]" % shown) in tail[-1]
+    assert bot.load_state()["last_error"] == shown
 
 
 def test_process_batch_empty_reply_is_not_silence(monkeypatch, runtime):
@@ -615,3 +628,25 @@ def test_persona_and_footer_cover_key_rules():
         assert needle in persona
     for needle in ("карта треков", "track:", "Связи", "context/psychology", "transcripts/telegram", "Kris/memory"):
         assert needle in footer
+
+
+def test_reserve_rights_match_claude(tmp_path):
+    vault = tmp_path / "vault"
+    r = bot.make_reserve(vault_dir=str(vault), home_dir="/root")
+    pol = r.policy()
+    assert os.path.realpath(str(vault)) in pol["read_roots"]
+    assert pol["write_roots"] == [os.path.realpath(bot.memory_dir(str(vault)))]
+    assert any(d.endswith("context/psychology") for d in pol["deny"])
+    assert any(d.endswith("/root/.ssh") or d.endswith(".ssh") for d in pol["deny"])
+    assert "terminal" not in r.toolsets and "web" not in r.toolsets
+
+
+def test_hermes_mcp_servers_gcal_limited(tmp_path):
+    cfg = tmp_path / "mcp.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "gcal": {"command": "/py", "args": ["/gcal.py"]},
+        "todoist": {"command": "/py", "args": ["/todoist.py"]}}}))
+    servers = bot.hermes_mcp_servers(str(cfg))
+    assert servers["gcal"]["tools"]["include"] == list(bot.GCAL_TOOLS)
+    assert "save_item" not in servers["gcal"]["tools"]["include"]
+    assert servers["todoist"]["command"] == "/py" and "tools" not in servers["todoist"]

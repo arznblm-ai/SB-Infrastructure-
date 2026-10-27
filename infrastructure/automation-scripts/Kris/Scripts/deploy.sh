@@ -46,6 +46,7 @@ rsync -az -e "$RSH" \
   "$SCRIPT_DIR/estimate_build.py" \
   "$SCRIPT_DIR/estimate_diff.py" \
   "$SCRIPT_DIR/gdrive.py" \
+  "$SCRIPT_DIR/hermes_reserve.py" \
   "$VPS:/opt/kris/"
 
 echo "==> [4/9] Готовлю venv и зависимости"

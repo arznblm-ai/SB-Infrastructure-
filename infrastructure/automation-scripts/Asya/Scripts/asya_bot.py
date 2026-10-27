@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import hermes_reserve
 import media_intake
 
 try:  # pragma: no cover - наличие пакета проверяется в main()
@@ -184,6 +185,45 @@ def deny_rules(vault_dir=None, home_dir=None):
     return rules
 
 
+def hermes_mcp_servers(path=None):
+    """MCP Аси для резерва Hermes: те же серверы, что в mcp.json; gcal — те же 4 тулзы."""
+    try:
+        with open(path or MCP_CONFIG, encoding="utf-8") as fh:
+            servers = json.load(fh).get("mcpServers") or {}
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for name, spec in servers.items():
+        item = {"command": spec.get("command"), "args": list(spec.get("args") or [])}
+        if spec.get("env"):
+            item["env"] = spec["env"]
+        if name == "gcal":
+            item["tools"] = {"include": list(GCAL_TOOLS)}
+        out[name] = item
+    return out
+
+
+def make_reserve(vault_dir=None, home_dir=None):
+    """Резерв Hermes (ADR-034): права как у Claude — читать vault и workspace, писать memory/."""
+    vault = vault_dir or VAULT_DIR
+    home = home_dir or HOME_DIR
+    return hermes_reserve.Reserve(
+        "ASYA",
+        os.path.join(STATE_DIR, "engine.json"),
+        os.path.join(ASYA_HOME, "hermes"),
+        WORKSPACE,
+        read_roots=[WORKSPACE, vault],
+        write_roots=[memory_dir(vault)],
+        deny=[os.path.join(vault, rel) for rel in DENY_READ_REL]
+        + [os.path.join(home, rel) for rel in SECRET_DIRS_REL],
+        deny_globs=[os.path.join(vault, rel) for rel in DENY_READ_GLOBS_REL] + ["*.env", ".env"],
+        toolsets=["file", "vision"],
+        mcp_servers=hermes_mcp_servers(),
+        timeout=CLAUDE_TIMEOUT,
+        logger=logger,
+    )
+
+
 def settings_payload(vault_dir=None, home_dir=None):
     """Содержимое workspace/.claude/settings.json (второй слой поверх CLI)."""
     return {
@@ -192,6 +232,9 @@ def settings_payload(vault_dir=None, home_dir=None):
             "deny": deny_rules(vault_dir, home_dir),
         }
     }
+
+
+RESERVE = make_reserve()
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +774,7 @@ async def run_claude(prompt):
             cost = json.loads(stdout).get("total_cost_usd")
         except (ValueError, AttributeError):
             pass
-        logger.info("Claude ok: dur=%.1fs reply_len=%d cost_usd=%s", dur, len(text), cost)
+        logger.info("engine=claude model=%s dur=%.1fs reply_len=%d cost_usd=%s", ASYA_MODEL, dur, len(text), cost)
     return text, kind
 
 
@@ -847,7 +890,7 @@ async def process_batch(bot, records):
             typing = asyncio.create_task(_typing_loop(bot, USER_ANTON_ID))
         try:
             try:
-                reply, kind = await run_claude(prompt)
+                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt))
             except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
                 logger.exception("run_claude упал: %s", exc)
                 reply, kind = "", "error"
@@ -1029,6 +1072,7 @@ def status_text(state=None, batch_len=0, busy=False, tail_lines=0, inbox_files=0
     return "\n".join(
         [
             "Ася: модель %s, окно пачки %.0f с." % (ASYA_MODEL, BATCH_SECONDS),
+            RESERVE.status_line(),
             "Последний ответ: %s" % (state.get("last_run_at") or "—"),
             "Последний сбой: %s %s" % (state.get("last_error") or "—", state.get("last_error_at") or ""),
             "Прогонов всего: %s" % state.get("runs", 0),
@@ -1085,6 +1129,8 @@ def main():  # pragma: no cover - рантайм
     maybe_cleanup_inbox()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    RESERVE.mcp_servers = hermes_mcp_servers()
+    RESERVE.notify = lambda text: send_to_anton(app.bot, text)
     private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler("start", cmd_start, filters=private))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
