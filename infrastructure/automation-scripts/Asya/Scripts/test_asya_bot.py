@@ -523,8 +523,8 @@ def test_process_batch_error_sends_short_reply(monkeypatch, runtime, kind):
     monkeypatch.setattr(bot, "run_claude", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("поставь синк", 1)]))
-    # quota/error уходят в резерв Hermes; он тут тоже падает -> короткая строка о сбое
-    shown = "timeout" if kind == "timeout" else "error"
+    # Hermes основной (27.10) тут падает -> эскалация в Claude -> его ошибка как есть
+    shown = kind
     assert fb.sent == [(ANTON, bot.error_reply(shown))]
     assert len(bot.error_reply(shown)) < 120
     tail = bot.read_chatlog_tail(limit=0)

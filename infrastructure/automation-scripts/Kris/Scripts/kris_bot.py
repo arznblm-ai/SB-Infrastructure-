@@ -708,23 +708,79 @@ RESERVE = hermes_reserve.Reserve(
     toolsets=["file", "vision"], timeout=CLAUDE_TIMEOUT, logger=logger)
 
 
-async def run_model(prompt: str, session_id=None):
-    """run_claude_resume с резервом Hermes. Тот же контракт (reply, new_sid, error_kind).
+# Диалог владельца на двух движках (разворот 27.10: Hermes основной, Claude по слову
+# «клод» или при сбое Hermes). У каждого движка своя сессия: Claude - session_id
+# (--resume), Hermes - hermes_session_id (--resume). Ходы, которые отвечал другой
+# движок, копятся в missed_<движок> и подкладываются ему перед новым сообщением -
+# так обе сессии видят весь диалог, а сохранённая сессия Claude не ломается.
+DIALOG_KEEP = 8
+DIALOG_CHARS = 1500
 
-    На резерве сессии нет: new_sid=None, сохранённая сессия Claude не трогается.
+
+def dialog_block(items) -> str:
+    items = [i for i in (items or []) if isinstance(i, dict)][-DIALOG_KEEP:]
+    if not items:
+        return ""
+    turns = "\n\n".join(
+        "Владелец: %s\nКрис: %s" % (str(i.get("user") or "")[:DIALOG_CHARS], str(i.get("reply") or "")[:DIALOG_CHARS])
+        for i in items
+    )
+    return (
+        "[Ходы диалога, на которые отвечал другой движок (ты их не видел), старое сверху]\n"
+        + turns + "\n\n[Новое сообщение владельца]\n"
+    )
+
+
+def reset_dialog(state: dict) -> None:
+    """Новая/другая сессия Claude - диалог Hermes и хвосты тоже с нуля."""
+    state["hermes_session_id"] = None
+    state["missed_claude"] = []
+    state["missed_hermes"] = []
+
+
+def remember_turn(prompt: str, reply: str) -> None:
+    """После удачного хода диалога: кто ответил - тот в курсе, другому - в хвост."""
+    engine = RESERVE.last_engine
+    other = "hermes" if engine == "claude" else "claude"
+    state = load_state()
+    state["missed_" + engine] = []
+    state["missed_" + other] = (list(state.get("missed_" + other) or []) + [{"user": prompt, "reply": reply}])[-DIALOG_KEEP:]
+    if engine == "hermes" and RESERVE.last_sid:
+        state["hermes_session_id"] = RESERVE.last_sid
+    save_state(state)
+
+
+async def run_model(prompt: str, session_id=None, dialog=False):
+    """run_claude_resume с Hermes. Тот же контракт (reply, new_sid, error_kind).
+
+    dialog=True - ход разговора с владельцем: слово «клод» зовёт Claude, обе сессии
+    продолжаются (см. dialog_block). Ответил Hermes - new_sid=None, сессия Claude
+    не трогается.
     """
     holder = {"sid": None}
+    state = load_state() if dialog else {}
+    hermes_sid = state.get("hermes_session_id") if dialog else None
+    claude_prompt = dialog_block(state.get("missed_claude")) + prompt if dialog else prompt
+    hermes_prompt = dialog_block(state.get("missed_hermes")) + prompt if dialog else prompt
 
     async def claude_fn():
-        reply, new_sid, kind = await run_claude_resume(prompt, session_id)
+        reply, new_sid, kind = await run_claude_resume(claude_prompt, session_id)
         holder["sid"] = new_sid
         holder["raw"] = reply
         return reply, kind
 
-    reply, kind = await RESERVE.call(prompt, claude_fn)
+    reply, kind = await RESERVE.call(
+        claude_prompt, claude_fn, user_text=prompt if dialog else None,
+        hermes_prompt=hermes_prompt, hermes_resume=hermes_sid)
+    if dialog and hermes_sid and RESERVE.last_reason == "escalate_fail":
+        fresh = load_state()  # сессия Hermes могла пропасть - следующий ход начнёт новую
+        fresh["hermes_session_id"] = None
+        save_state(fresh)
+    if dialog and kind is None and RESERVE.last_engine:
+        remember_turn(prompt, reply)
     if kind and not reply:
         reply = holder.get("raw") or kind  # для human_error
-    return (reply, holder["sid"] if kind is None else None, kind)
+    return (reply, holder["sid"] if kind is None and RESERVE.last_engine == "claude" else None, kind)
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +1035,7 @@ async def _fix_estimate_json(bot, chat_id, json_path, error) -> bool:
         f"Файл {json_path}: estimate.json невалиден: {error}. "
         "Исправь файл, ничего больше не делай."
     )
-    reply, new_sid, error_kind = await run_model(prompt, state.get("session_id"))
+    reply, new_sid, error_kind = await run_model(prompt, state.get("session_id"), dialog=True)
     if error_kind:
         logger.warning("Починка estimate.json не удалась: %s", error_kind)
         await bot.send_message(chat_id=chat_id, text=human_error(reply))
@@ -1268,7 +1324,7 @@ async def run_owner_turn(bot, chat_id, initial_text=None) -> None:
 
             typing_task = asyncio.create_task(_typing_loop(bot, chat_id))
             try:
-                reply_text, new_sid, error_kind = await run_model(prompt, session_id)
+                reply_text, new_sid, error_kind = await run_model(prompt, session_id, dialog=True)
             finally:
                 typing_task.cancel()
                 try:
@@ -1511,6 +1567,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"id": sid, "started_at": now_iso(), "first_msg": ""}
             )
     state["session_id"] = None
+    reset_dialog(state)
     save_state(state)
     await update.message.reply_text("Начата новая сессия. Контекст сброшен.")
 
@@ -1594,6 +1651,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = load_state()
     state["session_id"] = sid
+    reset_dialog(state)
     save_state(state)
     await query.answer("Переключено на сессию " + sid[:8])
     try:

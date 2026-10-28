@@ -1321,13 +1321,24 @@ def make_reserve():
 RESERVE = make_reserve()
 
 
+MESSAGE_MARK = "\n\nСообщение:\n"
+
+
+def user_text_of(prompt):
+    """Сообщение пользователя из промпта хода (после «Сообщение:»), для слова «клод».
+
+    Пассивный и утренний промпты такого блока не имеют — там эскалации по слову нет."""
+    at = (prompt or "").rfind(MESSAGE_MARK)
+    return prompt[at + len(MESSAGE_MARK):] if at >= 0 else None
+
+
 async def run_model(prompt):
     """run_claude с резервом Hermes. ref/ обновляем и для резерва."""
     try:
         refresh_ref()
     except Exception as exc:  # noqa: BLE001 - ref не должен ронять прогон
         logger.warning("refresh_ref упал: %s", exc)
-    return await RESERVE.call(prompt, lambda: run_claude(prompt))
+    return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text_of(prompt))
 
 
 # ---------------------------------------------------------------------------

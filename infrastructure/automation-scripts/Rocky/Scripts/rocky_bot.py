@@ -742,10 +742,12 @@ def make_reserve(home_dir=None):
 RESERVE = make_reserve()
 
 
-async def call_model(prompt):
-    """run_claude (с резервом Hermes), который никогда не бросает."""
+async def call_model(prompt, user_text=None):
+    """run_claude (с резервом Hermes), который никогда не бросает.
+
+    user_text — сообщения людей: слово «клод» в них зовёт Claude на этот ответ."""
     try:
-        return await RESERVE.call(prompt, lambda: run_claude(prompt))
+        return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text)
     except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
         logger.exception("run_claude упал: %s", exc)
         return "", "error"
@@ -850,7 +852,8 @@ async def process_batch(bot, who, records):  # pragma: no cover - рантайм
         prompt = build_turn_prompt(records, who, now, profiles, today, tail, DATA_DIR)
         logger.info("Пачка %s: %d сообщ., хвост %d строк", who, len(records), len(tail))
 
-        reply, kind = await _with_typing(bot, call_model(prompt))
+        user_text = "\n".join(record_content(r) or "" for r in records)
+        reply, kind = await _with_typing(bot, call_model(prompt, user_text))
         record_run(kind)
         if kind:
             await _deliver(bot, ERROR_TEXT, "%s [сбой: %s]" % (BOT_NAME, kind))

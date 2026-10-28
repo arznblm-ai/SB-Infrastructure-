@@ -890,7 +890,8 @@ async def process_batch(bot, records):
             typing = asyncio.create_task(_typing_loop(bot, USER_ANTON_ID))
         try:
             try:
-                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt))
+                user_text = "\n".join(r.get("text") or "" for r in records)
+                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text)
             except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
                 logger.exception("run_claude упал: %s", exc)
                 reply, kind = "", "error"

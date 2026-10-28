@@ -39,6 +39,7 @@ def fake_hermes(tmp_path, reply="ответ резерва", rc=0):
 def reserve(tmp_path, monkeypatch):
     for key in ("T_FORCE_ENGINE", "T_FAKE_QUOTA"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("T_PRIMARY_ENGINE", "claude")  # старая матрица; hermes-режим — ниже
     ws = tmp_path / "ws"
     ws.mkdir()
     r = hr.Reserve("T", str(tmp_path / "state" / "engine.json"), str(tmp_path / "home"), str(ws),
@@ -150,6 +151,7 @@ def test_command_profile_and_env(reserve, tmp_path):
     cfg = open(os.path.join(home, "config.yaml")).read()
     assert "memory_enabled: false" in cfg and "terminal" not in cfg
     assert "show_reasoning: false" in cfg and "honcho" not in cfg
+    assert "inline_diffs: false" in cfg
     env = reserve.env()
     assert env["HERMES_HOME"] == home and "TELEGRAM_BOT_TOKEN" not in env
     assert env["HERMES_WRITE_SAFE_ROOT"]  # без write_roots — несуществующий корень
@@ -164,8 +166,85 @@ def test_mcp_toolsets_added(reserve):
 def test_logs_engine_line(reserve, caplog):
     caplog.set_level("INFO")
     run(reserve.run_hermes("p"))
-    assert any("engine=hermes model=" in r.getMessage() and "cost_usd=" in r.getMessage()
+    assert any("engine=hermes reason=reserve model=" in r.getMessage() and "cost_usd=" in r.getMessage()
                for r in caplog.records)
+
+
+# --- PRIMARY_ENGINE=hermes (разворот 27.10) ----------------------------------
+@pytest.fixture
+def hreserve(reserve, monkeypatch):
+    monkeypatch.delenv("T_PRIMARY_ENGINE")  # дефолт — hermes
+    return reserve
+
+
+def test_primary_default_is_hermes(hreserve):
+    assert hreserve.primary() == "hermes"
+    fn = claude(("x", None))
+    assert run(hreserve.call("p", fn, user_text="привет")) == ("ответ резерва", None)
+    assert fn.calls == [] and hreserve.notices == [] and hreserve.engine() == "claude"
+    assert (hreserve.last_engine, hreserve.last_reason, hreserve.last_sid) == ("hermes", "primary", "test_sid")
+
+
+def test_hermes_failure_escalates_to_claude_once(hreserve, tmp_path):
+    hreserve.hermes_bin, _ = fake_hermes(tmp_path, reply="", rc=1)
+    fn = claude(("ответ claude", None))
+    assert run(hreserve.call("p", fn)) == ("ответ claude", None)
+    assert len(fn.calls) == 1 and hreserve.last_reason == "escalate_fail"
+    assert hreserve.notices == [] and not os.path.exists(hreserve.state_path)
+
+
+def test_unknown_toolsets_only_escalates(hreserve, tmp_path):
+    hreserve.hermes_bin, _ = fake_hermes(tmp_path, reply="Warning: Unknown toolsets: mcp-x")
+    assert run(hreserve.call("p", claude(("c", None)))) == ("c", None)
+
+
+def test_both_down_gives_claude_quota(hreserve, tmp_path):
+    hreserve.hermes_bin, _ = fake_hermes(tmp_path, reply="", rc=1)
+    assert run(hreserve.call("p", claude(("", "quota")))) == ("", "quota")
+
+
+@pytest.mark.parametrize("text", ["Клод, посчитай", "спроси у клоду", "с клодом", "ask CLAUDE", "(claude)"])
+def test_word_escalates(hreserve, text):
+    fn = claude(("ответ claude", None))
+    assert run(hreserve.call("p", fn, user_text=text)) == ("ответ claude", None)
+    assert len(fn.calls) == 1 and hreserve.last_reason == "escalate_word"
+
+
+@pytest.mark.parametrize("text", ["приклодка", "xclaude", "", None])
+def test_word_not_matched(hreserve, text):
+    fn = claude(("c", None))
+    run(hreserve.call("p", fn, user_text=text))
+    assert fn.calls == [] and hreserve.last_engine == "hermes"
+
+
+def test_word_escalation_claude_quota_falls_to_hermes(hreserve):
+    assert run(hreserve.call("p", claude(("", "quota")), user_text="клод?")) == ("ответ резерва", None)
+    assert hreserve.last_reason == "reserve" and hreserve.notices == []
+
+
+def test_word_ignored_in_prompt_without_user_text(hreserve):
+    fn = claude(("c", None))
+    run(hreserve.call("CLAUDE.md говорит клод", fn))
+    assert fn.calls == []
+
+
+def test_hermes_prompt_and_resume_passed(hreserve):
+    run(hreserve.call("claude-промпт", claude(("c", None)), hermes_prompt="h-промпт", hermes_resume="sid1"))
+    args = json.load(open(str(hreserve.args_log)))
+    assert args[args.index("--resume") + 1] == "sid1"
+    assert args[2].endswith("h-промпт")
+
+
+def test_force_claude_overrides_primary(hreserve, monkeypatch):
+    monkeypatch.setenv("T_FORCE_ENGINE", "claude")
+    fn = claude(("c", None))
+    assert run(hreserve.call("p", fn)) == ("c", None) and len(fn.calls) == 1
+
+
+def test_reason_in_hermes_log(hreserve, caplog):
+    caplog.set_level("INFO")
+    run(hreserve.call("p", claude(("c", None))))
+    assert any("engine=hermes reason=primary model=" in r.getMessage() for r in caplog.records)
 
 
 # --- страж путей ------------------------------------------------------------

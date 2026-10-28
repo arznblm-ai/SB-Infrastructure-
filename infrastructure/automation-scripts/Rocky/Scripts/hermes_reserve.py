@@ -21,6 +21,14 @@
 - Персона: Hermes сам подхватывает CLAUDE.md из cwd (workspace бота).
 - Тест-крючки: <PREFIX>_FORCE_ENGINE=hermes|claude, <PREFIX>_FAKE_QUOTA=1
   (Claude не вызывается, сразу квотная ошибка).
+
+Разворот 27.10 (ADR-034, правка 2026-10-27, вторая): <PREFIX>_PRIMARY_ENGINE=hermes|claude,
+по умолчанию hermes. В режиме hermes каждый ответ начинается с Hermes, без липкого
+состояния и без строк в чат. Claude зовётся на один ответ, если Hermes упал / таймаут /
+пусто (escalate_fail) или в сообщении пользователя есть слово «клод»/«claude»
+(escalate_word). Claude на квоте → ответ Hermes, если он есть, иначе квотная ошибка
+бота. Откат — PRIMARY_ENGINE=claude: тогда работает схема выше без изменений.
+Лог: engine=hermes|claude reason=primary|escalate_fail|escalate_word|reserve|forced.
 """
 
 import asyncio
@@ -41,6 +49,7 @@ PROBE_SECONDS = 30 * 60
 STICKY_KINDS = ("quota", "auth")      # переход на резерв до возврата Claude
 FALLBACK_KINDS = ("quota", "auth", "error")  # разовый уход в Hermes
 SHARED_AUTH_DIR = "/root/.hermes/shared"  # общий Nous OAuth машины (vps-bots)
+PRIMARY_DEFAULT = "hermes"
 
 NOTICE_RESERVE = "Claude сейчас недоступен, отвечаю через запасную модель. Могу быть проще обычного"
 NOTICE_BACK = "Claude снова на связи, вернулся на основную модель"
@@ -63,6 +72,14 @@ SOUL = (
     "как говоришь и что можешь, написано в CLAUDE.md рабочего каталога и в сообщении. "
     "Следуй им. Отвечай только текстом ответа, без пояснений о себе.\n"
 )
+
+_CLAUDE_WORD_RE = re.compile(r"(?<!\w)(?:клод|claude)\w*", re.IGNORECASE)
+
+
+def wants_claude(text):
+    """Пользователь позвал Claude словом: «клод», «клоду», «Claude»… (не часть слова)."""
+    return bool(text) and bool(_CLAUDE_WORD_RE.search(str(text)))
+
 
 _PATH_RE = re.compile(r"[^\s'\"()<>«»]+\.(?:jpe?g|png|webp|gif)\b", re.IGNORECASE)
 
@@ -228,6 +245,9 @@ class Reserve:
         self.provider = os.environ.get(prefix + "_HERMES_PROVIDER", DEFAULT_PROVIDER)
         self.model = os.environ.get(prefix + "_HERMES_MODEL", DEFAULT_MODEL)
         self.vision_model = os.environ.get(prefix + "_HERMES_VISION_MODEL", "") or self.model
+        self.last_engine = None  # кто дал последний ответ: claude|hermes
+        self.last_reason = None
+        self.last_sid = None     # session_id последнего прогона Hermes (для --resume)
 
     # --- состояние --------------------------------------------------------
     def load(self):
@@ -249,6 +269,10 @@ class Reserve:
         val = (os.environ.get(self.prefix + "_FORCE_ENGINE") or "").strip().lower()
         return val if val in ("claude", "hermes") else None
 
+    def primary(self):
+        val = (os.environ.get(self.prefix + "_PRIMARY_ENGINE") or PRIMARY_DEFAULT).strip().lower()
+        return val if val in ("claude", "hermes") else PRIMARY_DEFAULT
+
     def fake_quota(self):
         return (os.environ.get(self.prefix + "_FAKE_QUOTA") or "").strip() in ("1", "true", "yes")
 
@@ -259,56 +283,86 @@ class Reserve:
         st = self.load()
         if self.forced():
             return "движок: %s (принудительно)" % self.forced()
+        if self.primary() == "hermes":
+            return "движок: hermes основной, claude по слову «клод» или при сбое"
         if st.get("engine") == "hermes":
             return "движок: резерв Hermes с %s (%s)" % (st.get("since") or "?", st.get("reason") or "?")
         return "движок: claude"
 
     # --- главный вход -----------------------------------------------------
-    async def call(self, prompt, claude_fn, now=None):
-        """(текст, error_kind). claude_fn() -> (текст, kind) — прежний вызов бота."""
+    async def call(self, prompt, claude_fn, now=None, user_text=None, hermes_prompt=None,
+                   hermes_resume=None):
+        """(текст, error_kind). claude_fn() -> (текст, kind) — прежний вызов бота.
+
+        user_text — само сообщение пользователя (для слова «клод»), без него эскалации
+        по слову нет. hermes_prompt — свой промпт для Hermes (по умолчанию prompt),
+        hermes_resume — session_id Hermes для продолжения диалога.
+        """
+        hprompt = prompt if hermes_prompt is None else hermes_prompt
         forced = self.forced()
         if forced == "hermes":
-            return await self.run_hermes(prompt)
+            return await self.run_hermes(hprompt, hermes_resume, reason="forced")
         if forced == "claude":
-            return await claude_fn()
+            return await self._claude(claude_fn, "forced")
+        if self.primary() == "hermes":
+            return await self._hermes_first(hprompt, claude_fn, user_text, hermes_resume)
         now = time.time() if now is None else now
         st = self.load()
         on_reserve = st.get("engine") == "hermes"
         if on_reserve and now - float(st.get("last_probe") or 0) < PROBE_SECONDS:
-            return await self.run_hermes(prompt)
-        text, kind = await self._claude(claude_fn)
+            return await self.run_hermes(hprompt, hermes_resume)
+        text, kind = await self._claude(claude_fn, "primary")
         if on_reserve:
             st["last_probe"] = now
             if kind in STICKY_KINDS:
                 self.save(st)
                 self.log.info("engine probe: claude ещё %s, остаюсь на резерве", kind)
-                return await self.run_hermes(prompt)
+                return await self.run_hermes(hprompt, hermes_resume)
             if kind is None:
                 self.save({"engine": "claude", "back_at": now_iso()})
                 self.log.info("engine switch: hermes -> claude")
                 await self._notify(NOTICE_BACK)
                 return text, kind
             self.save(st)
-            return await self.run_hermes(prompt) if kind in FALLBACK_KINDS else (text, kind)
+            return await self.run_hermes(hprompt, hermes_resume) if kind in FALLBACK_KINDS else (text, kind)
         if kind in STICKY_KINDS:
             self.save({"engine": "hermes", "since": now_iso(), "reason": kind, "last_probe": now})
             self.log.warning("engine switch: claude -> hermes (%s)", kind)
             await self._notify(NOTICE_RESERVE)
-            return await self.run_hermes(prompt)
+            return await self.run_hermes(hprompt, hermes_resume)
         if kind in FALLBACK_KINDS:
             self.log.warning("engine fallback: claude %s, этот вызов через hermes", kind)
-            return await self.run_hermes(prompt)
+            return await self.run_hermes(hprompt, hermes_resume)
         return text, kind
 
-    async def _claude(self, claude_fn):
+    async def _hermes_first(self, prompt, claude_fn, user_text, resume):
+        """Режим PRIMARY_ENGINE=hermes: без состояния, в чат ничего не пишем."""
+        if wants_claude(user_text):
+            text, kind = await self._claude(claude_fn, "escalate_word")
+            if kind in FALLBACK_KINDS:
+                self.log.warning("engine=claude reason=escalate_word kind=%s, отвечает hermes", kind)
+                h_text, h_kind = await self.run_hermes(prompt, resume, reason="reserve")
+                if h_kind is None:
+                    return h_text, None
+            return text, kind
+        text, kind = await self.run_hermes(prompt, resume, reason="primary")
+        if kind is None:
+            return text, kind
+        self.log.warning("engine=hermes %s, этот ответ эскалирую в claude", kind)
+        return await self._claude(claude_fn, "escalate_fail")
+
+    async def _claude(self, claude_fn, reason="primary"):
+        self.last_engine, self.last_reason = "claude", reason
         if self.fake_quota():
             self.log.warning("engine=claude fake_quota=1 (тест)")
             return "", "quota"
         try:
-            return await claude_fn()
+            text, kind = await claude_fn()
         except Exception as exc:  # noqa: BLE001 - вызов не должен ронять бота
             self.log.exception("claude упал: %s", exc)
             return "", "error"
+        self.log.info("engine=claude reason=%s kind=%s", reason, kind or "ok")
+        return text, kind
 
     async def _notify(self, text):
         if self.notify is None:
@@ -338,7 +392,9 @@ class Reserve:
             "skills": {"creation_nudge_interval": 0},
             "curator": {"enabled": False},
             "compression": {"enabled": True},
-            "display": {"show_reasoning": False, "streaming": False},
+            # inline_diffs: иначе -Q печатает «┊ review diff» с диффом каждой записи
+            # файла прямо в stdout, и он уходит в чат как часть ответа (найдено 27.10)
+            "display": {"show_reasoning": False, "streaming": False, "inline_diffs": False},
             "security": {"tirith_enabled": False},  # сканер команд terminal, а terminal нет
             "hooks_auto_accept": True,
             "hooks": {"pre_tool_call": [{
@@ -397,11 +453,13 @@ class Reserve:
         sets += ["mcp-" + name for name in self.mcp_servers if "mcp-" + name not in sets]
         return sets
 
-    def build_cmd(self, prompt, images=()):
+    def build_cmd(self, prompt, images=(), resume=None):
         model = self.vision_model if images else self.model
         cmd = [self.hermes_bin, "chat", "-q", PREAMBLE + prompt, "-Q",
                "--provider", self.provider, "-m", model,
                "-t", ",".join(self.toolsets_for()), "--source", "tool"]
+        if resume:
+            cmd += ["--resume", resume]
         if images:
             cmd += ["--image", images[0]]
         return cmd
@@ -416,8 +474,9 @@ class Reserve:
         env["HERMES_ACCEPT_HOOKS"] = "1"
         return env
 
-    async def run_hermes(self, prompt):
-        """(текст, error_kind). Лог: engine=hermes model=… dur=… cost_usd=…"""
+    async def run_hermes(self, prompt, resume=None, reason="reserve"):
+        """(текст, error_kind). Лог: engine=hermes reason=… model=… dur=… cost_usd=…"""
+        self.last_engine, self.last_reason, self.last_sid = "hermes", reason, None
         try:
             self.ensure_home()
             await asyncio.to_thread(self.ensure_auth)
@@ -425,7 +484,7 @@ class Reserve:
             self.log.warning("engine=hermes профиль не собран: %s", exc)
             return "", "error"
         images = [p for p in self.images_in(prompt) if p.lower().endswith(IMAGE_EXTS)]
-        cmd = self.build_cmd(prompt, images)
+        cmd = self.build_cmd(prompt, images, resume)
         model = self.vision_model if images else self.model
         start = time.monotonic()
         try:
@@ -447,7 +506,8 @@ class Reserve:
                 await proc.wait()
             except Exception:  # noqa: BLE001
                 pass
-            self.log.warning("engine=hermes model=%s timeout dur=%.1fs", model, time.monotonic() - start)
+            self.log.warning("engine=hermes reason=%s model=%s timeout dur=%.1fs",
+                             reason, model, time.monotonic() - start)
             return "", "timeout"
         dur = time.monotonic() - start
         out = (out_b or b"").decode("utf-8", errors="replace")
@@ -457,11 +517,12 @@ class Reserve:
                          if not ln.startswith(("session_id:", "Warning: Unknown toolsets"))).strip()
         cost = self.session_cost(sid)
         if proc.returncode != 0 or not text:
-            self.log.warning("engine=hermes model=%s rc=%s dur=%.1fs cost_usd=%s tail=%s",
-                             model, proc.returncode, dur, cost, (err or text)[-400:])
+            self.log.warning("engine=hermes reason=%s model=%s rc=%s dur=%.1fs cost_usd=%s tail=%s",
+                             reason, model, proc.returncode, dur, cost, (err or text)[-400:])
             return "", "error"
-        self.log.info("engine=hermes model=%s dur=%.1fs reply_len=%d images=%d cost_usd=%s sid=%s",
-                      model, dur, len(text), len(images), cost, sid)
+        self.last_sid = sid
+        self.log.info("engine=hermes reason=%s model=%s dur=%.1fs reply_len=%d images=%d cost_usd=%s sid=%s",
+                      reason, model, dur, len(text), len(images), cost, sid)
         return text, None
 
     def session_cost(self, sid):

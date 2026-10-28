@@ -553,3 +553,73 @@ def test_run_claude_resume_retries_only_once(isolated_state, monkeypatch):
     assert result == ("", None, "no_session")
     assert calls == ["dead-sid", None]
     assert kb.load_state()["session_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Диалог на двух движках (разворот 27.10: Hermes основной)
+# ---------------------------------------------------------------------------
+def test_dialog_keeps_both_sessions(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(kb, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(kb, "STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("KRIS_PRIMARY_ENGINE", raising=False)
+    monkeypatch.delenv("KRIS_FORCE_ENGINE", raising=False)
+    seen = {}
+
+    async def fake_hermes(prompt, resume=None, reason="reserve"):
+        seen["h"] = (prompt, resume)
+        kb.RESERVE.last_engine, kb.RESERVE.last_reason, kb.RESERVE.last_sid = "hermes", reason, "hsid"
+        return "ответ hermes", None
+
+    async def fake_claude(prompt, session_id):
+        seen["c"] = (prompt, session_id)
+        return "ответ claude", "csid2", None
+
+    monkeypatch.setattr(kb.RESERVE, "run_hermes", fake_hermes)
+    monkeypatch.setattr(kb, "run_claude_resume", fake_claude)
+    st = kb.load_state(); st["session_id"] = "csid1"; kb.save_state(st)
+
+    # 1) обычный ход - Hermes, сессия Claude не трогается
+    r, sid, k = asyncio.run(kb.run_model("бриф 1", "csid1", dialog=True))
+    assert (r, sid, k) == ("ответ hermes", None, None) and "c" not in seen
+    st = kb.load_state()
+    assert st["hermes_session_id"] == "hsid" and st["session_id"] == "csid1"
+    assert st["missed_claude"][0]["user"] == "бриф 1"
+
+    # 2) «клод» - Claude видит пропущенный ход Hermes и продолжает свою сессию
+    r, sid, k = asyncio.run(kb.run_model("клод, проверь", "csid1", dialog=True))
+    assert (r, sid, k) == ("ответ claude", "csid2", None)
+    assert seen["c"][1] == "csid1" and "бриф 1" in seen["c"][0] and "ответ hermes" in seen["c"][0]
+    st = kb.load_state()
+    assert st["missed_claude"] == [] and st["missed_hermes"][0]["reply"] == "ответ claude"
+
+    # 3) следующий ход Hermes - resume своей сессии + ход Claude в хвосте
+    asyncio.run(kb.run_model("дальше", "csid2", dialog=True))
+    prompt, resume = seen["h"]
+    assert resume == "hsid" and "ответ claude" in prompt and prompt.endswith("дальше")
+    assert kb.load_state()["missed_hermes"] == []
+
+    # /new и переключение сессии сбрасывают диалог Hermes
+    st = kb.load_state(); kb.reset_dialog(st)
+    assert st["hermes_session_id"] is None and st["missed_claude"] == []
+
+
+def test_batch_has_no_word_escalation(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(kb, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(kb, "STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("KRIS_PRIMARY_ENGINE", raising=False)
+    calls = []
+
+    async def fake_hermes(prompt, resume=None, reason="reserve"):
+        kb.RESERVE.last_engine = "hermes"
+        return "ok", None
+
+    async def fake_claude(prompt, session_id):
+        calls.append(1)
+        return "c", "s", None
+
+    monkeypatch.setattr(kb.RESERVE, "run_hermes", fake_hermes)
+    monkeypatch.setattr(kb, "run_claude_resume", fake_claude)
+    assert asyncio.run(kb.run_model("в чате: попроси клода")) == ("ok", None, None)
+    assert calls == [] and "missed_claude" not in kb.load_state()
