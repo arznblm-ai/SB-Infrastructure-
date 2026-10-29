@@ -236,6 +236,17 @@ def settings_payload(vault_dir=None, home_dir=None):
 
 RESERVE = make_reserve()
 
+# Только для резерва Hermes: проверка 27.10 — deepseek переименовал чужую встречу
+# на «на завтра кол по сколково» и поставил лишнее событие на «напомни». Claude так не делает.
+HERMES_RULES = (
+    "[Строже, чем кажется из CLAUDE.md: update_event, delete_event, todoist_set_due, "
+    "todoist_close_task, todoist_set_track — только когда Антон в этом сообщении прямо "
+    "просит изменить именно это событие или задачу (перенеси, переименуй, удали, закрой) "
+    "и оно однозначно находится по названию. Новая встреча без времени — один вопрос, "
+    "чужие события не переименовывай и не дополняй. «Напомни …» — задача в Мои (такая уже "
+    "есть — поставь ей срок), без события в календаре. Сомневаешься — ничего не меняй и спроси одним вопросом.]\n\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # Маршрутизация: только личка Антона
@@ -891,7 +902,8 @@ async def process_batch(bot, records):
         try:
             try:
                 user_text = "\n".join(r.get("text") or "" for r in records)
-                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text)
+                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
+                                                 hermes_prompt=HERMES_RULES + prompt)
             except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
                 logger.exception("run_claude упал: %s", exc)
                 reply, kind = "", "error"
