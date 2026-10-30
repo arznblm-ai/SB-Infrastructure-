@@ -5,7 +5,7 @@ digest_builder.py — сборка русскоязычного тематиче
 Вход: JSON от fetch_tweets.py (--in file или stdin).
 Выход: готовый текст для Telegram (--out file или stdout).
 
-Ровно ОДИН вызов `claude -p` на выпуск (модель по умолчанию claude-sonnet-5).
+Ровно один изолированный вызов Codex на выпуск.
 Формат вывода — plain text без parse_mode: Telegram не парсит сущности,
 значит ни один спецсимвол из твита не сломает отправку.
 
@@ -31,8 +31,8 @@ if _SCRIPT_DIR not in sys.path:
 from spool import parse_dt  # noqa: E402 — соседний модуль, путь добавлен выше
 
 LOG_FILE = Path.home() / "Library" / "Logs" / "ai-twitter-digest.log"
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "/Users/anton/.local/bin/claude")
-MODEL = os.environ.get("AI_DIGEST_MODEL", "claude-sonnet-5")
+CODEX_BIN = os.environ.get("CODEX_BIN", str(Path.home() / ".local/bin/codex"))
+MODEL = os.environ.get("AI_DIGEST_MODEL", "")
 
 MAX_TWEETS_IN_PROMPT = 300
 MAX_TWEET_CHARS = 800
@@ -294,30 +294,30 @@ def prepare_tweets(tweets: list[dict]) -> tuple[list[dict], bool, dict[str, int]
 
 # ── LLM ──────────────────────────────────────────────────────────────────
 
-def run_claude(prompt: str) -> str | None:
-    cmd = [
-        CLAUDE_BIN, "-p",
-        "--model", MODEL,
-        "--max-turns", "1",
-        "--no-session-persistence",
-        "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        log(f"claude не найден: {CLAUDE_BIN}")
-        return None
-    except subprocess.TimeoutExpired:
-        log(f"claude: таймаут {CLAUDE_TIMEOUT_SECONDS}s")
-        return None
+def run_codex(prompt: str) -> str | None:
+    import tempfile
+    # Tweets are untrusted: no shell, apps, web or user MCP configuration.
+    with tempfile.TemporaryDirectory(prefix="twitter-digest-codex-") as workdir:
+        cmd = [CODEX_BIN, "exec", "--ignore-user-config", "--disable", "shell_tool",
+               "--disable", "unified_exec", "--disable", "apps", "-c", 'web_search="disabled"',
+               "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--cd", workdir]
+        if MODEL and not MODEL.lower().startswith("claude") and MODEL.lower() not in {"sonnet", "haiku", "opus"}:
+            cmd += ["--model", MODEL]
+        cmd += ["-"]
+        try:
+            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT_SECONDS)
+        except FileNotFoundError:
+            log(f"codex не найден: {CODEX_BIN}")
+            return None
+        except subprocess.TimeoutExpired:
+            log(f"codex: таймаут {CLAUDE_TIMEOUT_SECONDS}s")
+            return None
     if proc.returncode != 0:
-        log(f"claude: exit {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}")
+        log(f"codex: exit {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}")
         return None
     text = (proc.stdout or "").strip()
     if len(text) < 40:
-        log(f"claude: подозрительно короткий ответ ({len(text)} симв.)")
+        log(f"codex: подозрительно короткий ответ ({len(text)} симв.)")
         return None
     return text
 
@@ -370,7 +370,7 @@ def build_digest(payload: dict, now: dt.datetime) -> str:
     if not tweets:
         return f"{head}\n\nТишина в ленте: новых постов за период нет." + errors_footer(errors)
     capped, truncated, trimmed, cap = prepare_tweets(tweets)
-    body = run_claude(build_prompt(capped, truncated, len(tweets), trimmed, cap, period))
+    body = run_codex(build_prompt(capped, truncated, len(tweets), trimmed, cap, period))
     if body is None:
         body = fallback_body(capped)
     stats = f"\n\nИсточник: {len(tweets)} твитов, {payload.get('accounts_ok', '?')} аккаунтов."

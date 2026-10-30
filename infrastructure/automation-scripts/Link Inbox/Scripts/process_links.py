@@ -258,7 +258,7 @@ def maybe_auto_enrich(config: dict, note_path, logger) -> None:
         return
     try:
         from enrich_note_llm import enrich_one
-        status = enrich_one(Path(note_path), enrich_cfg.get("model") or "claude-haiku-4-5-20251001")
+        status = enrich_one(Path(note_path), enrich_cfg.get("model"))
         logger.info(f"auto-enrich {status}: {note_path}")
     except Exception as exc:
         logger.warning(f"auto-enrich failed (note stays pending, backlog will catch it): {exc}")

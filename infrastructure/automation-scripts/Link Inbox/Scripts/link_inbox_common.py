@@ -72,10 +72,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "cookies_from_browser": "",
         "cookies": "",
     },
-    # LLM enrichment ("разбор") runs automatically on save via headless `claude -p`.
+    # LLM enrichment runs automatically through isolated Codex CLI.
     "enrich": {
         "auto": True,
-        "model": "claude-haiku-4-5-20251001",
+        "model": None,
     },
     "review": {
         "max_items": 12,

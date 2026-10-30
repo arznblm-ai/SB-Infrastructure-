@@ -2,7 +2,10 @@
 set -euo pipefail
 
 VAULT="/Users/anton/AI AGENT FOLDER/Second Brain"
-CODEX="/Applications/Codex.app/Contents/Resources/codex"
+CODEX="${CODEX:-$HOME/.local/bin/codex}"
+if [[ ! -x "$CODEX" && -x "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex" ]]; then
+  CODEX="/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+fi
 LOG="/Users/anton/Library/Logs/personal-context-updater.log"
 
 mkdir -p "$(dirname "$LOG")"

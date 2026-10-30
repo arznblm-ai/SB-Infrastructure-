@@ -5,7 +5,7 @@ Turns a `pending` auto note into a `done` note by running the analysis (the
 "разбор"): краткое содержание, суть, полезные ссылки, инструменты, инсайты,
 готовые решения, оценка для Антона, Strategic Board.
 
-Uses headless `claude -p` (the user's Claude Code auth — no separate API key).
+Uses Codex CLI in an isolated read-only, tool-disabled session.
 Same engine is used by:
   - the bot pipeline (auto-enrich on save), and
   - batch backlog runs (`--all-pending`).
@@ -28,17 +28,14 @@ from pathlib import Path
 from external_resource_note import bullet_block, enrich_note, load_note, _links_block
 from link_inbox_common import EXTERNAL_TRANSCRIPTS_DIR
 
-# Resolve the claude CLI by absolute path so it works under a LaunchAgent
-# whose PATH may not include ~/.local/bin.
-CLAUDE_BIN = (
-    shutil.which("claude")
-    or next((p for p in (
-        os.path.expanduser("~/.local/bin/claude"),
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ) if os.path.exists(p)), "claude")
-)
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+# The job runs from an empty temporary directory and does not load user MCPs,
+# app connectors, project instructions or shell tools. Source text is untrusted.
+CODEX_BIN = (shutil.which("codex") or next((p for p in (
+    os.path.expanduser("~/.local/bin/codex"),
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "/usr/local/bin/codex",
+) if os.path.isfile(p) and os.access(p, os.X_OK)), "codex"))
+DEFAULT_MODEL = None  # use the Codex CLI default
 SKIP = {"index.md", "readme.md"}
 MAX_TRANSCRIPT = 6000
 
@@ -78,27 +75,32 @@ def extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def call_claude(prompt: str, model: str) -> dict:
-    res = subprocess.run(
-        [CLAUDE_BIN, "-p", prompt, "--output-format", "json", "--model", model,
-         # транскрипт — недоверенный внешний текст: никаких инструментов (см. digest_builder.py)
-         "--max-turns", "1", "--no-session-persistence",
-         "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep"],
-        capture_output=True, text=True, timeout=180,
-    )
+def call_codex(prompt: str, model: str | None = None) -> dict:
+    import tempfile
+    # Claude-era model names in older Link Inbox configs are not Codex models.
+    if model and (model.lower().startswith("claude") or model.lower() in {"sonnet", "haiku", "opus"}):
+        model = None
+    with tempfile.TemporaryDirectory(prefix="link-inbox-codex-") as workdir:
+        cmd = [CODEX_BIN, "exec", "--ignore-user-config", "--disable", "shell_tool",
+               "--disable", "unified_exec", "--disable", "apps", "-c", 'web_search="disabled"',
+               "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--cd", workdir]
+        if model:
+            cmd += ["--model", model]
+        cmd += ["-"]
+        res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=180)
     if res.returncode != 0:
-        raise RuntimeError(f"claude -p failed ({res.returncode}): {res.stderr[-300:]}")
-    envelope = json.loads(res.stdout)
-    if envelope.get("is_error"):
-        raise RuntimeError(f"claude -p error: {envelope.get('result', '')[:300]}")
-    return extract_json(envelope["result"])
+        raise RuntimeError(f"codex exec failed ({res.returncode}): {res.stderr[-300:]}")
+    data = extract_json(res.stdout)
+    if not isinstance(data, dict):
+        raise ValueError("Codex did not return a JSON object")
+    return data
 
 
 def section(note: dict, h: str) -> str:
     return note["sections"].get(h, "")
 
 
-def enrich_one(path: Path, model: str, force: bool = False) -> str:
+def enrich_one(path: Path, model: str | None = None, force: bool = False) -> str:
     note = load_note(path)
     fm = note["frontmatter"]
     if not force and "enrichment: done" in fm:
@@ -110,7 +112,7 @@ def enrich_one(path: Path, model: str, force: bool = False) -> str:
     if len(transcript.strip()) < 40:
         return "skip-no-transcript"
 
-    data = call_claude(
+    data = call_codex(
         PROMPT.format(title=title, platform=platform, caption=caption or "—", transcript=transcript),
         model,
     )
