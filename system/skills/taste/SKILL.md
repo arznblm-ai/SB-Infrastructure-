@@ -194,6 +194,8 @@ LLMs default to clichés. Override these defaults proactively. Each rule has a c
 
 * **ITALIC DESCENDER CLEARANCE (mandatory):** When italic is used in display type and the word contains a descender letter (`y g j p q`), `leading-[1]` or `leading-none` will clip the descender. Use `leading-[1.1]` minimum and add `pb-1` or `mb-1` reserve on the wrapping element. Audit every italic word in display headlines before shipping.
 
+* **РОВНЫЕ ПЕРЕНОСЫ, БЕЗ ВИСЯЧИХ ПРЕДЛОГОВ (обязательно, правило Антона 2026-10-30):** текст в заголовках и коротких абзацах (2–3 строки) должен ломаться на строки примерно равной длины. Не оставлять предлог, союз или частицу в конце строки («в», «на», «с», «у», «и», «а», «но», «по», «к», «за», «о» и т.п.) и не оставлять одно-два слова последней строкой. Как делать: для крупного текста ставить переносы руками (`<br>`) по смыслу, прикинув ширину строки (≈0,6 × кегль на символ); для веба дополнительно `text-wrap: balance` на заголовках и `&nbsp;` между коротким предлогом и следующим словом. Перед сдачей перечитать каждый заголовок и подзаголовок построчно. Касается и слайдов (Artifact Slides), не только сайтов.
+
 ### 4.2 Color Calibration
 * Max 1 accent color. Saturation < 80% by default.
 * **THE LILA RULE:** The "AI Purple / Blue glow" aesthetic is discouraged as a default. No automatic purple button glows, no random neon gradients. Use neutral bases (Zinc / Slate / Stone) with high-contrast singular accents (Emerald, Electric Blue, Deep Rose, Burnt Orange, etc.).
@@ -939,6 +941,7 @@ Run this matrix before outputting code. This is the last filter.
 - [ ] **Serif discipline**: if a serif is used, it is NOT Fraunces or Instrument_Serif (or it is, with explicit brand justification)? Different serif from your previous project?
 - [ ] **Premium-consumer palette check**: if the brief is premium-consumer (cookware / wellness / artisan / luxury), the palette is NOT the AI-default beige+brass+oxblood+espresso family? Different family from your previous premium-consumer project?
 - [ ] **Italic descender clearance**: every italic word with `y g j p q` has `leading-[1.1]` min + `pb-1` reserve?
+- [ ] **Ровные переносы**: в каждом заголовке и коротком абзаце строки примерно равной длины, нет висячих предлогов и союзов в конце строки, нет одного слова в последней строке (Section 4.1, правило Антона)?
 - [ ] **Hero fits the viewport**: headline ≤ 2 lines, subtext ≤ 20 words AND ≤ 4 lines, CTA visible without scroll, font scale planned around image?
 - [ ] **Hero top padding**: max `pt-24` at desktop, hero content does not float halfway down the viewport?
 - [ ] **Hero stack discipline**: max 4 text elements in hero (eyebrow OR brand strip, headline, subtext, CTAs)? No tiny tagline below CTAs, no trust micro-strip in hero?

@@ -387,7 +387,9 @@ class Reserve:
         guard = os.path.join(self.hermes_home, "guard.py")
         cfg = {
             "model": {"default": self.model, "provider": self.provider},
-            "agent": {"max_turns": 40},
+            # verify_on_stop: после записи файла Hermes дописывает ходы «проверить правку
+            # не могу», и -Q отдаёт в чат их, а не ответ (Марко 30.10 13:40)
+            "agent": {"max_turns": 40, "verify_on_stop": False},
             "memory": {"memory_enabled": False, "user_profile_enabled": False, "nudge_interval": 0},
             "skills": {"creation_nudge_interval": 0},
             "curator": {"enabled": False},
@@ -472,6 +474,7 @@ class Reserve:
         env["HERMES_SHARED_AUTH_DIR"] = os.environ.get(self.prefix + "_HERMES_SHARED_AUTH_DIR", SHARED_AUTH_DIR)
         env["HERMES_WRITE_SAFE_ROOT"] = os.pathsep.join(self.write_roots) or "/nonexistent-write-root"
         env["HERMES_ACCEPT_HOOKS"] = "1"
+        env["HERMES_VERIFY_ON_STOP"] = "0"  # то же, что agent.verify_on_stop в config.yaml
         return env
 
     async def run_hermes(self, prompt, resume=None, reason="reserve"):
@@ -513,8 +516,7 @@ class Reserve:
         out = (out_b or b"").decode("utf-8", errors="replace")
         err = (err_b or b"").decode("utf-8", errors="replace")
         sid = (re.findall(r"session_id:\s*(\S+)", err + "\n" + out) or [None])[-1]
-        text = "\n".join(ln for ln in out.splitlines()
-                         if not ln.startswith(("session_id:", "Warning: Unknown toolsets"))).strip()
+        text = self.session_reply(sid) or _strip_junk(out)
         cost = self.session_cost(sid)
         if proc.returncode != 0 or not text:
             self.log.warning("engine=hermes reason=%s model=%s rc=%s dur=%.1fs cost_usd=%s tail=%s",
@@ -524,6 +526,22 @@ class Reserve:
         self.log.info("engine=hermes reason=%s model=%s dur=%.1fs reply_len=%d images=%d cost_usd=%s sid=%s",
                       reason, model, dur, len(text), len(images), cost, sid)
         return text, None
+
+    def session_reply(self, sid):
+        """Ответ из state.db: первое сообщение ассистента с текстом и без tool_calls
+        после последнего user. Хвостовые ходы (проверки, догонялки) в чат не идут."""
+        if not sid:
+            return ""
+        try:
+            con = sqlite3.connect("file:%s?mode=ro" % os.path.join(self.hermes_home, "state.db"), uri=True)
+            try:
+                rows = con.execute("select role, content, tool_calls from messages where session_id=? "
+                                   "and active=1 order by id", (sid,)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return ""
+        return pick_reply(rows)
 
     def session_cost(self, sid):
         if not sid:
@@ -541,6 +559,23 @@ class Reserve:
             return "?"
         val = row[1] if row[1] is not None else row[0]
         return "?" if val is None else "%.4f" % float(val)
+
+
+def _strip_junk(text):
+    return "\n".join(ln for ln in (text or "").splitlines()
+                     if not ln.startswith(("session_id:", "Warning: Unknown toolsets"))).strip()
+
+
+def pick_reply(rows):
+    """rows: (role, content, tool_calls) по порядку. Пусто — если ответа не нашли."""
+    last_user = max((i for i, r in enumerate(rows) if r[0] == "user"), default=-1)
+    for role, content, tool_calls in rows[last_user + 1:]:
+        if role != "assistant" or (tool_calls or "").strip() not in ("", "[]", "null"):
+            continue
+        text = _strip_junk(content)
+        if text:
+            return text
+    return ""
 
 
 def guard_verdict(payload, policy):

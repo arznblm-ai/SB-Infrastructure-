@@ -1,7 +1,8 @@
 ---
 name: instagram-reel-analyzer
 description: "Analyze Instagram Reels from reel URLs or downloaded reel videos, extract metadata and transcript, find mentioned tools/links, run a post-analysis with Strategic Board when business/product relevance exists, and save a searchable Markdown note with summary, insights, reusable solutions, skills, source links, and strategic implications. Also handles a whole channel/author over the last ~30 days: batch-download their reels into a per-author folder and fully analyze each. Use when the user sends an Instagram reel link, sends a profile/channel link, asks to разбери/проанализируй рилс или канал из инстаграма, asks to download a creator's reels for the last 30 days, wants reel transcripts saved for future search, asks for strategic/business implications of a reel, or asks to build an insight library from Instagram reels."
-model: sonnet
+metadata:
+  model: sonnet
 ---
 
 # Instagram Reel Analyzer
@@ -28,14 +29,14 @@ Shared note builder (used by both the bot and this skill):
 ## Workflow
 
 1. Resolve the reel source.
-   - If the user gives a URL, try the public Instagram page first.
-   - If Instagram blocks video access, use page metadata and ask for the downloaded video only when audio/transcript cannot be obtained.
+   - For a reel URL, first search the canonical notes for the shortcode. If no transcript exists, immediately run the Saved Links download and transcription workflow below. A public page or browser check can supply metadata, but a blocked page or missing `yt-dlp` on PATH is not a reason to stop or ask for the video before trying this workflow.
+   - Ask for the downloaded video or a transcript only if the Saved Links workflow actually fails to obtain the audio or transcript; explain the observed failure.
    - If the user gives a local video file, skip URL extraction and transcribe the file directly.
 2. Extract available metadata.
    - Source URL, shortcode, media id, author username/full name/profile URL, post date, like/comment/view counts, caption, cover image, video URL, audio metadata, external links, mentioned products.
    - If metadata is unavailable, mark fields as `unknown`; do not invent.
 3. Download or locate the media when possible.
-   - Store media in `resources/instagram-reels/media/`.
+   - Saved Links / UGC Downloader manages media and run artifacts in its configured locations.
    - Use `/private/tmp` for temporary HTML/JSON files.
 4. Transcribe the audio.
    - Prefer local `faster_whisper` with `tiny` for speed or `small` for better English quality.
@@ -76,6 +77,17 @@ Every reel note must include:
 - `## Raw caption / metadata` for original caption and counts.
 
 Read `references/reel-note-schema.md` before changing the note format or creating rollups.
+
+## Single reel: Saved Links downloader
+
+Use the same pipeline as Saved Links for each specific reel URL, including fact-check requests:
+
+```bash
+python3 "/Users/anton/AI AGENT FOLDER/Second Brain/infrastructure/Link Inbox/Scripts/batch_reels.py" \
+  --author <username-or-unknown> "https://www.instagram.com/reel/SHORTCODE/"
+```
+
+Use the visible author username when known; otherwise use `unknown`. The script reads the configured browser cookies and transcription settings, invokes UGC Downloader, and prints the resulting note path. Inspect the `BUILT`, `SKIPPED`, and `FAILED` results: an exit code of zero alone does not establish success. Read the transcript, complete the requested analysis or fact-check using appropriate sources, enrich the resulting note, and rebuild the index. Do not enumerate an Instagram profile feed to obtain a single reel.
 
 ## Commands
 

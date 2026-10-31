@@ -23,6 +23,7 @@
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -88,6 +89,11 @@ BATCH_MAX_SECONDS = 60.0  # потолок от первого сообщени�
 
 INBOX_MAX_AGE_DAYS = 30
 CLAUDE_TIMEOUT = 600
+# Предразбор фото пачки одним запросом (rocky_vision.py) перед текстовым Hermes-прогоном
+VISION_PY = os.environ.get("ROCKY_VISION_PY", "/usr/local/lib/hermes-agent/venv/bin/python")
+VISION_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocky_vision.py")
+VISION_MODEL = os.environ.get("ROCKY_VISION_MODEL", "google/gemini-4-argon")
+VISION_TIMEOUT = _env_float("ROCKY_VISION_TIMEOUT", 45)
 TG_LIMIT = 4000
 CHATLOG_TAIL_LINES = 40
 TICK_SECONDS = 60
@@ -392,8 +398,10 @@ def _paths_block(data_dir):
 
 
 def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
-                      chatlog_tail=None, data_dir=None):
-    """Промпт на пачку сообщений одного автора."""
+                      chatlog_tail=None, data_dir=None, vision_text=None):
+    """Промпт на пачку сообщений одного автора.
+
+    vision_text — готовый разбор фото (предразбор): тогда картинки не открывать."""
     profiles = profiles or {}
     profile = profiles.get(who) or {}
     day = journal.day_of(dt or now_utc())
@@ -419,10 +427,15 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
         local = journal.msk(r.get("at") or now_utc()).strftime("%H:%M")
         lines.append("- %s %s: %s" % (local, r.get("author") or journal.WHO_RU[who], record_content(r) or "(без текста)"))
         for m in r.get("media") or ():
-            images.append("- %s - открой инструментом Read" % (m.get("rel") or m.get("path")))
+            images.append(m.get("rel") or m.get("path"))
     parts.append("## Новые сообщения: %s\n%s" % (journal.WHO_RU[who], "\n".join(lines) or "(пусто)"))
-    if images:
-        parts.append("## Картинки\n" + "\n".join(images))
+    if images and vision_text:
+        parts.append(
+            "## Картинки (уже разобраны vision-моделью - инструментами НЕ открывай, считай по разбору)\n"
+            + "\n".join("- фото %d: %s" % (i, p) for i, p in enumerate(images, 1))
+            + "\n\n### Разбор фото\n" + vision_text.strip())
+    elif images:
+        parts.append("## Картинки\n" + "\n".join("- %s - открой инструментом Read" % p for p in images))
     parts.append(_paths_block(data_dir))
     parts.append(UNTRUSTED)
     parts.append(
@@ -492,6 +505,9 @@ def today_text(profiles, entries, day):
 # ---------------------------------------------------------------------------
 ACTIONS_BLOCK_RE = re.compile(r"```[ \t]*rocky-actions[ \t]*\n?(.*?)```", re.S)
 ACTIONS_OPEN_RE = re.compile(r"```[ \t]*rocky-actions")
+GENERIC_FENCE_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:rocky-actions[ \t]*:?[ \t]*\n[ \t]*)?```[ \t]*(?:json)?[ \t]*\n(.*?)```", re.S | re.I)
+BARE_MARKER_RE = re.compile(r"(?:^|\n)[ \t>*_`]*rocky-actions[ \t*_`]*:?", re.I)
 
 
 def extract_actions(text):
@@ -508,6 +524,35 @@ def extract_actions(text):
     if unclosed:
         clean = clean[: unclosed.start()]
         error = "незакрытый блок rocky-actions"
+
+    # Блок в ```json / ``` (с меткой rocky-actions строкой выше или без неё),
+    # если внутри действия с "op".
+    def _generic(m):
+        body = m.group(1)
+        if '"op"' not in body:
+            return m.group(0)
+        blocks.append(body)
+        return "\n"
+    clean = GENERIC_FENCE_RE.sub(_generic, clean)
+
+    # Голая метка rocky-actions без fence (бывает у Hermes/deepseek):
+    # JSON сразу после метки, хвост после JSON остаётся текстом.
+    while True:
+        m = BARE_MARKER_RE.search(clean)
+        if not m:
+            break
+        rest = clean[m.end():]
+        stripped = rest.lstrip()
+        if stripped[:1] in ("[", "{"):
+            try:
+                _, end = json.JSONDecoder().raw_decode(stripped)
+                blocks.append(stripped[:end])
+                clean = clean[: m.start()] + "\n" + stripped[end:]
+                continue
+            except ValueError as exc:
+                error = "блок rocky-actions не JSON: %s; сырьё: %r" % (exc, stripped[:300])
+        clean = clean[: m.start()]
+
     actions = []
     for raw in blocks:
         raw = raw.strip()
@@ -728,10 +773,23 @@ async def run_claude(prompt):
     return text, kind
 
 
+# True внутри прогона, где фото уже разобраны: Hermes не цепляет --image и vision-тулзы
+_PRE_DESCRIBED = contextvars.ContextVar("rocky_pre_described", default=False)
+
+
+class RockyReserve(hermes_reserve.Reserve):
+    def images_in(self, prompt):
+        return [] if _PRE_DESCRIBED.get() else super().images_in(prompt)
+
+    def toolsets_for(self):
+        sets = super().toolsets_for()
+        return [t for t in sets if t != "vision"] if _PRE_DESCRIBED.get() else sets
+
+
 def make_reserve(home_dir=None):
     """Резерв Hermes (ADR-034): права как у Claude - только чтение workspace и data."""
     home = home_dir or HOME_DIR
-    return hermes_reserve.Reserve(
+    return RockyReserve(
         "ROCKY", os.path.join(STATE_DIR, "engine.json"), os.path.join(ROCKY_HOME, "hermes"), WORKSPACE,
         read_roots=[WORKSPACE, DATA_DIR],
         deny=[os.path.join(home, rel) for rel in SECRET_DIRS_REL],
@@ -742,15 +800,80 @@ def make_reserve(home_dir=None):
 RESERVE = make_reserve()
 
 
-async def call_model(prompt, user_text=None):
+async def call_model(prompt, user_text=None, hermes_prompt=None):
     """run_claude (с резервом Hermes), который никогда не бросает.
 
-    user_text — сообщения людей: слово «клод» в них зовёт Claude на этот ответ."""
+    user_text — сообщения людей: слово «клод» в них зовёт Claude на этот ответ.
+    hermes_prompt — промпт с готовым разбором фото: Hermes идёт без картинок."""
+    token = _PRE_DESCRIBED.set(hermes_prompt is not None)
     try:
-        return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text)
+        return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
+                                  hermes_prompt=hermes_prompt)
     except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
         logger.exception("run_claude упал: %s", exc)
         return "", "error"
+    finally:
+        _PRE_DESCRIBED.reset(token)
+
+
+def batch_images(records, workspace=None):
+    """Абсолютные пути фото пачки (только существующие картинки)."""
+    out = []
+    for r in records or ():
+        for m in r.get("media") or ():
+            p = m.get("path") or m.get("rel")
+            if not p:
+                continue
+            p = p if os.path.isabs(p) else os.path.join(workspace or WORKSPACE, p)
+            if p.lower().endswith(hermes_reserve.IMAGE_EXTS) and os.path.isfile(p) and p not in out:
+                out.append(p)
+    return out
+
+
+def parse_vision_output(stdout):
+    """Последняя JSON-строка rocky_vision.py -> текст разбора или None."""
+    for line in reversed((stdout or "").strip().splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("ok") and str(data.get("text") or "").strip():
+            return str(data["text"]).strip()
+        return None
+    return None
+
+
+async def describe_images(paths):
+    """(текст разбора | None, dur). Сбой/таймаут -> None, бот идёт старым путём."""
+    start = time.monotonic()
+    if not paths or not os.path.isfile(VISION_SCRIPT) or not os.path.isfile(VISION_PY):
+        return None, 0.0
+    cmd = [VISION_PY, "-I", VISION_SCRIPT, "--model", VISION_MODEL,
+           "--timeout", str(max(5.0, VISION_TIMEOUT - 5))] + list(paths)
+    try:
+        RESERVE.ensure_home()
+        await asyncio.to_thread(RESERVE.ensure_auth)  # первый запуск профиля: импорт Nous OAuth
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=WORKSPACE, env=RESERVE.env(), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vision_pre не запустился: %s", exc)
+        return None, time.monotonic() - start
+    try:
+        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=VISION_TIMEOUT)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("vision_pre timeout после %.1fs", time.monotonic() - start)
+        return None, time.monotonic() - start
+    stdout = (out_b or b"").decode("utf-8", errors="replace")
+    text = parse_vision_output(stdout)
+    if text is None:
+        logger.warning("vision_pre fail: %s", stdout.strip()[-300:])
+    return text, time.monotonic() - start
 
 
 def record_run(kind):
@@ -833,6 +956,31 @@ async def _deliver(bot, text, label=BOT_NAME):
         logger.warning("Не смог записать ответ в чатлог: %s", exc)
 
 
+def hermes_expected(user_text=None, reserve=None):
+    """Ответ, скорее всего, даст Hermes - тогда есть смысл в предразборе фото."""
+    r = reserve or RESERVE
+    forced = r.forced()
+    if forced:
+        return forced == "hermes"
+    if hermes_reserve.wants_claude(user_text) and r.primary() == "hermes":
+        return False
+    return r.primary() == "hermes" or r.load().get("engine") == "hermes"
+
+
+async def answer_batch(prompt, records, who, now, profiles, today, tail, user_text):
+    """Фото пачки -> предразбор одним запросом -> Hermes текстом; сбой -> старый путь."""
+    paths = batch_images(records)
+    hermes_prompt = None
+    if paths and hermes_expected(user_text):
+        vision_text, dur_pre = await describe_images(paths)
+        logger.info("vision_pre=%s images=%d dur_pre=%.1fs model=%s",
+                    "ok" if vision_text else "fail", len(paths), dur_pre, VISION_MODEL)
+        if vision_text:
+            hermes_prompt = build_turn_prompt(records, who, now, profiles, today, tail, DATA_DIR,
+                                              vision_text=vision_text)
+    return await call_model(prompt, user_text, hermes_prompt)
+
+
 async def process_batch(bot, who, records):  # pragma: no cover - рантайм
     """Пачка одного автора -> один прогон -> ответ в группу. Под замком, по очереди."""
     global _waiting
@@ -853,7 +1001,8 @@ async def process_batch(bot, who, records):  # pragma: no cover - рантайм
         logger.info("Пачка %s: %d сообщ., хвост %d строк", who, len(records), len(tail))
 
         user_text = "\n".join(record_content(r) or "" for r in records)
-        reply, kind = await _with_typing(bot, call_model(prompt, user_text))
+        reply, kind = await _with_typing(bot, answer_batch(prompt, records, who, now, profiles,
+                                                           today, tail, user_text))
         record_run(kind)
         if kind:
             await _deliver(bot, ERROR_TEXT, "%s [сбой: %s]" % (BOT_NAME, kind))

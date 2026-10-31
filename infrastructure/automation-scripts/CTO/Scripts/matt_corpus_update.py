@@ -11,7 +11,7 @@ matt_corpus_update.py — еженедельное автообновление 
   2. GitHub `mattpocock/skills` — коммиты с последнего виденного sha + новые
      секции CHANGELOG.md (он объясняет «почему»).
 
-Если появилось новое — ОДИН вызов `claude -p --model sonnet` дистиллирует это в
+Если появилось новое — ОДИН вызов `codex exec` дистиллирует это в
 стиле ядра доктрины и результат добавляется датированной секцией в дельта-файл
 `infrastructure/CTO/Matt Pocock/{self} {research} Мэт Покок дельта доктрины – 2026-08-08.md`.
 Ядро доктрины скрипт НЕ трогает: консолидация дельты в ядро — ручная команда
@@ -142,9 +142,9 @@ GITHUB_FIRST_RUN_DAYS = 14      # окно, если last_commit_date ещё н�
 DELTA_LINE_LIMIT = 200          # превышение = сигнал «пора консолидировать»
 SEEN_IDS_KEEP = 120
 
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", str(Path.home() / ".local" / "bin" / "claude"))
-CLAUDE_MODEL = "sonnet"
-CLAUDE_TIMEOUT = 600
+CODEX_BIN = os.environ.get("CODEX_BIN", str(Path.home() / ".local" / "bin" / "codex"))
+CODEX_MODEL = os.environ.get("MATT_CODEX_MODEL", "")
+CODEX_TIMEOUT = 600
 
 TG_DEFAULT_CHAT_ID = "324186708"   # главный чат Гермеса, БЕЗ топика
 TG_TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{20,}$")
@@ -659,45 +659,27 @@ def build_prompt(videos: list[VideoResult], github: Optional[GithubResult]) -> s
     return "\n\n".join(parts)
 
 
-def run_claude(prompt: str) -> Optional[str]:
-    if not Path(CLAUDE_BIN).exists():
-        log(f"claude: бинарь не найден: {CLAUDE_BIN}")
+def run_codex(prompt: str) -> Optional[str]:
+    import tempfile
+    if not Path(CODEX_BIN).exists():
+        log(f"codex: бинарь не найден: {CODEX_BIN}")
         return None
-    command = [
-        CLAUDE_BIN, "-p",
-        "--model", CLAUDE_MODEL,
-        "--output-format", "json",
-        "--max-turns", "1",
-        "--no-session-persistence",
-        "--disallowedTools", "Bash", "Edit", "Write", "WebFetch", "WebSearch", "Read", "Glob", "Grep", "Task",
-    ]
-    try:
-        proc = subprocess.run(
-            command, input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT
-        )
-    except subprocess.TimeoutExpired:
-        log(f"claude: timeout {CLAUDE_TIMEOUT} с")
-        return None
-    except Exception as exc:
-        log(f"claude: запуск не удался: {type(exc).__name__}: {exc}")
-        return None
-    if proc.returncode != 0:
-        log(f"claude: exit {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}")
-        return None
-    try:
-        envelope = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        text = proc.stdout.strip()
-        return text or None
-    if isinstance(envelope, dict):
-        if envelope.get("is_error"):
-            log(f"claude: is_error=true: {str(envelope.get('result'))[:200]}")
+    with tempfile.TemporaryDirectory(prefix="matt-corpus-codex-") as workdir:
+        command = [CODEX_BIN, "exec", "--ignore-user-config", "--disable", "shell_tool",
+                   "--disable", "unified_exec", "--disable", "apps", "-c", 'web_search="disabled"',
+                   "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--cd", workdir]
+        if CODEX_MODEL:
+            command += ["--model", CODEX_MODEL]
+        command += ["-"]
+        try:
+            proc = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=CODEX_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"codex: запуск не удался: {type(exc).__name__}")
             return None
-        result = envelope.get("result")
-        if isinstance(result, str) and result.strip():
-            return result.strip()
-    log("claude: в ответе нет текста")
-    return None
+    if proc.returncode != 0:
+        log(f"codex: exit {proc.returncode}: {(proc.stderr or proc.stdout)[:300]}")
+        return None
+    return proc.stdout.strip() or None
 
 
 def split_distillation(answer: str) -> tuple[str, list[str]]:
@@ -970,7 +952,7 @@ def seed_state(state: dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Еженедельное обновление корпуса Мэта.")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Всё собрать и напечатать; не писать файлы, не звать claude, не слать TG.")
+                        help="Всё собрать и напечатать; не писать файлы, не звать Codex, не слать TG.")
     parser.add_argument("--bootstrap", action="store_true",
                         help="Засеять state текущим состоянием источников и выйти.")
     parser.add_argument("--max-videos", type=int, default=MAX_VIDEOS_PER_RUN,
@@ -1054,10 +1036,10 @@ def main() -> int:
 
     if args.dry_run:
         _print_dry_run(videos, github, prompt, errors)
-        log("=== конец (dry-run: файлы не тронуты, claude не вызван, TG не отправлен) ===")
+        log("=== конец (dry-run: файлы не тронуты, Codex не вызван, TG не отправлен) ===")
         return 0
 
-    answer = run_claude(prompt)
+    answer = run_codex(prompt)
     body, bullets = split_distillation(answer) if answer else ("", [])
     delta_lines: Optional[int] = None
     if body:
@@ -1069,7 +1051,7 @@ def main() -> int:
             log(f"дельта: запись упала: {type(exc).__name__}: {exc}")
             body = ""
     else:
-        errors.append("claude не вернул дистилляцию — дельта не дополнена")
+        errors.append("Codex не вернул дистилляцию — дельта не дополнена")
 
     # Sha двигаем только если дистилляция реально легла в дельту: иначе эти
     # коммиты просто исчезли бы из корпуса. Не легла — на следующей неделе
@@ -1116,8 +1098,8 @@ def _print_dry_run(
         for section in github.changelog_sections:
             print(f"  • {section.splitlines()[0]}")
 
-    print(f"\nВ claude ушёл бы промпт на {len(prompt)} символов "
-          f"(модель {CLAUDE_MODEL}, один вызов, инструменты запрещены).")
+    print(f"\nВ Codex ушёл бы промпт на {len(prompt)} символов "
+          f"(модель {CODEX_MODEL or 'default'}, один вызов, инструменты запрещены).")
     print(f"В дельту {DELTA_FILE.name} ушла бы датированная секция "
           f"{datetime.now().strftime('%Y-%m-%d')} с разбором этих материалов.")
     if DELTA_FILE.exists():
@@ -1127,7 +1109,7 @@ def _print_dry_run(
         print(f"Дельта-файла ещё нет — он был бы создан с шапкой-контрактом.")
 
     sample = build_report(
-        videos, github, ["<буллеты от claude>"], errors, None, distilled=True
+        videos, github, ["<буллеты от Codex>"], errors, None, distilled=True
     )
     print("\n────────── ОТЧЁТ, который ушёл бы в TG ──────────")
     print(sample)

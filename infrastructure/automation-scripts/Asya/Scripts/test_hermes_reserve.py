@@ -301,3 +301,49 @@ def test_copies_identical():
 def test_unknown_toolsets_warning_stripped(reserve, tmp_path):
     reserve.hermes_bin, _ = fake_hermes(tmp_path, reply="Warning: Unknown toolsets: mcp-gcal\nготово")
     assert run(reserve.run_hermes("p")) == ("готово", None)
+
+
+MARCO_1030 = [  # сессия 20261030_134053_0af4d6: ответ, потом два хода verify-on-stop
+    ("user", "[Резервный режим…] когда билеты на Скриптонита?", None),
+    ("assistant", "", '[{"name": "read_file"}]'),
+    ("tool", '{"content": "..."}', None),
+    ("assistant", "", '[{"name": "patch"}]'),
+    ("tool", '{"success": true}', None),
+    ("assistant", "Похоже, продажа уже открылась.\n• ShowGo.uz, от 300 000 сумов", None),
+    ("assistant", "", '[{"name": "read_file"}]'),
+    ("tool", '{"content": "..."}', None),
+    ("assistant", "Правка проверена настолько, насколько это возможно без оболочки.", None),
+    ("assistant", "", '[{"name": "read_file"}]'),
+    ("tool", '{"content": "..."}', None),
+    ("assistant", "Повторный прогон невозможен по той же причине.", None),
+]
+
+
+def test_pick_reply_ignores_verify_turns():
+    assert hr.pick_reply(MARCO_1030).startswith("Похоже, продажа уже открылась.")
+
+
+def test_pick_reply_after_last_user_on_resume():
+    rows = [("user", "старый", None), ("assistant", "старый ответ", None)] + MARCO_1030
+    assert hr.pick_reply(rows).startswith("Похоже")
+    assert hr.pick_reply([("user", "x", None), ("assistant", "", "[{}]")]) == ""
+
+
+def test_reply_taken_from_state_db(reserve, tmp_path):
+    import sqlite3
+    os.makedirs(reserve.hermes_home, exist_ok=True)
+    con = sqlite3.connect(os.path.join(reserve.hermes_home, "state.db"))
+    con.execute("create table messages (id integer primary key, session_id text, role text, "
+                "content text, tool_calls text, active integer default 1)")
+    con.executemany("insert into messages (session_id, role, content, tool_calls) "
+                    "values ('test_sid', ?, ?, ?)", MARCO_1030)
+    con.commit()
+    con.close()
+    reserve.hermes_bin, _ = fake_hermes(tmp_path, reply="Повторный прогон невозможен по той же причине.")
+    text, err = run(reserve.run_hermes("p"))
+    assert err is None and text.startswith("Похоже, продажа уже открылась.")
+
+
+def test_verify_on_stop_disabled(reserve):
+    assert reserve.config()["agent"]["verify_on_stop"] is False
+    assert reserve.env()["HERMES_VERIFY_ON_STOP"] == "0"

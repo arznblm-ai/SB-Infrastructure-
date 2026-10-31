@@ -305,3 +305,87 @@ def test_media_target_path_and_cleanup(tmp_path):
     assert media_intake.count_inbox(inbox) == 1
     removed = media_intake.cleanup_inbox(30, today=NOW.date(), inbox=inbox)
     assert removed == 1 and sorted(os.listdir(inbox)) == ["2026-10-22"]
+
+
+def test_turn_prompt_with_vision_text():
+    rec = rb.build_record("anton", "обед", 7, media=[{"rel": "inbox/2026-10-22/7-photo.jpg"}], dt=NOW)
+    p = rb.build_turn_prompt([rec], "anton", NOW, PROFILES, TODAY, [], "/data", vision_text="фото 1: гречка 150 г")
+    assert "открой инструментом Read" not in p
+    assert "- фото 1: inbox/2026-10-22/7-photo.jpg" in p and "фото 1: гречка 150 г" in p
+    assert "инструментами НЕ открывай" in p
+
+
+def test_parse_vision_output():
+    assert rb.parse_vision_output('шум\n{"ok": true, "text": " разбор "}\n') == "разбор"
+    assert rb.parse_vision_output('{"ok": false, "error": "x"}') is None
+    assert rb.parse_vision_output('{"ok": true, "text": ""}') is None
+    assert rb.parse_vision_output("") is None and rb.parse_vision_output("не json") is None
+
+
+def test_batch_images(tmp_path):
+    (tmp_path / "inbox").mkdir()
+    (tmp_path / "inbox" / "1-photo.jpg").write_bytes(b"x")
+    recs = [{"media": [{"rel": "inbox/1-photo.jpg"}, {"rel": "inbox/missing.jpg"}, {"rel": "inbox/1-photo.jpg"}]},
+            {"media": []}, {}]
+    assert rb.batch_images(recs, str(tmp_path)) == [str(tmp_path / "inbox" / "1-photo.jpg")]
+
+
+def test_pre_described_hides_images_and_vision(tmp_path):
+    img = tmp_path / "a.jpg"
+    img.write_bytes(b"x")
+    r = rb.RockyReserve("ROCKYT", str(tmp_path / "e.json"), str(tmp_path / "h"), str(tmp_path),
+                        read_roots=[str(tmp_path)], toolsets=["file", "vision"])
+    assert r.images_in("смотри %s" % img) and "vision" in r.toolsets_for()
+    tok = rb._PRE_DESCRIBED.set(True)
+    try:
+        assert r.images_in("смотри %s" % img) == [] and r.toolsets_for() == ["file"]
+    finally:
+        rb._PRE_DESCRIBED.reset(tok)
+
+
+def test_hermes_expected(monkeypatch, tmp_path):
+    r = rb.RockyReserve("ROCKYT", str(tmp_path / "e.json"), str(tmp_path / "h"), str(tmp_path),
+                        read_roots=[str(tmp_path)])
+    monkeypatch.setenv("ROCKYT_PRIMARY_ENGINE", "hermes")
+    assert rb.hermes_expected("фото", r) and not rb.hermes_expected("клод посчитай", r)
+    monkeypatch.setenv("ROCKYT_PRIMARY_ENGINE", "claude")
+    assert not rb.hermes_expected("фото", r)
+    monkeypatch.setenv("ROCKYT_FORCE_ENGINE", "hermes")
+    assert rb.hermes_expected("фото", r)
+
+
+# --- блок actions в нештатном формате (кейс 30.10: Hermes без fence) ------------
+_MEAL = '{"op": "add_meal", "who": "anton", "items": ["скир ~200 мл"], "kcal": 120, "p": 20, "f": 1, "c": 13}'
+
+
+def test_extract_actions_unfenced_block():
+    clean, actions, err = rb.extract_actions("Записал скир.\n\nrocky-actions\n[\n  %s\n]" % _MEAL)
+    assert err is None and len(actions) == 1 and actions[0]["kcal"] == 120
+    assert "rocky-actions" not in clean and "add_meal" not in clean and clean == "Записал скир."
+    clean, actions, _ = rb.extract_actions("ок\nrocky-actions: %s\nхвост" % _MEAL)
+    assert len(actions) == 1 and clean == "ок\n\nхвост"
+
+
+def test_extract_actions_other_fence_labels():
+    for fence in ("```json\n%s\n```", "```\n[%s]\n```", "rocky-actions\n```json\n[%s]\n```"):
+        clean, actions, err = rb.extract_actions("Записал.\n" + fence % _MEAL)
+        assert err is None and len(actions) == 1, fence
+        assert "add_meal" not in clean and "rocky-actions" not in clean and clean == "Записал."
+    clean, actions, _ = rb.extract_actions("пример\n```\nprint(1)\n```")
+    assert actions is None and "print(1)" in clean  # обычный код не трогаем
+
+
+def test_extract_actions_unfenced_broken_json_stripped_and_logged():
+    clean, actions, err = rb.extract_actions('Записал.\nrocky-actions\n[{"op": "add_meal", oops')
+    assert actions is None and "не JSON" in err and "oops" in err
+    assert clean == "Записал." and "op" not in clean
+
+
+def test_hermes_reply_path_unfenced_block_applied(tmp_path):
+    rows = [("user", "у меня такой же завтрак + скир", None),
+            ("assistant", "", '[{"name": "read_file"}]'),
+            ("tool", "{}", None),
+            ("assistant", "Антон, записал скир.\n\nrocky-actions\n[\n  %s\n]" % _MEAL, None)]
+    reply = rb.hermes_reserve.pick_reply(rows)
+    text, outcome = rb.handle_reply(reply, NOW, str(tmp_path))
+    assert text == "Антон, записал скир." and outcome["applied"] == ["add_meal m-20261022-1"]
