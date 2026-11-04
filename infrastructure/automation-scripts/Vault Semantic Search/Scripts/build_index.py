@@ -9,6 +9,7 @@ repeat runs are fast. Never writes inside the vault.
 import sys
 import time
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,8 @@ import common as C  # noqa: E402
 
 
 def main():
+    # This is a background maintenance task; leave CPU time for interactive work.
+    os.nice(10)
     cfg = C.load_config()
     t0 = time.time()
 
@@ -78,11 +81,12 @@ def main():
         uniq_hashes = list(uniq.keys())
         uniq_texts = list(uniq.values())
 
-        emb = C.Embedder(cfg)
+        emb = C.Embedder(cfg, threads=2)
         print(f"[index] model:           {emb.model_name}")
         print("[index] (first run downloads the model once, then fully offline)")
 
-        B = 256
+        # Large multilingual-e5 batches can exhaust the memory of a 16 GB Mac.
+        B = 4
         for i in range(0, len(uniq_texts), B):
             vecs = emb.embed(uniq_texts[i:i + B], is_query=False)
             for h, v in zip(uniq_hashes[i:i + B], vecs):

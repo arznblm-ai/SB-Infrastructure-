@@ -113,13 +113,13 @@ def l2_normalize(arr):
 class Embedder:
     """Thin wrapper over fastembed. e5 models get query:/passage: prefixes."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, threads=None):
         from fastembed import TextEmbedding
 
         self.model_name = cfg["model_name"]
         os.makedirs(cfg["model_cache_dir"], exist_ok=True)
         self.model = TextEmbedding(
-            model_name=self.model_name, cache_dir=cfg["model_cache_dir"]
+            model_name=self.model_name, cache_dir=cfg["model_cache_dir"], threads=threads
         )
         self.is_e5 = "e5" in self.model_name.lower()
 

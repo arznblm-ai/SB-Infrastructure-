@@ -126,6 +126,34 @@ def test_turn_prompt_onboarding_marker_for_empty_author():
     assert "норма не задана" in p
 
 
+def test_meal_history_uses_only_authors_live_past_meals_and_keeps_them_out_of_totals(tmp_path):
+    data = str(tmp_path)
+    old = {"id": "m-20261021-1", "kind": "meal", "who": "anton", "items": ["каша 200 г"],
+           "kcal": 320, "note": "уточнил порцию"}
+    journal.write_entries("2026-10-21", [old, {**old, "who": "ralina", "items": ["чужое блюдо"]},
+                                          {**old, "deleted": True, "items": ["удалённое"]}], data)
+    journal.write_entries("2026-10-22", [{**old, "items": ["сегодняшнее"]}], data)
+    journal.write_entries("2026-07-23", [{**old, "items": ["слишком старое"]}], data)
+    history = rb.recent_meal_history("anton", NOW, data)
+    assert history == [("2026-10-21", old)]
+    p = rb.build_turn_prompt([], "anton", NOW, PROFILES, TODAY, [], data, meal_history=history)
+    assert "каша 200 г" in p and "уточнил порцию" in p
+    assert "чужое блюдо" not in p and "удалённое" not in p and "слишком старое" not in p
+    assert "400 из 2100" in p and "Не добавляй прошлые блюда" in p
+    vision = rb.build_turn_prompt([], "anton", NOW, PROFILES, TODAY, [], data,
+                                  vision_text="еда", meal_history=history)
+    assert "каша 200 г" in vision
+
+
+def test_meal_history_is_bounded_and_newest_first(tmp_path):
+    entries = [{"kind": "meal", "who": "anton", "items": [str(i)], "kcal": 1}
+               for i in range(rb.MEAL_HISTORY_LIMIT + 5)]
+    journal.write_entries("2026-10-21", entries, str(tmp_path))
+    history = rb.recent_meal_history("anton", NOW, str(tmp_path))
+    assert len(history) == rb.MEAL_HISTORY_LIMIT
+    assert history[0][1]["items"] == [str(rb.MEAL_HISTORY_LIMIT + 4)]
+
+
 def test_daily_and_weekly_prompts():
     p = rb.build_daily_prompt(NOW, PROFILES, TODAY, [], "/data")
     assert "Тип запуска: daily" in p and "Итог дня: Антон" in p and "Итог дня: Ралина" in p
@@ -206,18 +234,20 @@ def test_split_message():
 # --- расписание и состояние ------------------------------------------------
 def test_due_jobs():
     st = rb.default_state()
-    assert rb.due_jobs(datetime(2026, 10, 22, 20, 59, tzinfo=journal.MSK), st) == []
-    assert rb.due_jobs(datetime(2026, 10, 22, 21, 0, tzinfo=journal.MSK), st) == [("daily", "2026-10-22")]
-    assert rb.due_jobs(datetime(2026, 10, 22, 23, 30, tzinfo=journal.MSK), st) == []  # поздно догонять
+    assert rb.due_jobs(datetime(2026, 10, 22, 21, 0, tzinfo=journal.MSK), st) == []
+    assert rb.due_jobs(datetime(2026, 10, 22, 22, 59, tzinfo=journal.MSK), st) == []
+    assert rb.due_jobs(datetime(2026, 10, 22, 23, 0, tzinfo=journal.MSK), st) == [("daily", "2026-10-22")]
+    assert rb.due_jobs(datetime(2026, 10, 22, 23, 59, tzinfo=journal.MSK), st) == [("daily", "2026-10-22")]
+    assert rb.due_jobs(datetime(2026, 10, 23, 0, 0, tzinfo=journal.MSK), st) == []
     st["daily_sent"] = "2026-10-22"
-    assert rb.due_jobs(datetime(2026, 10, 22, 21, 30, tzinfo=journal.MSK), st) == []
+    assert rb.due_jobs(datetime(2026, 10, 22, 23, 30, tzinfo=journal.MSK), st) == []
     mon = datetime(2026, 10, 26, 9, 0, tzinfo=journal.MSK)
     assert rb.due_jobs(mon, st) == [("weekly", "2026-W43")]
     st["weekly_sent"] = "2026-W43"
     assert rb.due_jobs(mon, st) == []
     assert rb.due_jobs(datetime(2026, 10, 27, 9, 0, tzinfo=journal.MSK), rb.default_state()) == []
-    # UTC-время пересчитывается в МСК: 18:00 UTC = 21:00 МСК
-    assert rb.due_jobs(datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc), rb.default_state())
+    # UTC-время пересчитывается в МСК: 20:00 UTC = 23:00 МСК
+    assert rb.due_jobs(datetime(2026, 10, 22, 20, 0, tzinfo=timezone.utc), rb.default_state()) == [("daily", "2026-10-22")]
 
 
 def test_state_roundtrip(tmp_path):
