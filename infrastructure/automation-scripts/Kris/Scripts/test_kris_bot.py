@@ -343,6 +343,10 @@ def test_claude_cmd_has_no_skip_permissions_and_whitelists_tools():
     assert cmd[cmd.index("--allowedTools") + 1] == "Read,Write,Edit,Glob,Grep"
     assert "Bash" not in cmd[cmd.index("--allowedTools") + 1]
     assert cmd[cmd.index("--add-dir") + 1] == kb.MEMORY_DIR
+    assert kb.ASYA_MEMORY_DIR in cmd
+    assert "Edit(//root/second-brain/infrastructure/Asya/memory/**)" in cmd[cmd.index("--disallowedTools") + 1]
+    assert kb.ASYA_MEMORY_DIR in kb.RESERVE.read_roots
+    assert kb.ASYA_MEMORY_DIR not in kb.RESERVE.write_roots
     assert "--resume" not in cmd
 
 

@@ -385,7 +385,8 @@ def test_claude_cmd_deny_rules_cover_private_zones():
         "Read(//root/second-brain/context/psychology/**)",
         "Read(//root/second-brain/context/archive/**)",
         "Read(//root/second-brain/transcripts/telegram/**)",
-        "Read(//root/second-brain/infrastructure/Kris/memory/**)",
+        "Read(//root/second-brain/infrastructure/Kris/memory/knowledge/**)",
+        "Read(//root/second-brain/infrastructure/Kris/memory/estimates/**)",
         "Read(//**/.env)",
         "Read(//**/*.env)",
         "Read(//root/.config/**)",
@@ -413,7 +414,7 @@ def test_mcp_json_points_to_vps_servers():
     with open(os.path.join(ROOT, "config", "mcp.json"), encoding="utf-8") as f:
         servers = json.load(f)["mcpServers"]
     assert servers["gcal"] == {"command": "/root/tools/gcal-mcp/venv/bin/python", "args": ["/root/tools/gcal-mcp/server.py"]}
-    assert servers["todoist"] == {"command": "/root/tools/todoist-mcp/venv/bin/python", "args": ["/root/tools/todoist-mcp/server.py"]}
+    assert servers["todoist"] == {"command": "/root/tools/todoist-mcp/venv/bin/python", "args": ["/root/tools/todoist-mcp/server.py"], "env": {"TODOIST_ASYA_REVIEW": "1"}}
 
 
 # ---------------------------------------------------------------------------

@@ -205,7 +205,7 @@ def allowed_tools(vault):
 
 def deny_rules(vault, home_dir="/root"):
     """Как у Аси (приватные зоны, секреты, Bash/Web) + календарь целиком."""
-    return asya_bot.deny_rules(vault, home_dir) + ["mcp__gcal"]
+    return asya_bot.deny_rules(vault, home_dir) + ["Read(%s/**)" % asya_bot._abs_rule(os.path.join(vault, "infrastructure/Kris/memory")), "mcp__gcal"]
 
 
 def settings_payload(vault="/root/second-brain", home_dir="/root"):

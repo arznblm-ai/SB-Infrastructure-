@@ -1,0 +1,14 @@
+[Unit]
+Description=Asya daily task review
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=HOME=/root
+Environment=ASYA_VAULT_DIR=/root/second-brain
+EnvironmentFile=/root/.config/asya/.env
+ExecStart=/root/tools/todoist-mcp/venv/bin/python /opt/asya/task_review.py
+TimeoutStartSec=1500
+Nice=10

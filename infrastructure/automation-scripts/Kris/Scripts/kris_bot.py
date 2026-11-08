@@ -67,6 +67,7 @@ WORKSPACE = os.path.join(KRIS_HOME, "workspace")
 MEMORY_DIR = os.environ.get(
     "KRIS_MEMORY_DIR", "/root/second-brain/infrastructure/Kris/memory"
 )
+ASYA_MEMORY_DIR = os.environ.get("KRIS_ASYA_MEMORY_DIR", "/root/second-brain/infrastructure/Asya/memory")
 
 STATE_DIR = os.environ.get("KRIS_STATE_DIR", "/root/.config/kris")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -589,6 +590,10 @@ def build_claude_cmd(prompt: str, session_id=None) -> list:
         ALLOWED_TOOLS,
         "--add-dir",
         MEMORY_DIR,
+        "--add-dir",
+        ASYA_MEMORY_DIR,
+        "--disallowedTools",
+        "Edit(//%s/**),Write(//%s/**)" % (ASYA_MEMORY_DIR.lstrip("/"), ASYA_MEMORY_DIR.lstrip("/")),
     ]
     if session_id:
         cmd += ["--resume", session_id]
@@ -702,7 +707,7 @@ async def run_claude_resume(prompt: str, session_id):
 # Резерв Hermes (ADR-034): права как у Claude - rw workspace и память, без Bash и сети.
 RESERVE = hermes_reserve.Reserve(
     "KRIS", os.path.join(STATE_DIR, "engine.json"), os.path.join(KRIS_HOME, "hermes"), WORKSPACE,
-    read_roots=[WORKSPACE, MEMORY_DIR], write_roots=[WORKSPACE, MEMORY_DIR],
+    read_roots=[WORKSPACE, MEMORY_DIR, ASYA_MEMORY_DIR], write_roots=[WORKSPACE, MEMORY_DIR],
     deny=["/root/.config", "/root/.claude", "/root/.ssh", "/root/.hermes"],
     deny_globs=["*.env", ".env"],
     toolsets=["file", "vision"], timeout=CLAUDE_TIMEOUT, logger=logger)
