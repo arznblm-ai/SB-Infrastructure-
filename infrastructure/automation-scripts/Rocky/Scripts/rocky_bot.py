@@ -351,7 +351,7 @@ def read_chatlog_tail(limit=CHATLOG_TAIL_LINES, dt=None, chatlog_dir=None):
                 content = f.read()
         except OSError:
             continue
-        lines.extend(ln for ln in content.splitlines() if ln.startswith("- "))
+        lines.extend("[%s] %s" % (day, ln) for ln in content.splitlines() if ln.startswith("- "))
     return lines[-limit:] if limit else lines
 
 
@@ -368,8 +368,10 @@ UNTRUSTED = (
 
 def format_time_block(dt=None, run_type="message"):
     local = journal.msk(dt or now_utc())
-    return "Тип запуска: %s\nСейчас: %s МСК, %s." % (
-        run_type, local.strftime("%Y-%m-%d %H:%M"), WEEKDAYS_RU[local.weekday()]
+    return "Тип запуска: %s\nСейчас: %s МСК, %s. Сегодня %s; вчера %s; завтра %s." % (
+        run_type, local.strftime("%Y-%m-%d %H:%M"), WEEKDAYS_RU[local.weekday()],
+        local.strftime("%Y-%m-%d"), (local - timedelta(days=1)).strftime("%Y-%m-%d"),
+        (local + timedelta(days=1)).strftime("%Y-%m-%d")
     )
 
 
@@ -446,6 +448,11 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
                          "## Сегодняшний журнал: %s (%s), с id записей" % (journal.WHO_RU[who], day)),
         format_meal_history(who, meal_history),
     ]
+    yesterday = (journal.msk(dt or now_utc()).date() - timedelta(days=1)).isoformat()
+    yesterday_entries = journal.read_entries(yesterday, data_dir or DATA_DIR)
+    for person in (who,):
+        parts.append(format_day_block(person, yesterday_entries, profiles.get(person) or {}, yesterday,
+                                       "## Вчерашний журнал: %s (%s)" % (journal.WHO_RU[person], yesterday)))
     tail = list(chatlog_tail or [])
     if tail:
         parts.append("## Хвост чата (последние %d строк)\n%s" % (len(tail), "\n".join(tail)))
@@ -484,14 +491,16 @@ def build_daily_prompt(dt=None, profiles=None, entries=None, chatlog_tail=None, 
     for who in journal.WHO:
         parts.append(format_day_block(who, entries, profiles.get(who) or {}, day,
                                       "## Итог дня: %s (%s)" % (journal.WHO_RU[who], day)))
+        parts.append(format_meal_history(who, recent_meal_history(who, dt or now_utc(), data_dir or DATA_DIR)))
     tail = list(chatlog_tail or [])
     if tail:
         parts.append("## Хвост чата (последние %d строк)\n%s" % (len(tail), "\n".join(tail)))
     parts.append(_paths_block(data_dir))
     parts.append(UNTRUSTED)
     parts.append(
-        "Напиши итог дня одним сообщением: блок на каждого (ккал и БЖУ против нормы, одна похвала, "
-        "одна подсказка на завтра; пусто за день - короткий тёплый пинок). "
+        "Напиши итог дня одним сообщением: блок на каждого (что записано, ккал и БЖУ против цели, "
+        "один конкретный совет по знакомым блюдам этого человека). Журнал может быть неполным; "
+        "не называй записанные суммы фактическим потреблением, голоданием или пропуском еды. "
         "Блока rocky-actions нет. NO_REPLY не используй."
     )
     return "\n\n".join(parts)
@@ -503,11 +512,13 @@ def build_weekly_prompt(dt=None, profiles=None, weekly_text="", week=None, data_
         format_time_block(dt, "weekly"),
         format_profiles_block(profiles),
         "## Неделя %s (посчитано кодом)\n%s" % (week or "?", weekly_text),
+        *[format_meal_history(who, recent_meal_history(who, dt or now_utc(), data_dir or DATA_DIR)) for who in journal.WHO],
         _paths_block(data_dir),
         UNTRUSTED,
-        "Напиши недельную аналитику по каждому: средние ккал и белок против нормы, дни в норме, "
-        "тренировки, вес и тренд; затем 2-3 конкретных совета на неделю. Если тренд веса расходится "
-        "с целью - предложи пересчитать норму (применишь только по «да»). "
+        "Напиши недельную аналитику по каждому: среднее записанное по дням с записями, "
+        "записанные тренировки и замеры веса. Записи могут быть неполными: не делай вывод о голодании "
+        "или отсутствии тренировок; два близких замера не доказывают тренд. Дай 1-2 конкретных совета "
+        "из известных продуктов каждого. Норму меняй только после согласия. "
         "Блока rocky-actions нет. NO_REPLY не используй.",
     ]
     return "\n\n".join(parts)
@@ -936,6 +947,35 @@ def handle_reply(reply, now, data_dir=None):
     elif actions:
         outcome = journal.apply_actions(actions, now, data_dir or DATA_DIR)
     text = None if (is_no_reply(clean) or not clean.strip()) else clean
+    if text and not outcome["applied"] and not outcome["errors"] and re.search(r"(?<!не )\b(?:записал|перен[её]с|исправил|поправил|удалил)\b", text, re.I):
+        outcome["errors"].append("ответ обещает запись, но действий нет")
+    if outcome["errors"]:
+        text = (text or "") + "\nНе получилось сохранить часть изменений в журнале. Проверь запись или попроси меня повторить."
+    if text and outcome["applied"]:
+        changed = set()
+        for raw_action in actions or []:
+            action, err = journal.validate_action(raw_action)
+            if err or not action:
+                continue
+            op = action.get("op")
+            if op in ("add_meal", "update_entry", "delete_entry", "move_entry"):
+                old_day = journal.day_from_id(str(action.get("id") or ""))
+                people = {action.get("who")} if action.get("who") in journal.WHO else set()
+                if old_day:
+                    old = journal.read_entries(old_day, data_dir or DATA_DIR, include_deleted=True)
+                    people.update(e.get("who") for e in old if e.get("id") == action.get("id") and e.get("who") in journal.WHO)
+                for day in (old_day, action.get("day") or (journal.day_of(now) if op == "add_meal" else None)):
+                    if day:
+                        changed.update((day, person) for person in people)
+        if changed:
+            lines = []
+            for day, person in sorted(changed):
+                entries = journal.read_entries(day, data_dir or DATA_DIR)
+                totals = journal.day_totals(entries, person)
+                lines.append("%s, %s: записано %s ккал, Б %s · Ж %s · У %s" %
+                             (journal.WHO_RU[person], day, totals["kcal"], totals["p"], totals["f"], totals["c"]))
+            if lines:
+                text += "\n\nСверка журнала (записи могут быть неполными):\n" + "\n".join(lines)
     return text, outcome
 
 

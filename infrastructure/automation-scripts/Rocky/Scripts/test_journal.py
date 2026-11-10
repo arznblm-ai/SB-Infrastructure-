@@ -141,6 +141,30 @@ def test_day_boundary_is_moscow(tmp_path):
     assert journal.read_entries("2026-10-23", str(tmp_path))[0]["id"] == "m-20261023-1"
 
 
+def test_add_yesterday_and_move_preserve_totals_and_history(tmp_path):
+    data = str(tmp_path)
+    res = journal.apply_actions([meal(day="2026-10-21")], NOW, data)
+    assert not res["errors"]
+    assert journal.day_totals(journal.read_entries("2026-10-21", data), "anton")["kcal"] == 620
+    assert not journal.read_entries("2026-10-22", data)
+    journal.apply_actions([meal(who="ralina", kcal=400)], NOW, data)
+    res = journal.apply_actions([{"op": "move_entry", "id": "m-20261022-1", "day": "2026-10-21"}], NOW, data)
+    assert not res["errors"]
+    moved = journal.read_entries("2026-10-21", data)[1]
+    assert moved["who"] == "ralina" and moved["moved_from"] == "m-20261022-1"
+    assert "время неизвестно" in journal.format_entry(moved)
+    assert not journal.read_entries("2026-10-22", data)
+    assert journal.apply_actions([{"op": "move_entry", "id": "m-20261022-1", "day": "2026-10-21"}], NOW, data)["errors"]
+    assert len(journal.read_entries("2026-10-21", data)) == 2
+
+
+def test_historical_dates_reject_future_and_outside_window(tmp_path):
+    data = str(tmp_path)
+    assert journal.apply_actions([meal(day="2026-10-23")], NOW, data)["errors"]
+    assert journal.apply_actions([meal(day="2026-10-01")], NOW, data)["errors"]
+    assert not journal.read_entries("2026-10-22", data)
+
+
 # --- профили ---------------------------------------------------------------
 def test_set_profile_merges_atomically(tmp_path):
     data = str(tmp_path)

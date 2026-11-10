@@ -91,7 +91,7 @@ def test_chatlog_append_and_tail(tmp_path):
     for i in range(50):
         rb.append_chatlog([rb.format_chatlog_line("Ралина", "msg %d" % i, NOW)], NOW, d)
     tail = rb.read_chatlog_tail(40, NOW, d)
-    assert len(tail) == 40 and tail[-1].endswith("msg 49") and tail[0].startswith("- 13:05 Ралина")
+    assert len(tail) == 40 and tail[-1].endswith("msg 49") and tail[0].startswith("[2026-10-22] - 13:05 Ралина")
     assert os.path.exists(os.path.join(d, "2026-10-22.md"))
     assert rb.format_chatlog_line("x", "   ") == ""
 
@@ -201,7 +201,12 @@ def test_handle_reply_applies_and_strips(tmp_path):
 
 def test_handle_reply_broken_block_writes_nothing_but_text_goes(tmp_path):
     text, outcome = rb.handle_reply("Записал\n```rocky-actions\n[oops\n```", NOW, str(tmp_path))
-    assert text == "Записал" and outcome["errors"] and not outcome["applied"]
+    assert "Не получилось сохранить" in text and outcome["errors"] and not outcome["applied"]
+
+
+def test_false_claim_of_recording_is_reported(tmp_path):
+    text, outcome = rb.handle_reply("Перенес ужин на вчера.", NOW, str(tmp_path))
+    assert outcome["errors"] and "Не получилось сохранить" in text
     assert journal.read_entries("2026-10-22", str(tmp_path)) == []
 
 
@@ -418,4 +423,4 @@ def test_hermes_reply_path_unfenced_block_applied(tmp_path):
             ("assistant", "Антон, записал скир.\n\nrocky-actions\n[\n  %s\n]" % _MEAL, None)]
     reply = rb.hermes_reserve.pick_reply(rows)
     text, outcome = rb.handle_reply(reply, NOW, str(tmp_path))
-    assert text == "Антон, записал скир." and outcome["applied"] == ["add_meal m-20261022-1"]
+    assert text.startswith("Антон, записал скир.") and "записано 120 ккал" in text and outcome["applied"] == ["add_meal m-20261022-1"]

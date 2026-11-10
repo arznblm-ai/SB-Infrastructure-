@@ -33,7 +33,7 @@ ID_RE = re.compile(r"^([mwg])-(\d{8})-(\d+)$")
 EDIT_WINDOW_DAYS = 7      # update/delete - только записи последних 7 дней
 NORM_TOLERANCE = 0.10     # «день в норме» = ккал в пределах ±10% от target_kcal
 
-OPS = ("add_meal", "add_workout", "add_weight", "update_entry", "delete_entry", "set_profile")
+OPS = ("add_meal", "add_workout", "add_weight", "update_entry", "delete_entry", "move_entry", "set_profile")
 ADD_OPS = {"add_meal": "meal", "add_workout": "workout", "add_weight": "weight"}
 
 # Спецификации полей: ("num", lo, hi) | ("str", maxlen) | ("list", max_items) | ("enum", {...})
@@ -308,15 +308,27 @@ def validate_action(raw):
         missing = [k for k in REQUIRED[kind] if k not in fields]
         if missing:
             return None, "%s: нет поля %s" % (op, ",".join(missing))
-        return {"op": op, "kind": kind, "who": who, "fields": fields}, None
+        day = raw.get("day")
+        if day is not None:
+            try:
+                day = date.fromisoformat(str(day)).isoformat()
+            except ValueError:
+                return None, "%s: неверная дата" % op
+        return {"op": op, "kind": kind, "who": who, "fields": fields, "day": day}, None
 
-    if op in ("update_entry", "delete_entry"):
+    if op in ("update_entry", "delete_entry", "move_entry"):
         entry_id = str(raw.get("id") or "").strip()
         m = ID_RE.match(entry_id)
         if not m or day_from_id(entry_id) is None:
             return None, "%s: кривой id %r" % (op, raw.get("id"))
         if op == "delete_entry":
             return {"op": op, "id": entry_id}, None
+        if op == "move_entry":
+            try:
+                day = date.fromisoformat(str(raw.get("day"))).isoformat()
+            except ValueError:
+                return None, "move_entry: неверная дата"
+            return {"op": op, "id": entry_id, "day": day}, None
         kind = PREFIX_KIND[m.group(1)]
         raw_fields = raw.get("fields")
         if not isinstance(raw_fields, dict) or not raw_fields:
@@ -405,6 +417,35 @@ def delete_entry(entry_id, now, data_dir):
     return None, "нет записи %s" % entry_id
 
 
+def move_entry(entry_id, target_day, now, data_dir):
+    """Переносит запись между днями с новым id, сохраняя след и идемпотентность."""
+    old_day = day_from_id(entry_id)
+    if not old_day or not _within_window(old_day, now) or not _within_window(target_day, now):
+        return None, "дата вне окна правок"
+    if old_day == target_day:
+        return None, "запись уже в этом дне"
+    source = read_entries(old_day, data_dir, include_deleted=True)
+    entry = next((e for e in source if e.get("id") == entry_id), None)
+    if not entry or entry.get("deleted"):
+        return None, "запись не найдена или уже перенесена"
+    target = read_entries(target_day, data_dir, include_deleted=True)
+    moved = next((e for e in target if e.get("moved_from") == entry_id and not e.get("deleted")), None)
+    if not moved:
+        moved = dict(entry)
+        moved["id"] = next_id(entry["kind"], target_day, target)
+        moved["moved_from"] = entry_id
+        moved["original_ts"] = entry.get("ts")
+        moved["ts"] = target_day + "T12:00:00+03:00"
+        moved["time_unknown"] = True
+        target.append(moved)
+        write_entries(target_day, target, data_dir)
+    entry["deleted"] = True
+    entry["deleted_ts"] = msk(now).isoformat(timespec="seconds")
+    entry["moved_to"] = moved["id"]
+    write_entries(old_day, source, data_dir)
+    return moved, None
+
+
 def load_profiles(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -446,8 +487,22 @@ def apply_actions(actions, now, data_dir):
             continue
         op = action["op"]
         if op in ADD_OPS:
-            entry = add_entry(action["kind"], action["who"], action["fields"], now, data_dir)
+            day = action.get("day")
+            if day and not _within_window(day, now):
+                result["errors"].append("%s: дата вне окна правок" % op)
+                continue
+            event_time = msk(now) if not day or day == day_of(now) else datetime.combine(date.fromisoformat(day), datetime.min.time(), tzinfo=MSK).replace(hour=12)
+            fields = dict(action["fields"])
+            if day and day != day_of(now):
+                fields["time_unknown"] = True
+            entry = add_entry(action["kind"], action["who"], fields, event_time, data_dir)
             result["applied"].append("%s %s" % (op, entry["id"]))
+        elif op == "move_entry":
+            entry, err = move_entry(action["id"], action["day"], now, data_dir)
+            if err:
+                result["errors"].append("move_entry %s: %s" % (action["id"], err))
+            else:
+                result["applied"].append("move_entry %s -> %s" % (action["id"], entry["id"]))
         elif op == "update_entry":
             entry, err = update_entry(action["id"], action["fields"], now, data_dir)
             if err:
@@ -528,7 +583,7 @@ def _fmt_num(value):
 def format_entry(entry):
     """Строка записи для промпта и /today (с id - по нему модель правит)."""
     ts = str(entry.get("ts") or "")
-    hhmm = ts[11:16] if len(ts) >= 16 else "--:--"
+    hhmm = "время неизвестно" if entry.get("time_unknown") else (ts[11:16] if len(ts) >= 16 else "--:--")
     kind = entry.get("kind")
     eid = entry.get("id", "?")
     if kind == "meal":
@@ -680,7 +735,7 @@ def weekly_summary(entries_by_day, profiles, days):
                 "types": workouts_types,
             },
             "weights": weights,
-            "weight_trend": round(weights[-1][1] - weights[0][1], 1) if len(weights) >= 2 else None,
+        "weight_trend": round(weights[-1][1] - weights[0][1], 1) if len(weights) >= 2 else None,
         }
     return summary
 
@@ -707,7 +762,7 @@ def format_weekly_text(summary, days):
                 % (label, row["kcal"], row["p"], row["f"], row["c"], mark)
             )
         if s["logged_days"]:
-            avg_line = "  Среднее за %d дн.: %d ккал, Б %d" % (s["logged_days"], s["avg_kcal"], s["avg_p"])
+            avg_line = "  Среднее записанное за %d дн. с записями (дневник может быть неполным): %d ккал, Б %d" % (s["logged_days"], s["avg_kcal"], s["avg_p"])
             if tg.get("kcal"):
                 avg_line += " (норма %s ккал, Б %s)" % (_fmt_num(tg["kcal"]), _fmt_num(tg.get("p") or "?"))
             lines.append(avg_line)
@@ -722,7 +777,7 @@ def format_weekly_text(summary, days):
             types = ", ".join("%s ×%d" % (k, v) for k, v in sorted(w["types"].items()))
             lines.append("  Тренировок: %d, %d мин (%s)" % (w["count"], w["minutes"], types))
         else:
-            lines.append("  Тренировок: 0")
+            lines.append("  Записанных тренировок: 0 (не означает отсутствие тренировок)")
         if s["weights"]:
             ws = ", ".join("%s %s" % (date.fromisoformat(d).strftime("%d.%m"), _fmt_num(kg)) for d, kg in s["weights"])
             trend = s["weight_trend"]

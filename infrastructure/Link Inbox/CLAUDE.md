@@ -35,6 +35,7 @@ Link Inbox — автоматизация для Telegram-бота / канал�
 
 ## Workflow
 
+- **Тематические метки (с 2026-11-09, ADR-035).** Хэштег в сообщении со ссылкой (например `#smm`) сохраняется как есть в секции «Original Telegram Message» карточки — кода под метки нет. Потребитель метки — агент (`#smm` → Ника, `infrastructure/Nika/CLAUDE.md`), он грепает карточки. Ограничение: повторно присланный URL пропускается дедупом, метка не добавляется.
 0. **Вход через Гермеса (с 2026-08-19, ADR-023).** Гермес (VPS, MCP `link_intake.save_link`) кладёт JSON в очередь `resources/link-inbox/inbox/`; мак-процесс `telegram_link_bot.py::scan_inbox_queue()` — единственный писатель `state.json` — импортирует записи и гонит их через штатный конвейер, дайджест уходит токеном Гермеса в топик Saved. Старый бот @Saved Links остаётся fallback. Детали — `ARCHITECTURE.md` (§2b, §3) и `deploy/README.md`.
 1. `telegram_link_bot.py` слушает личные сообщения в Telegram bot через Bot API.
 2. Из каждого сообщения достаёт URL и сохраняет link card в `resources/link-inbox/links/`.
