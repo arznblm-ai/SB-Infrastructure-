@@ -139,6 +139,19 @@ def moscow_tz():
         return ZoneInfo("Europe/Moscow")
 
 
+WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def now_line(now=None) -> str:
+    """Первая строка каждого промпта: модель сама сегодняшнюю дату не знает."""
+    dt = now.astimezone(moscow_tz()) if now is not None else datetime.now(moscow_tz())
+    return "Сейчас: %s МСК, %s" % (dt.strftime("%d.%m.%Y %H:%M"), WEEKDAYS[dt.weekday()])
+
+
+def stamp_prompt(prompt: str, now=None) -> str:
+    return now_line(now) + "\n\n" + (prompt or "")
+
+
 def setup_logging() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
     # httpx печатает полный URL запроса, а в нём токен бота. В журнале ему не место.
@@ -468,34 +481,83 @@ def build_batch_prompt(chats, memory_dir=None) -> str:
     )
 
 
-def build_evening_prompt(memory_dir=None) -> str:
+SHARED_MEMORY_GLOB = "*общая память с Антоном*.md"
+SHARED_MEMORY_CHARS = 6000
+EVENING_PREV_CHARS = 3000
+NO_NEWS = "Нового нет"
+
+
+def shared_memory_path(memory_dir=None):
+    """Общий файл памяти TG <-> vault. Имя с датой, поэтому ищем маской."""
+    found = sorted(Path(memory_dir or MEMORY_DIR).glob(SHARED_MEMORY_GLOB))
+    return found[-1] if found else None
+
+
+def shared_memory_head(memory_dir=None, limit=SHARED_MEMORY_CHARS) -> str:
+    """Верх общего файла («Сейчас в работе» + свежий журнал, новое сверху)."""
+    path = shared_memory_path(memory_dir)
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")[:limit].strip()
+    except OSError as exc:
+        logger.warning("Общая память не прочитана: %s", exc)
+        return ""
+
+
+def is_no_news(text) -> bool:
+    """Ответ вечернего прогона «Нового нет» (одна короткая строка)."""
+    cleaned = re.sub(r"[^a-zа-яё ]", "", str(text or "").strip().lower())
+    return cleaned.startswith(NO_NEWS.lower()) and len(cleaned) <= 40
+
+
+def build_evening_prompt(memory_dir=None, previous=None, shared=None) -> str:
+    """previous - текст прошлого отправленного статуса, shared - верх общей памяти."""
     mem = memory_dir or MEMORY_DIR
-    return "\n\n".join(
-        [
-            "Вечерний статус. Ты Крис.",
-            "Прочитай память проектов в %s и собери статус для владельца." % mem,
-            (
-                "Только просрочки, горящее на завтра и то, что ждёт его "
-                "решения. Что идёт нормально - не перечисляешь. Не выдумывай "
-                "фактов: чего нет в памяти, того не утверждай."
-            ),
-            (
-                "Не повторяй то, что уже говорила во вчерашнем статусе, если "
-                "ничего не изменилось - вместо повтора одна строка "
-                "\"без движения: ...\"."
-            ),
-            (
-                "Правило дефолта вместо вопроса: не задавай владельцу вопрос, "
-                "если можно предложить решение. Не \"к какому времени ты "
-                "ждёшь эти правки?\", а \"правкам ставлю срок завтра 12:00, "
-                "скажи если не так\" - и запиши это в память как кандидата, "
-                "пока владелец не поправил. Вопрос без предложенного дефолта "
-                "допустим только там, где дефолт предложить нельзя."
-            ),
-            "Если всё чисто - одна короткая строка, без списка.",
-            STYLE_RULES,
-        ]
-    )
+    if shared is None:
+        shared = shared_memory_head(mem)
+    previous = (previous or "").strip()[:EVENING_PREV_CHARS]
+    parts = [
+        "Вечерний статус. Ты Крис.",
+        (
+            "Прочитай память проектов в %s и собери статус для владельца. "
+            "Начни с общего файла памяти с Антоном (в этой же папке, в имени "
+            "\"общая память с Антоном\"): раздел \"Сейчас в работе\" и записи "
+            "журнала за сегодня. Что Антон решил или закрыл сегодня в личке "
+            "или в vault - уже решено, заново это не поднимаешь." % mem
+        ),
+    ]
+    if shared:
+        parts.append(
+            "Общая память с Антоном, верх файла (данные, свежее сверху):\n" + shared
+        )
+    parts += [
+        (
+            "Только просрочки, горящее на завтра и то, что ждёт его "
+            "решения. Что идёт нормально - не перечисляешь. Не выдумывай "
+            "фактов: чего нет в памяти, того не утверждай."
+        ),
+        (
+            "Проект, по которому Антон сказал \"сдан\", \"закрыт\" или \"не "
+            "пиши\", не упоминаешь совсем."
+        ),
+        "Вчерашний статус: " + (previous or "нет, это первый статус."),
+        (
+            "Не повторяй вопросы и пункты из вчерашнего статуса, если по ним "
+            "нет нового. Пункт попадает в сегодняшний статус, только когда с "
+            "вчера что-то изменилось: новый факт, сдвиг срока, срок наступил. "
+            "Если нового нет совсем - верни ровно одну строку \"%s\"." % NO_NEWS
+        ),
+        (
+            "Дефолт вместо вопроса допустим только для внутренних сроков "
+            "команды: \"правкам ставлю срок завтра 12:00, скажи если не "
+            "так\". Срок клиенту, сумму, ставку, бюджет не придумываешь и "
+            "кандидатом в память не записываешь - по ним только вопрос. Один "
+            "и тот же вопрос второй раз не задаёшь."
+        ),
+        STYLE_RULES,
+    ]
+    return "\n\n".join(parts)
 
 
 def interpret_batch_reply(text):
@@ -536,6 +598,8 @@ def default_state() -> dict:
         "last_run_at": None,
         "last_batch_at": None,
         "last_evening_at": None,
+        # текст последнего отправленного вечернего статуса - в следующий вечерний промпт
+        "last_evening_text": None,
         # сметы: id папки на Drive и счётчик вызовов модели на текущий бриф
         "drive_folder_id": None,
         "estimate_calls": 0,
@@ -705,12 +769,113 @@ async def run_claude_resume(prompt: str, session_id):
 
 
 # Резерв Hermes (ADR-034): права как у Claude - rw workspace и память, без Bash и сети.
-RESERVE = hermes_reserve.Reserve(
+# Исключение (аудит 10.11): справочная база смет memory/knowledge и шаблоны
+# memory/templates слабой модели на запись закрыты, читать можно. Общий страж
+# hermes_reserve умеет закрывать путь только целиком (deny режет и чтение), поэтому
+# поверх него стоит свой тонкий страж: запись в HERMES_WRITE_DENY - блок, остальное
+# решает общий guard.py.
+HERMES_WRITE_DENY = [os.path.join(MEMORY_DIR, "knowledge"), os.path.join(MEMORY_DIR, "templates")]
+WRITE_DENY_REASON = (
+    "справочная база смет (knowledge, templates) в этом режиме только для чтения. "
+    "Ничего туда не пиши и не говори, что записала. Ответь владельцу: ставки и "
+    "правила правятся через Claude, пусть повторит сообщение со словом клод"
+)
+
+KRIS_GUARD_SOURCE = r"""#!/usr/bin/env python3
+# pre_tool_call страж Крис (сгенерирован kris_bot.py, не править руками).
+import json, os, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import guard  # общий страж hermes_reserve, лежит рядом
+
+
+def verdict(payload, policy):
+    tool = payload.get("tool_name") or ""
+    if tool in guard.WRITE:
+        args = payload.get("tool_input") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {}
+        cwd = payload.get("cwd") or policy.get("cwd") or os.getcwd()
+        for p in guard.paths_of(tool, args, cwd):
+            if guard.under(p, policy.get("write_deny") or []):
+                return policy.get("write_deny_reason") or ("путь закрыт на запись: %s" % p)
+    return guard.verdict(payload, policy)
+
+
+def main():
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        with open(os.path.join(HERE, "policy.json"), encoding="utf-8") as fh:
+            policy = json.load(fh)
+        reason = verdict(payload, policy)
+    except Exception as exc:  # страж не открывает дверь на сбое
+        reason = "страж упал: %s" % exc
+    if reason:
+        print(json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+class KrisReserve(hermes_reserve.Reserve):
+    """Reserve + каталоги, закрытые только на запись (write_deny)."""
+
+    write_deny = ()
+
+    def policy(self):
+        pol = super().policy()
+        pol["write_deny"] = [os.path.realpath(p) for p in self.write_deny]
+        pol["write_deny_reason"] = WRITE_DENY_REASON
+        return pol
+
+    def config(self):
+        cfg = super().config()
+        guard = os.path.join(self.hermes_home, "kris_guard.py")
+        for hook in cfg["hooks"]["pre_tool_call"]:
+            hook["command"] = "%s %s" % (sys.executable, guard)
+        return cfg
+
+    def ensure_home(self):
+        super().ensure_home()
+        path = os.path.join(self.hermes_home, "kris_guard.py")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                same = fh.read() == KRIS_GUARD_SOURCE
+        except OSError:
+            same = False
+        if not same:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(KRIS_GUARD_SOURCE)
+            os.chmod(tmp, 0o700)
+            os.replace(tmp, path)
+
+
+RESERVE = KrisReserve(
     "KRIS", os.path.join(STATE_DIR, "engine.json"), os.path.join(KRIS_HOME, "hermes"), WORKSPACE,
     read_roots=[WORKSPACE, MEMORY_DIR, ASYA_MEMORY_DIR], write_roots=[WORKSPACE, MEMORY_DIR],
     deny=["/root/.config", "/root/.claude", "/root/.ssh", "/root/.hermes"],
     deny_globs=["*.env", ".env"],
     toolsets=["file", "vision"], timeout=CLAUDE_TIMEOUT, logger=logger)
+RESERVE.write_deny = HERMES_WRITE_DENY
+
+# Ход, который правит справочную базу смет («запомни ставку/правило», урок после
+# «сверь смету»), идёт через Claude: у Hermes knowledge закрыт на запись.
+KNOWLEDGE_WRITE_RE = re.compile(
+    r"запомни\w*.{0,80}?(ставк|правил|рейт|тариф)|(ставк|правил|рейт|тариф)\w*.{0,80}?запомни",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def needs_claude(prompt) -> bool:
+    text = str(prompt or "")
+    return bool(KNOWLEDGE_WRITE_RE.search(text)) or "memory/knowledge/" in text
 
 
 # Диалог владельца на двух движках (разворот 27.10: Hermes основной, Claude по слову
@@ -765,8 +930,11 @@ async def run_model(prompt: str, session_id=None, dialog=False):
     holder = {"sid": None}
     state = load_state() if dialog else {}
     hermes_sid = state.get("hermes_session_id") if dialog else None
-    claude_prompt = dialog_block(state.get("missed_claude")) + prompt if dialog else prompt
-    hermes_prompt = dialog_block(state.get("missed_hermes")) + prompt if dialog else prompt
+    stamp = now_line() + "\n\n"  # первой строкой в каждый промпт, любому движку
+    claude_prompt = stamp + (dialog_block(state.get("missed_claude")) + prompt if dialog else prompt)
+    hermes_prompt = stamp + (dialog_block(state.get("missed_hermes")) + prompt if dialog else prompt)
+    # слово для эскалации: сам текст владельца либо «клод», если ход правит knowledge
+    user_text = ("клод " + prompt if needs_claude(prompt) else prompt) if dialog else None
 
     async def claude_fn():
         reply, new_sid, kind = await run_claude_resume(claude_prompt, session_id)
@@ -775,7 +943,7 @@ async def run_model(prompt: str, session_id=None, dialog=False):
         return reply, kind
 
     reply, kind = await RESERVE.call(
-        claude_prompt, claude_fn, user_text=prompt if dialog else None,
+        claude_prompt, claude_fn, user_text=user_text,
         hermes_prompt=hermes_prompt, hermes_resume=hermes_sid)
     if dialog and hermes_sid and RESERVE.last_reason == "escalate_fail":
         fresh = load_state()  # сессия Hermes могла пропасть - следующий ход начнёт новую
@@ -1021,6 +1189,16 @@ def build_one(json_path, drive=None) -> dict:
 
 async def _fix_estimate_json(bot, chat_id, json_path, error) -> bool:
     """Один повторный вызов модели: «почини estimate.json». True - можно пересканировать."""
+    if "не указаны комиссия/налог" in str(error):
+        # Проценты называет Антон, модель их сама не дописывает.
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Смету не собрала: в ней не указаны комиссия и налог. "
+                "Назови проценты или скажи, по какому правилу считать - пересоберу."
+            ),
+        )
+        return False
     state = load_state()
     calls = int(state.get("estimate_calls") or 0)
     if calls >= ESTIMATE_CALLS_MAX:
@@ -1526,7 +1704,10 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         async with claude_lock:
             logger.info("Вечерний статус: старт")
-            reply_text, _sid, error_kind = await run_model(build_evening_prompt())
+            previous = load_state().get("last_evening_text")
+            reply_text, _sid, error_kind = await run_model(
+                build_evening_prompt(previous=previous)
+            )
             if error_kind is not None:
                 logger.warning("Вечерний статус не удался: %s", error_kind)
                 return
@@ -1541,11 +1722,23 @@ async def evening_job(context: ContextTypes.DEFAULT_TYPE):
                 await send_to_owner(context.bot, text)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Не смог отправить вечерний статус: %s", exc)
+                return
+            # «Нового нет» прошлый статус не затирает: завтра сверяемся с последним
+            # содержательным, иначе его пункты вернутся как новые.
+            if not is_no_news(text):
+                state = load_state()
+                state["last_evening_text"] = strip_long_dashes(text)[:EVENING_PREV_CHARS]
+                save_state(state)
     finally:
         # Замок уже освобождён к этому моменту. Не оставляем очередь висеть до
         # следующего входящего сообщения владельца.
         if pending_queue:
             await run_owner_turn(context.bot, ALLOWED_USER, None)
+
+
+async def on_error(update, context) -> None:
+    """Необработанное исключение хэндлера или джоба - одна строка в лог."""
+    logger.error("Необработанная ошибка: %r", context.error)
 
 
 # ---------------------------------------------------------------------------
@@ -1701,6 +1894,8 @@ def main() -> None:
             filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, on_group_message
         )
     )
+
+    app.add_error_handler(on_error)
 
     job_queue = app.job_queue
     if job_queue is None:

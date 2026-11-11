@@ -76,3 +76,19 @@ def test_unknown_lands_in_post_miscellanea_row_29(tmp_path):
     assert ws["C29"].value == "Раскадровщик агентства ?"
     assert ws["E29"].value == 2
     assert ws["G29"].value is None
+
+
+@pytest.mark.parametrize("key", ["fee_pct", "tax_pct"])
+def test_fee_and_tax_are_required(tmp_path, key):
+    est = _base()
+    del est[key]
+    with pytest.raises(ValueError) as e:
+        build(est, DEFAULT_TEMPLATE, tmp_path / "nofee.xlsx")
+    assert "не указаны комиссия/налог" in str(e.value) and key in str(e.value)
+
+
+def test_zero_fee_is_allowed_when_explicit(tmp_path):
+    est = _base()
+    est["fee_pct"] = 0
+    res = build(est, DEFAULT_TEMPLATE, tmp_path / "zero.xlsx")
+    assert res.total > 0

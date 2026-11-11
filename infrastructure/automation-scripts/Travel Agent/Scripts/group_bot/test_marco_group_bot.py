@@ -1857,3 +1857,106 @@ def test_handler_ignores_attachments_from_stranger(media_env):
     )
     assert ctx.bot.requested == []
     assert list(media_env.rglob("*.pdf")) == []
+
+
+# ---------------------------------------------------------------------------
+# Аудит 10.11: лимиты Hermes, фильтр служебного текста, обработчик ошибок
+# ---------------------------------------------------------------------------
+import asyncio  # noqa: E402
+
+
+def test_reserve_limits_for_marco():
+    r = bot.make_reserve()
+    assert r.timeout == 180 and r.max_turns == 12 and r.resume_max_hours == 12
+    assert r.config()["agent"]["max_turns"] == 12
+
+
+@pytest.mark.parametrize("text", [
+    "Смотри /root/second-brain/x.md", "запусти python3 -c 'print(1)'", "hermes-verify не прошёл",
+    "Я в Резервный режим перешёл", "В этой сборке у меня нет поиска",
+])
+def test_leak_marker_found(text):
+    assert bot.leak_marker(text)
+
+
+def test_leak_marker_clean():
+    assert bot.leak_marker("Билеты пока не в продаже, проверю в пятницу.") is None
+    assert bot.leak_marker("") is None and bot.leak_marker(None) is None
+
+
+def _patch_model(monkeypatch, hermes_reply, claude_reply, engine="hermes"):
+    calls = {"claude": 0}
+
+    async def fake_call(prompt, claude_fn, **kw):
+        bot.RESERVE.last_engine = engine
+        return hermes_reply
+
+    async def fake_claude(prompt, group_dir=None):
+        calls["claude"] += 1
+        return claude_reply
+
+    monkeypatch.setattr(bot.RESERVE, "call", fake_call)
+    monkeypatch.setattr(bot, "run_claude", fake_claude)
+    monkeypatch.setattr(bot, "refresh_ref", lambda *a, **k: None)
+    monkeypatch.delenv("MARCO_FAKE_QUOTA", raising=False)
+    return calls
+
+
+def test_filter_retries_through_claude(monkeypatch):
+    calls = _patch_model(monkeypatch, ("файл /root/second-brain/plan.md обновил", None), ("Готово, записал.", None))
+    assert asyncio.run(bot.run_model("p")) == ("Готово, записал.", None)
+    assert calls["claude"] == 1 and bot.RESERVE.last_reason == "escalate_filter"
+
+
+def test_filter_gives_up_when_claude_fails_or_leaks(monkeypatch):
+    _patch_model(monkeypatch, ("резервный режим", None), ("", "quota"))
+    assert asyncio.run(bot.run_model("p")) == ("", bot.ERROR_FILTERED)
+    _patch_model(monkeypatch, ("резервный режим", None), ("см. /root/x", None))
+    assert asyncio.run(bot.run_model("p")) == ("", bot.ERROR_FILTERED)
+
+
+def test_filter_no_second_claude_run(monkeypatch):
+    calls = _patch_model(monkeypatch, ("python3 -c ...", None), ("ок", None), engine="claude")
+    assert asyncio.run(bot.run_model("p")) == ("", bot.ERROR_FILTERED)
+    assert calls["claude"] == 0
+
+
+def test_clean_reply_and_errors_pass_through(monkeypatch):
+    calls = _patch_model(monkeypatch, ("Вылет в 10:30.", None), ("x", None))
+    assert asyncio.run(bot.run_model("p")) == ("Вылет в 10:30.", None)
+    _patch_model(monkeypatch, ("", "timeout"), ("x", None))
+    assert asyncio.run(bot.run_model("p")) == ("", "timeout")
+    assert calls["claude"] == 0
+
+
+def test_filtered_reply_not_sent_and_not_logged(monkeypatch, tmp_path):
+    sent, logged = [], []
+
+    async def fake_model(prompt):
+        return "", bot.ERROR_FILTERED
+
+    async def fake_send(b, text, reply_to=None):
+        sent.append(text)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(bot, "run_model", fake_model)
+    monkeypatch.setattr(bot, "send_group", fake_send)
+    monkeypatch.setattr(bot, "append_chatlog", lambda *a, **k: logged.append(a))
+    monkeypatch.setattr(bot, "sync_pin", noop)
+    monkeypatch.setattr(bot, "sync_calendar", noop)
+    monkeypatch.setattr(bot, "_typing_loop", noop)
+    asyncio.run(bot.run_turn(None, "p", reply_to=5))
+    assert sent == [bot.FILTERED_TEXT] and logged == []
+    sent.clear()
+    asyncio.run(bot.run_passive_turn(None, "p", reply_to=5))
+    assert sent == [] and logged == []
+
+
+def test_on_error_logs_one_line(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(bot.on_error(None, SimpleNamespace(error=RuntimeError("сеть упала"))))
+    lines = [r for r in caplog.records if "Ошибка обработчика" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].exc_info is None and "RuntimeError" in lines[0].getMessage()

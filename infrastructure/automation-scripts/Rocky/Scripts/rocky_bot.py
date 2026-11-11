@@ -99,6 +99,9 @@ CHATLOG_TAIL_LINES = 40
 MEAL_HISTORY_DAYS = 90
 MEAL_HISTORY_LIMIT = 60
 TICK_SECONDS = 60
+REPLY_WARN_CHARS = 600      # обычный ответ длиннее - предупреждение в лог
+REPLY_QUOTE_CHARS = 300     # сколько текста исходного сообщения класть в «Ответ на сообщение»
+SEND_RETRY_DELAY = 2.0      # пауза перед единственным повтором отправки
 
 DAILY_HOUR = 23
 DAILY_CATCHUP_HOURS = 1    # рестарт в 23:00-23:59 догоняет итог дня, после полуночи - нет
@@ -282,8 +285,10 @@ batches = {who: Batch() for who in journal.WHO}
 # ---------------------------------------------------------------------------
 # Записи сообщений
 # ---------------------------------------------------------------------------
-def build_record(who, text, message_id=None, media=None, notes=None, dt=None):
-    """Нормализованная запись. Совсем пустая (ни текста, ни картинок, ни пометок) - None."""
+def build_record(who, text, message_id=None, media=None, notes=None, dt=None, reply_to=None):
+    """Нормализованная запись. Совсем пустая (ни текста, ни картинок, ни пометок) - None.
+
+    reply_to - строка «автор, текст» сообщения, на которое ответили (только в промпт)."""
     body = " ".join(str(text or "").split())
     files = [m for m in (media or ()) if m]
     marks = [n for n in (notes or ()) if n]
@@ -297,7 +302,29 @@ def build_record(who, text, message_id=None, media=None, notes=None, dt=None):
         "media": files,
         "notes": marks,
         "at": dt or now_utc(),
+        "reply_to": reply_to or None,
     }
+
+
+def reply_context(message, anton_id=None, ralina_id=None):
+    """«<автор>, <текст или [фото]>» из reply_to_message или None. Чистая."""
+    src = getattr(message, "reply_to_message", None)
+    if src is None or getattr(src, "forum_topic_created", None):
+        return None
+    user = getattr(src, "from_user", None)
+    who = who_of(getattr(user, "id", None), anton_id, ralina_id)
+    if who:
+        author = journal.WHO_RU[who]
+    elif getattr(user, "is_bot", False):
+        author = BOT_NAME
+    else:
+        author = guest_label(None, _user_display(user))
+    body = " ".join(str(getattr(src, "text", None) or getattr(src, "caption", None) or "").split())
+    if len(body) > REPLY_QUOTE_CHARS:
+        body = body[:REPLY_QUOTE_CHARS].rstrip() + "…"
+    has_media = bool(getattr(src, "photo", None) or getattr(src, "document", None))
+    content = " ".join(x for x in ("[фото]" if has_media else "", body) if x) or "[сообщение]"
+    return "%s, %s" % (author, content)
 
 
 def record_content(record):
@@ -338,6 +365,16 @@ def append_chatlog(lines, dt=None, chatlog_dir=None):
         for line in lines:
             f.write(line + "\n")
     return path
+
+
+PHOTO_MARK_RE = re.compile(r"\[фото:[^\]]*\]")
+
+
+def scrub_tail(lines):
+    """В хвосте чата пути старых фото не нужны: `[фото: inbox/…]` -> `[фото]`.
+
+    Иначе модель открывает вчерашнюю картинку на текстовом сообщении."""
+    return [PHOTO_MARK_RE.sub("[фото]", str(ln)) for ln in (lines or ())]
 
 
 def read_chatlog_tail(limit=CHATLOG_TAIL_LINES, dt=None, chatlog_dir=None):
@@ -446,16 +483,22 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
         format_profiles_block(profiles),
         format_day_block(who, today_entries, profile, day,
                          "## Сегодняшний журнал: %s (%s), с id записей" % (journal.WHO_RU[who], day)),
-        format_meal_history(who, meal_history),
     ]
+    partner = next((w for w in journal.WHO if w != who), None)
+    if partner:
+        parts.append(format_day_block(
+            partner, today_entries, profiles.get(partner) or {}, day,
+            "## Сегодняшний журнал партнёра: %s (%s), с id записей "
+            "(правка чужой записи - update_entry по id, не новая запись)" % (journal.WHO_RU[partner], day)))
+    parts.append(format_meal_history(who, meal_history))
     yesterday = (journal.msk(dt or now_utc()).date() - timedelta(days=1)).isoformat()
     yesterday_entries = journal.read_entries(yesterday, data_dir or DATA_DIR)
     for person in (who,):
         parts.append(format_day_block(person, yesterday_entries, profiles.get(person) or {}, yesterday,
                                        "## Вчерашний журнал: %s (%s)" % (journal.WHO_RU[person], yesterday)))
-    tail = list(chatlog_tail or [])
+    tail = scrub_tail(chatlog_tail)
     if tail:
-        parts.append("## Хвост чата (последние %d строк)\n%s" % (len(tail), "\n".join(tail)))
+        parts.append("## Хвост чата (последние %d строк; старые фото не открывай)\n%s" % (len(tail), "\n".join(tail)))
     else:
         parts.append("## Хвост чата\n(пусто)")
 
@@ -464,6 +507,8 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
     for r in records or ():
         local = journal.msk(r.get("at") or now_utc()).strftime("%H:%M")
         lines.append("- %s %s: %s" % (local, r.get("author") or journal.WHO_RU[who], record_content(r) or "(без текста)"))
+        if r.get("reply_to"):
+            lines.append("  Ответ на сообщение: %s" % r["reply_to"])
         for m in r.get("media") or ():
             images.append(m.get("rel") or m.get("path"))
     parts.append("## Новые сообщения: %s\n%s" % (journal.WHO_RU[who], "\n".join(lines) or "(пусто)"))
@@ -474,6 +519,8 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
             + "\n\n### Разбор фото\n" + vision_text.strip())
     elif images:
         parts.append("## Картинки\n" + "\n".join("- %s - открой инструментом Read" % p for p in images))
+    else:
+        parts.append("В новых сообщениях картинок нет: ничего не открывай и не описывай фото из хвоста чата.")
     parts.append(_paths_block(data_dir))
     parts.append(UNTRUSTED)
     parts.append(
@@ -492,15 +539,18 @@ def build_daily_prompt(dt=None, profiles=None, entries=None, chatlog_tail=None, 
         parts.append(format_day_block(who, entries, profiles.get(who) or {}, day,
                                       "## Итог дня: %s (%s)" % (journal.WHO_RU[who], day)))
         parts.append(format_meal_history(who, recent_meal_history(who, dt or now_utc(), data_dir or DATA_DIR)))
-    tail = list(chatlog_tail or [])
+    tail = scrub_tail(chatlog_tail)
     if tail:
         parts.append("## Хвост чата (последние %d строк)\n%s" % (len(tail), "\n".join(tail)))
     parts.append(_paths_block(data_dir))
     parts.append(UNTRUSTED)
     parts.append(
         "Напиши итог дня одним сообщением: блок на каждого (что записано, ккал и БЖУ против цели, "
-        "один конкретный совет по знакомым блюдам этого человека). Журнал может быть неполным; "
+        "один конкретный совет по знакомым блюдам этого человека). Числа бери только из строк «Итого» выше, "
+        "сам не пересчитывай. Журнал может быть неполным; "
         "не называй записанные суммы фактическим потреблением, голоданием или пропуском еды. "
+        "Итог приходит в конце дня: слово «недобор» запрещено, советов «на вечер», «на ужин», "
+        "«сегодня ещё успеешь» не давай - совет только на завтра. "
         "Блока rocky-actions нет. NO_REPLY не используй."
     )
     return "\n\n".join(parts)

@@ -161,6 +161,9 @@ HOME_TZ = os.environ.get("MARCO_HOME_TZ", "Europe/Moscow")
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 CLAUDE_TIMEOUT = 600
+# Лимиты Hermes (аудит 10.11: прогон 525 с и ~30 веб-вызовов на один вопрос)
+HERMES_TIMEOUT = _env_int("MARCO_HERMES_TIMEOUT", 180)
+HERMES_MAX_TURNS = _env_int("MARCO_HERMES_MAX_TURNS", 12)
 TG_LIMIT = 4000
 PIN_LIMIT = 4000
 TICK_SECONDS = 15 * 60
@@ -1315,7 +1318,8 @@ def make_reserve():
         read_roots=[WORKSPACE, GROUP_DIR], write_roots=[WORKSPACE, GROUP_DIR],
         deny=["/root/.config", "/root/.claude", "/root/.ssh", "/root/.hermes"],
         deny_globs=["*.env", ".env"],
-        toolsets=["file", "vision", "web"], timeout=CLAUDE_TIMEOUT, logger=logger)
+        toolsets=["file", "vision", "web"], timeout=HERMES_TIMEOUT, max_turns=HERMES_MAX_TURNS,
+        logger=logger)
 
 
 RESERVE = make_reserve()
@@ -1332,13 +1336,43 @@ def user_text_of(prompt):
     return prompt[at + len(MESSAGE_MARK):] if at >= 0 else None
 
 
+# Служебный текст, которому не место в чате (аудит 10.11): пути сервера, команды,
+# слова модели о своём движке. Сравнение без регистра.
+LEAK_MARKERS = ("/root/", "python3 -c", "hermes-verify", "резервный режим", "в этой сборке")
+ERROR_FILTERED = "filtered"
+FILTERED_TEXT = "Не получилось, повтори, пожалуйста."
+
+
+def leak_marker(text):
+    """Первый служебный маркер в ответе или None."""
+    low = (text or "").lower()
+    for marker in LEAK_MARKERS:
+        if marker in low:
+            return marker
+    return None
+
+
 async def run_model(prompt):
-    """run_claude с резервом Hermes. ref/ обновляем и для резерва."""
+    """run_claude с резервом Hermes. ref/ обновляем и для резерва.
+
+    Ответ со служебным текстом в чат и чатлог не идёт: ответил Hermes — один повтор
+    через Claude; не помогло — ("", ERROR_FILTERED)."""
     try:
         refresh_ref()
     except Exception as exc:  # noqa: BLE001 - ref не должен ронять прогон
         logger.warning("refresh_ref упал: %s", exc)
-    return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text_of(prompt))
+    reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text_of(prompt))
+    marker = leak_marker(reply) if kind is None else None
+    if marker is None:
+        return reply, kind
+    logger.warning("Фильтр: в ответе %s служебный текст (%r), в чат не шлю",
+                   RESERVE.last_engine, marker)
+    if RESERVE.last_engine == "hermes":
+        reply, kind = await RESERVE.escalate(lambda: run_claude(prompt))
+        if kind is None and leak_marker(reply) is None:
+            return reply, kind
+        logger.warning("Фильтр: повтор через claude не помог (kind=%s)", kind or "leak")
+    return "", ERROR_FILTERED
 
 
 # ---------------------------------------------------------------------------
@@ -1557,7 +1591,9 @@ async def run_turn(bot, prompt, reply_to=None, log_reply=True, segment=None, sho
                     try:
                         await send_group(
                             bot,
-                            "Не могу сейчас ответить — у меня сбой на сервере "
+                            FILTERED_TEXT
+                            if error_kind == ERROR_FILTERED
+                            else "Не могу сейчас ответить — у меня сбой на сервере "
                             f"({error_kind}). Антон, загляни в логи.",
                             reply_to,
                         )
@@ -2219,6 +2255,12 @@ def ensure_dirs():
         os.makedirs(path, exist_ok=True)
 
 
+async def on_error(update, context):
+    """Сбой обработчика или сети — одна строка в лог вместо трейсбека PTB."""
+    exc = getattr(context, "error", None)
+    logger.warning("Ошибка обработчика: %s: %s", type(exc).__name__, str(exc)[:300])
+
+
 def main():  # pragma: no cover - рантайм
     setup_logging()
     if not TELEGRAM_AVAILABLE:
@@ -2249,6 +2291,8 @@ def main():  # pragma: no cover - рантайм
     app.add_handler(
         MessageHandler(groups & ~filters.COMMAND & ~filters.StatusUpdate.ALL, on_group_message)
     )
+
+    app.add_error_handler(on_error)
 
     job_queue = app.job_queue
     if job_queue is None:

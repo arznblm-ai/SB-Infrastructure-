@@ -246,8 +246,17 @@ def build(estimate: dict, template: Path, out_xlsx: Path) -> BuildResult:
     if production is not None and not isinstance(production, str):
         raise ValueError("production: строка или null")
 
-    fee_pct = _pct(estimate.get("fee_pct", 0.05), "fee_pct")
-    tax_pct = _pct(estimate.get("tax_pct", 0.15), "tax_pct")
+    # Комиссия и налог молча не подставляются (аудит 10.11): их называет Антон
+    # или правило расчёта из knowledge с источником. 0 допустим, но явно.
+    absent = [name for key, name in (("fee_pct", "комиссия (fee_pct)"), ("tax_pct", "налог (tax_pct)"))
+              if estimate.get(key) is None]
+    if absent:
+        raise ValueError(
+            "не указаны комиссия/налог: нет поля %s. Значение не подставляй сама: "
+            "спроси у Антона или возьми из правил расчёта в knowledge с указанием источника"
+            % " и ".join(absent))
+    fee_pct = _pct(estimate["fee_pct"], "fee_pct")
+    tax_pct = _pct(estimate["tax_pct"], "tax_pct")
 
     lines = estimate.get("lines") or []
     unknown = estimate.get("unknown") or []

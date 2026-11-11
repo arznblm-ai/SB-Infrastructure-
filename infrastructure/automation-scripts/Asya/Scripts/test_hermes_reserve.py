@@ -140,8 +140,10 @@ def test_command_profile_and_env(reserve, tmp_path):
     img = os.path.join(reserve.workspace, "inbox", "1-photo.jpg")
     os.makedirs(os.path.dirname(img))
     open(img, "wb").close()
-    run(reserve.run_hermes("Вложение: inbox/1-photo.jpg (фото)"))
+    run(reserve.run_hermes("хвост: inbox/0-old.jpg\n\n## Вложения\n- Вложение: inbox/1-photo.jpg (фото)"))
     args = json.load(open(str(reserve.args_log)))
+    assert "Резервн" not in args[2] and "резервн" not in args[2]
+    assert "не упоминай в ответе движок" in args[2] and "уже приложена" in args[2]
     assert args[:2] == ["chat", "-q"] and "-Q" in args
     assert args[args.index("-t") + 1] == "file"
     assert args[args.index("--image") + 1] == os.path.realpath(img)
@@ -229,6 +231,7 @@ def test_word_ignored_in_prompt_without_user_text(hreserve):
 
 
 def test_hermes_prompt_and_resume_passed(hreserve):
+    hreserve.note_session("sid1")
     run(hreserve.call("claude-промпт", claude(("c", None)), hermes_prompt="h-промпт", hermes_resume="sid1"))
     args = json.load(open(str(hreserve.args_log)))
     assert args[args.index("--resume") + 1] == "sid1"
@@ -289,6 +292,81 @@ def test_guard_script_blocks(tmp_path):
                         input=json.dumps({"tool_name": "read_file", "tool_input": {"path": str(tmp_path / "a")}}),
                         capture_output=True, text=True).stdout
     assert ok.strip() == ""
+
+
+def _img(reserve, rel):
+    path = os.path.join(reserve.workspace, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").close()
+    return os.path.realpath(path)
+
+
+def test_images_only_from_current_message(reserve):
+    old, new = _img(reserve, "inbox/1-old.jpg"), _img(reserve, "inbox/2-new.png")
+    tail = "Хвост чата:\n[10:00] Антон: [фото: inbox/1-old.jpg]\n\nСообщение:\nчто на фото?"
+    # картинка только в хвосте чатлога — не прикладывается
+    run(reserve.run_hermes(tail))
+    args = json.load(open(str(reserve.args_log)))
+    assert "--image" not in args and "уже приложена" not in args[2]
+    # блок вложений текущего сообщения — берём из него, не из хвоста
+    run(reserve.run_hermes(tail + "\n\n## Вложения\n- Вложение: inbox/2-new.png (фото)"))
+    args = json.load(open(str(reserve.args_log)))
+    assert args[args.index("--image") + 1] == new
+    # явный список бота главнее промпта; пустой список — без картинок
+    run(reserve.call(tail + "\n\n## Вложения\n- inbox/2-new.png", claude(("", "quota")), images=[old]))
+    args = json.load(open(str(reserve.args_log)))
+    assert args[args.index("--image") + 1] == old
+    run(reserve.run_hermes(tail + "\n\n## Вложения\n- inbox/2-new.png", images=[]))
+    assert "--image" not in json.load(open(str(reserve.args_log)))
+    # список одного вызова не протекает в следующий
+    run(reserve.run_hermes(tail))
+    assert "--image" not in json.load(open(str(reserve.args_log)))
+
+
+def test_guard_search_root_with_deny_inside():
+    msg = verdict("search_files", pattern="x", path="/vault")
+    assert msg and "ищи в конкретной папке или файле" in msg
+    assert verdict("search_files", pattern="x", path="/vault/context")
+    assert verdict("search_files", pattern="x", path="/vault/meetings") is None
+    assert verdict("search_files", pattern="x", path="/vault/context/psychology")
+    inside_cwd = dict(POLICY, deny=["/w/secret"])
+    assert hr.guard_verdict({"tool_name": "search_files", "tool_input": {"pattern": "x"}, "cwd": "/w"}, inside_cwd)
+    assert hr.guard_verdict({"tool_name": "read_file", "tool_input": {"path": "/w/a.md"}, "cwd": "/w"}, inside_cwd) is None
+
+
+def test_max_turns_and_timeout_configurable(tmp_path):
+    base = hr.Reserve("M", str(tmp_path / "s.json"), str(tmp_path / "h"), str(tmp_path), read_roots=[str(tmp_path)])
+    assert base.config()["agent"]["max_turns"] == 40 and base.timeout == 600 and base.resume_max_hours == 12
+    r = hr.Reserve("M", str(tmp_path / "s.json"), str(tmp_path / "h2"), str(tmp_path), read_roots=[str(tmp_path)],
+                   max_turns=12, timeout=180, resume_max_hours=3)
+    assert r.config()["agent"]["max_turns"] == 12 and r.timeout == 180
+    r.ensure_home()
+    assert "max_turns: 12" in open(os.path.join(r.hermes_home, "config.yaml")).read()
+
+
+def test_resume_dropped_when_session_stale(hreserve):
+    os.makedirs(hreserve.hermes_home, exist_ok=True)
+    # неизвестная модулю сессия — не продолжаем
+    assert hreserve.fresh_resume("sidX") is None
+    hreserve.note_session("sid1", now=1000.0)
+    assert hreserve.fresh_resume("sid1", now=1000.0 + 11 * 3600) == "sid1"
+    assert hreserve.fresh_resume("sid1", now=1000.0 + 13 * 3600) is None
+    assert hreserve.fresh_resume("other", now=1001.0) is None
+    hreserve.resume_max_hours = None
+    assert hreserve.fresh_resume("other") == "other"
+    hreserve.resume_max_hours = 12
+    hreserve.note_session("old", now=1.0)
+    run(hreserve.call("p", claude(("c", None)), hermes_resume="old"))
+    args = json.load(open(str(hreserve.args_log)))
+    assert "--resume" not in args
+    # удачный прогон запомнил новую сессию — следующий ход её продолжит
+    assert hreserve.fresh_resume("test_sid") == "test_sid"
+
+
+def test_escalate_runs_claude_once(hreserve):
+    fn = claude(("чистый ответ", None))
+    assert run(hreserve.escalate(fn)) == ("чистый ответ", None)
+    assert fn.calls == [1] and hreserve.last_engine == "claude" and hreserve.last_reason == "escalate_filter"
 
 
 def test_copies_identical():

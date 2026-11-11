@@ -29,6 +29,17 @@
 (escalate_word). Claude на квоте → ответ Hermes, если он есть, иначе квотная ошибка
 бота. Откат — PRIMARY_ENGINE=claude: тогда работает схема выше без изменений.
 Лог: engine=hermes|claude reason=primary|escalate_fail|escalate_word|reserve|forced.
+
+Правки 2026-11-10 (аудит TG-ботов, `tasks/CTO/{automation} {plan} аудит TG-ботов и правки –
+2026-11-10.md`):
+- Картинки: к вызову прикладывается только картинка текущего сообщения — список из
+  `call(images=[...])` либо пути из блока вложений промпта (после последней метки из
+  `image_marks`). Хвост чатлога больше не просматривается.
+- Преамбула нейтральная, без слов «резервный режим»; просит не упоминать движок и пути.
+- Страж блокирует поиск, если закрытый путь лежит внутри корня поиска.
+- `max_turns` и `timeout` — аргументы конструктора (дефолты 40 и 600 с).
+- `--resume` не делается, если сессия Hermes старше `resume_max_hours` (12 ч) или
+  модулю неизвестна: диалог начинается заново.
 """
 
 import asyncio
@@ -58,17 +69,32 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
 FILE_TOOLS = ("read_file", "write_file", "patch", "search_files", "vision_analyze")
 WRITE_TOOLS = ("write_file", "patch")
 
-PREAMBLE = (
-    "[Резервный режим: ты работаешь не в Claude Code, а в Hermes. Правила из CLAUDE.md "
-    "действуют полностью. Названия инструментов там от Claude Code, у тебя им "
-    "соответствуют: Read = read_file, Glob/Grep = search_files, Edit = patch, "
-    "Write = write_file, mcp__<сервер>__<тулза> = тулза MCP-сервера с тем же именем. "
-    "Картинки смотри тулзой vision_analyze (первая картинка уже приложена к сообщению). "
-    "Командной строки нет. Ответ пиши так же, как ответил бы бот.]\n\n"
-)
+# Метки начала блока вложений текущего сообщения в промптах ботов (media_intake,
+# Роки, бухгалтер). Пути картинок ищем только после последней такой метки.
+IMAGE_MARKS = ("\n## Вложения", "\n## Картинки", "\n## Файлы")
+DEFAULT_MAX_TURNS = 40
+DEFAULT_TIMEOUT = 600
+DEFAULT_RESUME_MAX_HOURS = 12
+
+
+def preamble(has_image=False):
+    """Вводная к промпту Hermes. Нейтральная: модель повторяла «резервный режим» в чате."""
+    return (
+        "[Ты работаешь в Hermes, не в Claude Code. Правила из CLAUDE.md "
+        "действуют полностью. Названия инструментов там от Claude Code, у тебя им "
+        "соответствуют: Read = read_file, Glob/Grep = search_files, Edit = patch, "
+        "Write = write_file, mcp__<сервер>__<тулза> = тулза MCP-сервера с тем же именем. "
+        "Картинки смотри тулзой vision_analyze%s. "
+        "Командной строки нет. Ответ пиши так же, как ответил бы бот: не упоминай в ответе "
+        "движок, режим, инструменты и пути к файлам.]\n\n"
+        % (" (первая картинка уже приложена к сообщению)" if has_image else "")
+    )
+
+
+PREAMBLE = preamble(False)
 
 SOUL = (
-    "Ты движок Telegram-бота в резервном режиме. Своей личности у тебя нет: кто ты, "
+    "Ты движок Telegram-бота. Своей личности у тебя нет: кто ты, "
     "как говоришь и что можешь, написано в CLAUDE.md рабочего каталога и в сообщении. "
     "Следуй им. Отвечай только текстом ответа, без пояснений о себе.\n"
 )
@@ -156,6 +182,7 @@ import fnmatch, json, os, sys
 
 POLICY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policy.json")
 WRITE = ("write_file", "patch")
+SEARCH = ("search_files",)
 
 
 def under(path, roots):
@@ -202,6 +229,12 @@ def verdict(payload, policy):
         roots = policy.get("write_roots") if write else policy.get("read_roots")
         if not under(p, roots or []):
             return "вне разрешённых каталогов: %s" % p
+        # поиск по корню, внутри которого есть закрытый путь, отдаёт имена и строки
+        # закрытых файлов (Ася 07.11: context/psychology/ ушёл во внешнюю модель)
+        if not write and (tool in SEARCH or os.path.isdir(p)):
+            for d in policy.get("deny", []):
+                if d != p and under(d, [p]):
+                    return ("внутри %s есть закрытые пути: ищи в конкретной папке или файле" % p)
     return None
 
 
@@ -227,7 +260,9 @@ class Reserve:
 
     def __init__(self, prefix, state_path, hermes_home, workspace, read_roots,
                  write_roots=(), deny=(), deny_globs=(), toolsets=("file",),
-                 mcp_servers=None, timeout=600, logger=None):
+                 mcp_servers=None, timeout=DEFAULT_TIMEOUT, logger=None,
+                 max_turns=DEFAULT_MAX_TURNS, resume_max_hours=DEFAULT_RESUME_MAX_HOURS,
+                 image_marks=IMAGE_MARKS):
         self.prefix = prefix
         self.state_path = state_path
         self.hermes_home = hermes_home
@@ -238,7 +273,10 @@ class Reserve:
         self.deny_globs = list(deny_globs)
         self.toolsets = list(toolsets)
         self.mcp_servers = mcp_servers or {}
-        self.timeout = timeout
+        self.timeout = timeout          # потолок одного прогона Hermes, секунды
+        self.max_turns = int(max_turns)  # agent.max_turns в config.yaml профиля
+        self.resume_max_hours = resume_max_hours  # None — возраст сессии не проверять
+        self.image_marks = tuple(image_marks or ())
         self.log = logger or logging.getLogger(prefix.lower())
         self.notify = None  # async fn(text): бот ставит при старте; нет — метка только в логе
         self.hermes_bin = os.environ.get(prefix + "_HERMES_BIN", HERMES_BIN)
@@ -248,6 +286,7 @@ class Reserve:
         self.last_engine = None  # кто дал последний ответ: claude|hermes
         self.last_reason = None
         self.last_sid = None     # session_id последнего прогона Hermes (для --resume)
+        self._images = None      # картинки текущего call(); run_hermes забирает и чистит
 
     # --- состояние --------------------------------------------------------
     def load(self):
@@ -291,14 +330,17 @@ class Reserve:
 
     # --- главный вход -----------------------------------------------------
     async def call(self, prompt, claude_fn, now=None, user_text=None, hermes_prompt=None,
-                   hermes_resume=None):
+                   hermes_resume=None, images=None):
         """(текст, error_kind). claude_fn() -> (текст, kind) — прежний вызов бота.
 
         user_text — само сообщение пользователя (для слова «клод»), без него эскалации
         по слову нет. hermes_prompt — свой промпт для Hermes (по умолчанию prompt),
         hermes_resume — session_id Hermes для продолжения диалога.
+        images — картинки текущего сообщения (пути); None — взять из блока вложений
+        промпта, [] — без картинок.
         """
         hprompt = prompt if hermes_prompt is None else hermes_prompt
+        self._images = images
         forced = self.forced()
         if forced == "hermes":
             return await self.run_hermes(hprompt, hermes_resume, reason="forced")
@@ -389,7 +431,7 @@ class Reserve:
             "model": {"default": self.model, "provider": self.provider},
             # verify_on_stop: после записи файла Hermes дописывает ходы «проверить правку
             # не могу», и -Q отдаёт в чат их, а не ответ (Марко 30.10 13:40)
-            "agent": {"max_turns": 40, "verify_on_stop": False},
+            "agent": {"max_turns": self.max_turns, "verify_on_stop": False},
             "memory": {"memory_enabled": False, "user_profile_enabled": False, "nudge_interval": 0},
             "skills": {"creation_nudge_interval": 0},
             "curator": {"enabled": False},
@@ -448,6 +490,53 @@ class Reserve:
                 out.append(path)
         return out
 
+    def current_part(self, prompt):
+        """Часть промпта с вложениями текущего сообщения: после последней метки."""
+        text = prompt or ""
+        at = max((text.rfind(mark) for mark in self.image_marks), default=-1)
+        return text[at:] if at >= 0 else ""
+
+    def images_for(self, prompt, images=None):
+        """Картинки текущего сообщения: явный список бота либо блок вложений промпта."""
+        if images is None:
+            return self.images_in(self.current_part(prompt))
+        return self.images_in("\n".join(str(p) for p in images))
+
+    # --- возраст сессии Hermes (для --resume) --------------------------------
+    def _session_mark_path(self):
+        return os.path.join(self.hermes_home, "last_session.json")
+
+    def note_session(self, sid, now=None):
+        if not sid:
+            return
+        try:
+            os.makedirs(self.hermes_home, exist_ok=True)
+            _write_atomic(self._session_mark_path(),
+                          json.dumps({"sid": sid, "at": time.time() if now is None else now}))
+        except OSError as exc:
+            self.log.warning("метка сессии hermes не записана: %s", exc)
+
+    def fresh_resume(self, resume, now=None):
+        """resume, если сессия моложе resume_max_hours; иначе None (диалог с нуля)."""
+        if not resume or self.resume_max_hours is None:
+            return resume or None
+        now = time.time() if now is None else now
+        try:
+            with open(self._session_mark_path(), encoding="utf-8") as fh:
+                mark = json.load(fh)
+            age = now - float(mark["at"]) if mark.get("sid") == resume else None
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            age = None
+        if age is not None and age < float(self.resume_max_hours) * 3600:
+            return resume
+        self.log.info("engine=hermes сессия %s не продолжается (возраст %s, порог %s ч), новая",
+                      resume, "?" if age is None else "%.1f ч" % (age / 3600.0), self.resume_max_hours)
+        return None
+
+    async def escalate(self, claude_fn, reason="escalate_filter"):
+        """Разовый прогон через Claude по просьбе бота (ответ Hermes забракован фильтром)."""
+        return await self._claude(claude_fn, reason)
+
     def toolsets_for(self):
         # Без mcp-<сервер> в -t тулз MCP нет. v0.19.1 при этом печатает в stdout
         # «Warning: Unknown toolsets», хотя тулзы есть (проверено 26.10) — строку режем.
@@ -457,7 +546,7 @@ class Reserve:
 
     def build_cmd(self, prompt, images=(), resume=None):
         model = self.vision_model if images else self.model
-        cmd = [self.hermes_bin, "chat", "-q", PREAMBLE + prompt, "-Q",
+        cmd = [self.hermes_bin, "chat", "-q", preamble(bool(images)) + prompt, "-Q",
                "--provider", self.provider, "-m", model,
                "-t", ",".join(self.toolsets_for()), "--source", "tool"]
         if resume:
@@ -477,16 +566,20 @@ class Reserve:
         env["HERMES_VERIFY_ON_STOP"] = "0"  # то же, что agent.verify_on_stop в config.yaml
         return env
 
-    async def run_hermes(self, prompt, resume=None, reason="reserve"):
+    async def run_hermes(self, prompt, resume=None, reason="reserve", images=None):
         """(текст, error_kind). Лог: engine=hermes reason=… model=… dur=… cost_usd=…"""
         self.last_engine, self.last_reason, self.last_sid = "hermes", reason, None
+        if images is None:
+            images = getattr(self, "_images", None)
+        self._images = None
+        resume = self.fresh_resume(resume)
         try:
             self.ensure_home()
             await asyncio.to_thread(self.ensure_auth)
         except Exception as exc:  # noqa: BLE001
             self.log.warning("engine=hermes профиль не собран: %s", exc)
             return "", "error"
-        images = [p for p in self.images_in(prompt) if p.lower().endswith(IMAGE_EXTS)]
+        images = [p for p in self.images_for(prompt, images) if p.lower().endswith(IMAGE_EXTS)]
         cmd = self.build_cmd(prompt, images, resume)
         model = self.vision_model if images else self.model
         start = time.monotonic()
@@ -523,6 +616,7 @@ class Reserve:
                              reason, model, proc.returncode, dur, cost, (err or text)[-400:])
             return "", "error"
         self.last_sid = sid
+        self.note_session(sid)
         self.log.info("engine=hermes reason=%s model=%s dur=%.1fs reply_len=%d images=%d cost_usd=%s sid=%s",
                       reason, model, dur, len(text), len(images), cost, sid)
         return text, None

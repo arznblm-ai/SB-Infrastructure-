@@ -72,6 +72,9 @@ CLAUDE_BIN = os.environ.get("ASYA_CLAUDE_BIN", "/root/.local/bin/claude")
 ASYA_MODEL = os.environ.get("ASYA_MODEL", "opus")  # алиас, версии не пиновать
 
 BATCH_SECONDS = _env_float("ASYA_BATCH_SEC", 4)
+# В пачке пока только пересланное — ждём дольше: Антон сначала пересылает, потом
+# дописывает комментарий («поставь это»), и он должен попасть в ту же пачку.
+BATCH_FORWARD_SECONDS = _env_float("ASYA_BATCH_FWD_SEC", 11)
 BATCH_MAX_SECONDS = 60.0  # потолок от первого сообщения пачки
 
 ASYA_HOME = os.environ.get("ASYA_HOME", "/var/lib/asya")
@@ -89,6 +92,9 @@ HOME_DIR = "/root"  # где лежат секреты сервера (.config, 
 MEMORY_REL = "infrastructure/Asya/memory"
 MEMORY_FILE_NAME = "{self} {research} память Аси – 2026-10-16.md"
 MEMORY_PROMPT_LIMIT = 8000
+JOURNAL_FILE_NAME = "{self} {research} общая память Аси с Антоном – 2026-10-20.md"
+JOURNAL_HEAD_LINES = 40  # столько строк верха журнала код кладёт в промпт сам
+JOURNAL_LINE_MAX = 400
 
 MSK = ZoneInfo("Europe/Moscow")
 DAY_START_HOUR = 5  # «день» разговора начинается в 05:00 MSK
@@ -157,6 +163,10 @@ def memory_dir(vault_dir=None):
 
 def memory_path(vault_dir=None):
     return os.path.join(memory_dir(vault_dir), MEMORY_FILE_NAME)
+
+
+def journal_path(vault_dir=None):
+    return os.path.join(memory_dir(vault_dir), JOURNAL_FILE_NAME)
 
 
 def allowed_tools(vault_dir=None):
@@ -238,18 +248,37 @@ def settings_payload(vault_dir=None, home_dir=None):
 
 RESERVE = make_reserve()
 
-# Только для резерва Hermes: проверка 27.10 — deepseek переименовал чужую встречу
-# на «на завтра кол по сколково» и поставил лишнее событие на «напомни». Claude так не делает.
+# Только для Hermes (deepseek): проверка 27.10 — переименовал чужую встречу на «на завтра
+# кол по сколково» и поставил лишнее событие на «напомни»; 06–07.11 — отказывал в прямой
+# просьбе закрыть задачи. Правила — целыми предложениями и без спора с персоной
+# («изменение задач — сразу, без подтверждения»). Сигнатуры тулз — чтобы модель не
+# тратила ход на их описание.
 HERMES_RULES = (
-    "[Строже, чем кажется из CLAUDE.md: update_event, delete_event, todoist_set_due, "
-    "todoist_close_task, todoist_set_track — только когда Антон в этом сообщении прямо "
-    "просит изменить именно это событие или задачу (перенеси, переименуй, удали, закрой) "
-    "и оно однозначно находится по названию. Новая встреча без времени — один вопрос, "
-    "Исключение: Антон поручил ревизию проекта «Мои» — можешь закрывать в нём задачи "
-    "при убедительном свидетельстве выполнения или отмены; неясные оставь открытыми, "
-    "в ответе назови основания. Другие проекты без прямого запроса не меняй. "
-    "чужие события не переименовывай и не дополняй. «Напомни …» — задача в Мои (такая уже "
-    "есть — поставь ей срок), без события в календаре. Сомневаешься — ничего не меняй и спроси одним вопросом.]\n\n"
+    "[Правила этого ответа, вдобавок к CLAUDE.md.\n"
+    "1. Прямая просьба Антона в этом сообщении создать, закрыть, перенести, переименовать "
+    "или удалить задачу или встречу — выполняй сразу, без вопроса и без подтверждения. "
+    "Просьба разобрать «Мои» («закрой сделанное», «актуализируй задачи») — такая же прямая "
+    "просьба: закрывай задачи с убедительным свидетельством выполнения или отмены, неясные "
+    "оставь открытыми, в ответе назови основания.\n"
+    "2. Не трогай только то, чего Антон не называл: чужие события и задачи не переименовывай, "
+    "не дополняй, не переноси и не удаляй. Событие или задача не находится однозначно по "
+    "названию — задай один вопрос с вариантами.\n"
+    "3. Новая встреча без даты или времени — один вопрос, событие не создавай. «Напомни …» — "
+    "это задача в «Мои» (такая уже есть — поставь ей срок), события в календаре не нужно.\n"
+    "4. Инструменты вызывай сразу, их описания не запрашивай. Календарь (время московское): "
+    "list_events(date=\"YYYY-MM-DD\"); "
+    "create_event(title, start=\"YYYY-MM-DDTHH:MM\", end=\"\", description=\"\") — пустой end значит плюс час; "
+    "update_event(event_id, title=\"\", start=\"\", end=\"\", description=\"\") — пустое поле не меняется; "
+    "delete_event(event_id). Задачи: todoist_my_tasks(); todoist_open_tasks(section=\"all\"); "
+    "todoist_add_task(content, track=\"\", due_date=\"YYYY-MM-DD\", description=\"\") — "
+    "track: портал, луч, зекиро, бренд, личное или пусто; todoist_close_task(task_id); "
+    "todoist_set_due(task_id, due_date=\"YYYY-MM-DD\"); todoist_set_track(task_id, track). "
+    "event_id и task_id бери только из ответов list_events, create_event и списков задач.\n"
+    "5. Общий журнал правь одним вызовом patch: old_string — строка «## Журнал», new_string — "
+    "«## Журнал», пустая строка и новая строка журнала. Файл журнала целиком не перечитывай "
+    "и не переписывай: его верх уже есть в сообщении.\n"
+    "6. Поиск по всему vault закрыт. Ищи в конкретной папке (meetings/, tasks/, "
+    "infrastructure/Kris/memory/) или читай конкретный файл context/ по пути из CLAUDE.md.]\n\n"
 )
 
 
@@ -436,6 +465,13 @@ def format_record_line(record):
     return "- %s: %s" % (record_label(record), content)
 
 
+def has_pdf(records):
+    """В пачке есть PDF: Hermes их не читает, такой ответ делает Claude."""
+    return any(
+        isinstance(m, dict) and m.get("kind") == media_intake.KIND_PDF for m in collect_media(records)
+    )
+
+
 def collect_media(records):
     files = []
     for record in records or ():
@@ -457,8 +493,10 @@ class Batch:
     голосовое, расшифрованное позже, встаёт на своё место.
     """
 
-    def __init__(self, quiet=None, max_wait=None):
+    def __init__(self, quiet=None, max_wait=None, quiet_forward=None):
         self.quiet = BATCH_SECONDS if quiet is None else float(quiet)
+        fwd = BATCH_FORWARD_SECONDS if quiet_forward is None else float(quiet_forward)
+        self.quiet_forward = max(self.quiet, fwd)
         self.max_wait = BATCH_MAX_SECONDS if max_wait is None else float(max_wait)
         self._records = []
         self._first_at = None
@@ -495,10 +533,17 @@ class Batch:
         self._last_at = stamp
         return True
 
+    def only_forwards(self):
+        """В пачке одни пересылки (своих слов Антона ещё нет)."""
+        return bool(self._records) and all(r.get("forward") for r in self._records)
+
+    def current_quiet(self):
+        return self.quiet_forward if self.only_forwards() else self.quiet
+
     def fire_at(self):
         if not self._records or self._last_at is None:
             return None
-        by_silence = self._last_at + timedelta(seconds=self.quiet)
+        by_silence = self._last_at + timedelta(seconds=self.current_quiet())
         by_cap = self._first_at + timedelta(seconds=self.max_wait)
         return min(by_silence, by_cap)
 
@@ -599,6 +644,39 @@ def read_memory(path=None, limit=MEMORY_PROMPT_LIMIT):
     return text
 
 
+def read_journal_head(path=None, limit=JOURNAL_HEAD_LINES):
+    """Верх общего журнала TG ↔ vault: «Сейчас в работе» и свежие строки.
+
+    Код кладёт его в промпт сам — модель не тратит ход на Read. Frontmatter,
+    пустые строки и HTML-комментарии пропускаются, длинные строки режутся.
+    """
+    try:
+        with open(path or journal_path(), "r", encoding="utf-8") as f:
+            raw = f.read().splitlines()
+    except OSError:
+        return ""
+    if raw and raw[0].strip() == "---":
+        try:
+            raw = raw[raw.index("---", 1) + 1:]
+        except ValueError:
+            pass
+    out, in_comment = [], False
+    for line in raw:
+        text = line.rstrip()
+        if in_comment:
+            in_comment = "-->" not in text
+            continue
+        if text.lstrip().startswith("<!--"):
+            in_comment = "-->" not in text
+            continue
+        if not text.strip():
+            continue
+        out.append(_cap(text, JOURNAL_LINE_MAX))
+        if len(out) >= limit:
+            break
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Промпт хода
 # ---------------------------------------------------------------------------
@@ -619,7 +697,8 @@ def format_now_block(dt=None):
     )
 
 
-def build_turn_prompt(records, dt=None, chatlog_tail=None, memory_text=None, memory_file=None, media=None):
+def build_turn_prompt(records, dt=None, chatlog_tail=None, memory_text=None, memory_file=None, media=None,
+                      journal_text=None):
     """Промпт на пачку. Правил поведения тут нет — они в workspace/CLAUDE.md."""
     parts = [
         "Личка Антона. Ответь как Ася по правилам из CLAUDE.md.",
@@ -629,6 +708,12 @@ def build_turn_prompt(records, dt=None, chatlog_tail=None, memory_text=None, mem
         "(«запомни …», поправка вроде «Руслан — это Луч»)." % (memory_file or memory_path()),
         "Долгая память (факты и поправки Антона):\n" + (memory_text.strip() if memory_text else "(пусто)"),
     ]
+    if journal_text is not None:
+        parts.append(
+            "Общий журнал с Асей в vault, верх файла (читать его перед ответом не нужно; "
+            "дальше вглубь — только если Антон спрашивает о прошлом):\n"
+            + (journal_text.strip() or "(пусто)")
+        )
     tail = [ln for ln in (chatlog_tail or []) if ln]
     if tail:
         parts.append("Разговор сегодня с 05:00 MSK (старое сверху):\n" + "\n".join(tail))
@@ -898,6 +983,7 @@ async def process_batch(bot, records):
             chatlog_tail=tail,
             memory_text=read_memory(),
             memory_file=memory_path(),
+            journal_text=read_journal_head(),
         )
         logger.info("Пачка: %d сообщ., хвост %d строк", len(records), len(tail))
 
@@ -907,8 +993,15 @@ async def process_batch(bot, records):
         try:
             try:
                 user_text = "\n".join(r.get("text") or "" for r in records)
-                reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
-                                                 hermes_prompt=HERMES_RULES + prompt)
+                reply, kind, tried_claude = "", "error", False
+                if has_pdf(records) and RESERVE.forced() != "hermes":
+                    tried_claude = True
+                    reply, kind = await RESERVE.escalate(lambda: run_claude(prompt), "pdf")
+                    if kind:
+                        logger.warning("PDF: claude %s, пробую обычный порядок движков", kind)
+                if not tried_claude or kind:
+                    reply, kind = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
+                                                     hermes_prompt=HERMES_RULES + prompt)
             except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
                 logger.exception("run_claude упал: %s", exc)
                 reply, kind = "", "error"
@@ -1125,6 +1218,15 @@ async def cmd_start(update, context):  # pragma: no cover - рантайм
     )
 
 
+async def on_error(update, context):
+    """Одна строка в лог вместо «No error handlers are registered» с трейсбеком."""
+    err = getattr(context, "error", None)
+    text = "%s: %s" % (type(err).__name__, err)
+    if BOT_TOKEN:
+        text = text.replace(BOT_TOKEN, "<token>")
+    logger.warning("Ошибка в хендлере Telegram: %s", " ".join(text.split())[:500])
+
+
 def ensure_dirs():
     for path in (WORKSPACE, INBOX_DIR, CHATLOG_DIR, STATE_DIR):
         os.makedirs(path, exist_ok=True)
@@ -1153,10 +1255,12 @@ def main():  # pragma: no cover - рантайм
     app.add_handler(CommandHandler("start", cmd_start, filters=private))
     app.add_handler(CommandHandler("status", cmd_status, filters=private))
     app.add_handler(MessageHandler(private & ~filters.COMMAND & ~filters.StatusUpdate.ALL, on_message))
+    app.add_error_handler(on_error)
     logger.info(
-        "Ася запущена (модель=%s, окно пачки %.1f с, потолок %.0f с, vault=%s)",
+        "Ася запущена (модель=%s, окно пачки %.1f с, для пересланного %.1f с, потолок %.0f с, vault=%s)",
         ASYA_MODEL,
         BATCH_SECONDS,
+        BATCH_FORWARD_SECONDS,
         BATCH_MAX_SECONDS,
         VAULT_DIR,
     )
