@@ -892,15 +892,16 @@ def make_reserve(home_dir=None):
 RESERVE = make_reserve()
 
 
-async def call_model(prompt, user_text=None, hermes_prompt=None):
+async def call_model(prompt, user_text=None, hermes_prompt=None, images=None):
     """run_claude (с резервом Hermes), который никогда не бросает.
 
     user_text — сообщения людей: слово «клод» в них зовёт Claude на этот ответ.
-    hermes_prompt — промпт с готовым разбором фото: Hermes идёт без картинок."""
+    hermes_prompt — промпт с готовым разбором фото: Hermes идёт без картинок.
+    images — фото текущей пачки ([] = текст без фото): старые фото из чата не цепляются."""
     token = _PRE_DESCRIBED.set(hermes_prompt is not None)
     try:
         return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
-                                  hermes_prompt=hermes_prompt)
+                                  hermes_prompt=hermes_prompt, images=images)
     except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
         logger.exception("run_claude упал: %s", exc)
         return "", "error"
@@ -935,11 +936,27 @@ def parse_vision_output(stdout):
     return None
 
 
+def parse_vision_cost(stdout):
+    """Последняя JSON-строка rocky_vision.py -> стоимость запроса в $ или None."""
+    for line in reversed((stdout or "").strip().splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        cost = data.get("cost") if isinstance(data, dict) else None
+        return float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+    return None
+
+
+def fmt_cost(cost):
+    return "?" if cost is None else "$%.4f" % cost
+
+
 async def describe_images(paths):
-    """(текст разбора | None, dur). Сбой/таймаут -> None, бот идёт старым путём."""
+    """(текст разбора | None, dur, cost $ | None). Сбой/таймаут -> None, бот идёт старым путём."""
     start = time.monotonic()
     if not paths or not os.path.isfile(VISION_SCRIPT) or not os.path.isfile(VISION_PY):
-        return None, 0.0
+        return None, 0.0, None
     cmd = [VISION_PY, "-I", VISION_SCRIPT, "--model", VISION_MODEL,
            "--timeout", str(max(5.0, VISION_TIMEOUT - 5))] + list(paths)
     try:
@@ -950,7 +967,7 @@ async def describe_images(paths):
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except Exception as exc:  # noqa: BLE001
         logger.warning("vision_pre не запустился: %s", exc)
-        return None, time.monotonic() - start
+        return None, time.monotonic() - start, None
     try:
         out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=VISION_TIMEOUT)
     except asyncio.TimeoutError:
@@ -960,12 +977,12 @@ async def describe_images(paths):
         except Exception:  # noqa: BLE001
             pass
         logger.warning("vision_pre timeout после %.1fs", time.monotonic() - start)
-        return None, time.monotonic() - start
+        return None, time.monotonic() - start, None
     stdout = (out_b or b"").decode("utf-8", errors="replace")
     text = parse_vision_output(stdout)
     if text is None:
         logger.warning("vision_pre fail: %s", stdout.strip()[-300:])
-    return text, time.monotonic() - start
+    return text, time.monotonic() - start, parse_vision_cost(stdout)
 
 
 def record_run(kind):
@@ -984,49 +1001,142 @@ def record_run(kind):
 # ---------------------------------------------------------------------------
 # Обработка ответа на сообщения (чистая часть + IO журнала)
 # ---------------------------------------------------------------------------
-def handle_reply(reply, now, data_dir=None):
+_NUM = r"\d[\d\s.,]*"
+_FILL = r"(?:\s*(?:уже|ещё|еще|вышло|набралось|итого|всего|записано|получилось|получается|примерно|около|где-то|[~≈:=–-]))*\s*"
+TOTALS_RES = [
+    # «1240 из 2100 ккал», «1240 ккал из 2100»
+    re.compile(_NUM + r"\s*(?:ккал\s*)?из\s*[~≈]?\s*" + _NUM + r"\s*ккал", re.I),
+    re.compile(_NUM + r"\s*ккал\s*из\s*[~≈]?\s*\d{3,5}", re.I),
+    # «белка уже 95 из 130»
+    re.compile(r"(?:белк\w*|жир\w*|углевод\w*|\b[БЖУ])" + _FILL + r"\d+\s*(?:г\s*)?из\s*\d+", re.I),
+    # «осталось 860 ккал», «до нормы 900»
+    re.compile(r"оста[лё]\w*" + _FILL + r"\d[\d\s]*\s*ккал", re.I),
+    re.compile(r"до\s+нормы" + _FILL + r"(?:осталось\s*)?[~≈]?\s*\d{3,5}", re.I),
+    # «за день 1850», «за сегодня уже 1500 ккал»
+    re.compile(r"за\s+(?:весь\s+)?(?:день|сегодня)" + _FILL + r"\d{3,5}", re.I),
+]
+# Оценка самого блюда: «≈ 780 ккал (660–900) · Б 60 · Ж 27 · У 79» - её не трогаем.
+DISH_RE = re.compile(
+    r"≈\s*\d[\d\s]*\s*ккал(?:\s*\([^)\n]*\))?(?:\s*·\s*[БЖУ]\s*\d+)*"
+    r"|\d[\d\s]*\s*ккал(?:\s*\([^)\n]*\))?(?:\s*·\s*[БЖУ]\s*\d+)+")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _totals_spans(chunk):
+    return [m.span() for rx in TOTALS_RES for m in rx.finditer(chunk)]
+
+
+def strip_model_totals(text):
+    """(текст без «N из M ккал», «осталось N ккал», «за день N»; сколько фраз вырезано).
+
+    Итог дня считает код по журналу, числа модели про день вырезаются целой фразой.
+    Строка оценки блюда остаётся; если итог приписан к ней хвостом - режется только хвост."""
+    out, removed = [], 0
+    for line in str(text or "").split("\n"):
+        spans = _totals_spans(line)
+        if not spans:
+            out.append(line)
+            continue
+        dish = DISH_RE.search(line)
+        first = min(a for a, _ in spans)
+        if dish and first >= dish.end():
+            out.append(line[:first].rstrip(" \t,;:—–-(").rstrip())
+            removed += 1
+            continue
+        kept = []
+        for sentence in _SENT_SPLIT_RE.split(line):
+            if _totals_spans(sentence):
+                removed += 1
+            else:
+                kept.append(sentence)
+        if " ".join(kept).strip():
+            out.append(" ".join(kept))
+    clean = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return clean, removed
+
+
+def totals_line(person, day, totals, profile, updated=False):
+    """Строка итога по журналу: её пишет код, не модель."""
+    if journal.profile_filled(profile):
+        kcal = "%d из %s ккал" % (totals["kcal"], journal._fmt_num(profile["target_kcal"]))
+    else:
+        kcal = "%d ккал" % totals["kcal"]
+    macros = "Б %d · Ж %d · У %d" % (totals["p"], totals["f"], totals["c"])
+    if updated:
+        return "Итог дня обновлён (%s, %s): %s, %s" % (journal.WHO_RU[person], day, kcal, macros)
+    return "%s, %s: записано %s, %s" % (journal.WHO_RU[person], day, kcal, macros)
+
+
+CLAIM_RE = re.compile(r"(?<!не )\b(?:записал|перен[её]с|исправил|поправил|удалил)\b", re.I)
+DAY_OPS = ("add_meal", "update_entry", "delete_entry", "move_entry")
+
+
+def handle_reply(reply, now, data_dir=None, who=None, daily_sent=None):
     """Ответ модели -> (текст для группы | None, итог применения actions).
 
     Блок вырезается всегда; битый блок -> ничего не пишем, ошибка в лог, текст уходит.
     NO_REPLY -> текст None (действия, если были, всё равно применяются).
+    Числа про итог дня из текста модели вырезаются, строку итога дописывает код по журналу;
+    для дня, по которому итог уже отправлен (day <= daily_sent), - «Итог дня обновлён: …».
     """
+    data = data_dir or DATA_DIR
     clean, actions, error = extract_actions(reply)
-    outcome = {"applied": [], "errors": []}
+    outcome = {"applied": [], "errors": [], "skipped": [], "warnings": []}
     if error:
         outcome["errors"].append(error)
     elif actions:
-        outcome = journal.apply_actions(actions, now, data_dir or DATA_DIR)
+        got = journal.apply_actions(actions, now, data)
+        for key in outcome:
+            outcome[key] = list(got.get(key) or [])
+    done = outcome["applied"] or outcome["skipped"]
     text = None if (is_no_reply(clean) or not clean.strip()) else clean
-    if text and not outcome["applied"] and not outcome["errors"] and re.search(r"(?<!не )\b(?:записал|перен[её]с|исправил|поправил|удалил)\b", text, re.I):
+    if text and not done and not outcome["errors"] and CLAIM_RE.search(text):
         outcome["errors"].append("ответ обещает запись, но действий нет")
+    stripped = 0
+    if text:
+        text, stripped = strip_model_totals(text)
+        outcome["stripped"] = stripped
     if outcome["errors"]:
-        text = (text or "") + "\nНе получилось сохранить часть изменений в журнале. Проверь запись или попроси меня повторить."
-    if text and outcome["applied"]:
-        changed = set()
+        text = ((text or "") + "\nНе получилось сохранить часть изменений в журнале. "
+                "Проверь запись или попроси меня повторить.").strip()
+    if text is None:
+        return None, outcome
+
+    changed = set()
+    if done:
         for raw_action in actions or []:
             action, err = journal.validate_action(raw_action)
             if err or not action:
                 continue
             op = action.get("op")
-            if op in ("add_meal", "update_entry", "delete_entry", "move_entry"):
-                old_day = journal.day_from_id(str(action.get("id") or ""))
-                people = {action.get("who")} if action.get("who") in journal.WHO else set()
-                if old_day:
-                    old = journal.read_entries(old_day, data_dir or DATA_DIR, include_deleted=True)
-                    people.update(e.get("who") for e in old if e.get("id") == action.get("id") and e.get("who") in journal.WHO)
-                for day in (old_day, action.get("day") or (journal.day_of(now) if op == "add_meal" else None)):
-                    if day:
-                        changed.update((day, person) for person in people)
-        if changed:
-            lines = []
-            for day, person in sorted(changed):
-                entries = journal.read_entries(day, data_dir or DATA_DIR)
-                totals = journal.day_totals(entries, person)
-                lines.append("%s, %s: записано %s ккал, Б %s · Ж %s · У %s" %
-                             (journal.WHO_RU[person], day, totals["kcal"], totals["p"], totals["f"], totals["c"]))
-            if lines:
-                text += "\n\nСверка журнала (записи могут быть неполными):\n" + "\n".join(lines)
-    return text, outcome
+            if op not in DAY_OPS:
+                continue
+            old_day = journal.day_from_id(str(action.get("id") or ""))
+            people = {action.get("who")} if action.get("who") in journal.WHO else set()
+            people.update(w for w in [(action.get("fields") or {}).get("who")] if w in journal.WHO)
+            if old_day:
+                old = journal.read_entries(old_day, data, include_deleted=True)
+                people.update(e.get("who") for e in old if e.get("id") == action.get("id") and e.get("who") in journal.WHO)
+            for day in (old_day, action.get("day") or (journal.day_of(now) if op == "add_meal" else None)):
+                if day:
+                    changed.update((day, person) for person in people)
+    if stripped and not changed and who in journal.WHO:
+        changed.add((journal.day_of(now), who))  # числа модели вырезаны - отвечаем числами журнала
+    if not changed:
+        return (text or clean), outcome
+
+    profiles = journal.load_profiles(journal.profiles_path(data))
+    plain, updated = [], []
+    for day, person in sorted(changed):
+        totals = journal.day_totals(journal.read_entries(day, data), person)
+        late = bool(daily_sent) and day <= str(daily_sent)
+        (updated if late else plain).append(totals_line(person, day, totals, profiles.get(person) or {}, late))
+    blocks = [text] if text else []
+    if plain:
+        blocks.append("Сверка журнала (записи могут быть неполными):\n" + "\n".join(plain))
+    if updated:
+        blocks.append("\n".join(updated))
+    return "\n\n".join(blocks), outcome
 
 
 # ---------------------------------------------------------------------------
@@ -1044,11 +1154,32 @@ async def _typing_loop(bot, chat_id):  # pragma: no cover - сетевой ци�
         return
 
 
-async def send_group(bot, text):
+TOKEN_RE = re.compile(r"\d{6,}:[A-Za-z0-9_-]{20,}")
+
+
+def redact(value):
+    """Текст ошибки для лога без токена бота (он бывает в URL запроса)."""
+    return TOKEN_RE.sub("<token>", str(value))
+
+
+async def send_group(bot, text, retry_delay=None):
+    """Отправить кусками; на ошибку/таймаут Telegram - один повтор куска.
+
+    Возвращает (отправленные куски, всё ли ушло). После второго сбоя дальше не шлём."""
+    delay = SEND_RETRY_DELAY if retry_delay is None else retry_delay
     sent = []
     for chunk in split_message(text):
-        sent.append(await bot.send_message(chat_id=GROUP_CHAT_ID, text=chunk))
-    return sent
+        for attempt in (1, 2):
+            try:
+                await bot.send_message(chat_id=GROUP_CHAT_ID, text=chunk)
+                sent.append(chunk)
+                break
+            except Exception as exc:  # noqa: BLE001 - сеть, таймаут, flood control
+                logger.warning("Отправка в группу: попытка %d не удалась: %s", attempt, redact(exc))
+                if attempt == 2:
+                    return sent, False
+                await asyncio.sleep(min(float(getattr(exc, "retry_after", None) or delay), 30.0))
+    return sent, True
 
 
 async def _with_typing(bot, coro):  # pragma: no cover - сетевой цикл
@@ -1066,15 +1197,22 @@ async def _with_typing(bot, coro):  # pragma: no cover - сетевой цикл
                 pass
 
 
-async def _deliver(bot, text, label=BOT_NAME):
+async def _deliver(bot, text, label=BOT_NAME, retry_delay=None):
+    """В чатлог как отправленное идёт только то, что Telegram принял. -> всё ли ушло."""
     try:
-        await send_group(bot, text)
+        sent, ok = await send_group(bot, text, retry_delay)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Не смог отправить в группу: %s", exc)
-    try:
-        append_chatlog([format_chatlog_line(label, text)])
-    except OSError as exc:
-        logger.warning("Не смог записать ответ в чатлог: %s", exc)
+        logger.error("Не смог отправить в группу: %s", redact(exc))
+        sent, ok = [], False
+    if not ok:
+        logger.error("Ответ НЕ доставлен (%d знаков, ушло кусков: %d) - в чатлог как отправленный не пишу",
+                     len(text or ""), len(sent))
+    if sent:
+        try:
+            append_chatlog([format_chatlog_line(label, "\n\n".join(sent))])
+        except OSError as exc:
+            logger.warning("Не смог записать ответ в чатлог: %s", exc)
+    return ok
 
 
 def hermes_expected(user_text=None, reserve=None):
@@ -1093,13 +1231,13 @@ async def answer_batch(prompt, records, who, now, profiles, today, tail, user_te
     paths = batch_images(records)
     hermes_prompt = None
     if paths and hermes_expected(user_text):
-        vision_text, dur_pre = await describe_images(paths)
-        logger.info("vision_pre=%s images=%d dur_pre=%.1fs model=%s",
-                    "ok" if vision_text else "fail", len(paths), dur_pre, VISION_MODEL)
+        vision_text, dur_pre, cost_pre = await describe_images(paths)
+        logger.info("vision_pre=%s images=%d dur_pre=%.1fs cost_pre=%s model=%s",
+                    "ok" if vision_text else "fail", len(paths), dur_pre, fmt_cost(cost_pre), VISION_MODEL)
         if vision_text:
             hermes_prompt = build_turn_prompt(records, who, now, profiles, today, tail, DATA_DIR,
                                               vision_text=vision_text, meal_history=meal_history)
-    return await call_model(prompt, user_text, hermes_prompt)
+    return await call_model(prompt, user_text, hermes_prompt, images=paths)
 
 
 async def process_batch(bot, who, records):  # pragma: no cover - рантайм
@@ -1131,17 +1269,25 @@ async def process_batch(bot, who, records):  # pragma: no cover - рантайм
             await _deliver(bot, ERROR_TEXT, "%s [сбой: %s]" % (BOT_NAME, kind))
             return
         try:
-            text, outcome = handle_reply(reply, now_utc())
+            text, outcome = handle_reply(reply, now_utc(), who=who, daily_sent=load_state().get("daily_sent"))
         except Exception as exc:  # noqa: BLE001 - журнал не должен ронять ответ
             logger.exception("Применение actions упало: %s", exc)
             text, outcome = extract_actions(reply)[0] or None, {"applied": [], "errors": [str(exc)]}
         if outcome["applied"]:
             logger.info("Журнал: %s", "; ".join(outcome["applied"]))
+        if outcome.get("skipped"):
+            logger.info("Журнал, дубли пропущены: %s", "; ".join(outcome["skipped"]))
+        if outcome.get("warnings"):
+            logger.warning("Журнал, поправлено при записи: %s", "; ".join(outcome["warnings"]))
+        if outcome.get("stripped"):
+            logger.info("Из ответа вырезано фраз с итогами модели: %d", outcome["stripped"])
         if outcome["errors"]:
             logger.warning("Actions отклонены: %s", "; ".join(outcome["errors"]))
         if text is None:
             logger.info("NO_REPLY/пустой ответ - молчу")
             return
+        if len(text) > REPLY_WARN_CHARS:
+            logger.warning("Длинный ответ на обычное сообщение: %d знаков (порог %d)", len(text), REPLY_WARN_CHARS)
         await _deliver(bot, text)
         maybe_cleanup_inbox()
 
@@ -1287,7 +1433,7 @@ async def intake_record(bot, who, message):  # pragma: no cover - сеть
         note = media_intake.unsupported_note(info)
         if note:
             notes.append(note)
-    return build_record(who, text, message_id, media, notes)
+    return build_record(who, text, message_id, media, notes, reply_to=reply_context(message))
 
 
 def _user_display(user):
@@ -1330,6 +1476,10 @@ async def on_group_message(update, context):  # pragma: no cover - рантай�
         batch.release()
     if len(batch):
         schedule_flush(context.bot, who)
+
+
+async def on_error(update, context):  # pragma: no cover - рантайм
+    logger.error("Ошибка хендлера: %s", redact(repr(getattr(context, "error", None))))
 
 
 async def tick_job(context):  # pragma: no cover - рантайм
@@ -1453,6 +1603,7 @@ def main():  # pragma: no cover - рантайм
     app.add_handler(CommandHandler("daily_now", cmd_daily_now, filters=groups))
     app.add_handler(CommandHandler("weekly_now", cmd_weekly_now, filters=groups))
     app.add_handler(MessageHandler(groups & ~filters.COMMAND & ~filters.StatusUpdate.ALL, on_group_message))
+    app.add_error_handler(on_error)
 
     if app.job_queue is None:
         sys.exit("JobQueue недоступна. Нужен python-telegram-bot[job-queue].")

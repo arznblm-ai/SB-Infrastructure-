@@ -99,7 +99,19 @@ ST_TRACK = "pending_track"  # ждём ответа Антона о треке
 ST_FAILED = "failed"
 ST_NO_TRANSCRIPT = "no_transcript"
 ST_UNPARSED = "done_unparsed"  # модель отработала (файлы могли быть записаны), но JSON не разобран — не повторять
-FINAL = (ST_DONE, ST_FAILED, ST_NO_TRANSCRIPT, ST_UNPARSED)
+ST_DUPLICATE = "duplicate"  # вторая запись уже разобранного разговора (Krisp + диктофон/быстрый путь)
+FINAL = (ST_DONE, ST_FAILED, ST_NO_TRANSCRIPT, ST_UNPARSED, ST_DUPLICATE)
+HANDLED = (ST_DONE, ST_TRACK, ST_UNPARSED)  # с такими сверяем новую запись на дубль
+
+# Один разговор по двум записям: начало ±5 мин и длительность ±10%.
+DUP_START_MINUTES = 5
+DUP_DURATION_SHARE = 0.10
+DATE_LINE_RE = re.compile(r"^\*\*Дата:\*\*\s*\d{4}-\d{2}-\d{2}\s+(\d{1,2}):(\d{2})", re.M)
+TITLE_TIME_RE = re.compile(r"(?<!\d)(\d{1,2})[ :](\d{2})\s*([AP]M)\b", re.I)
+STAMP_RE = re.compile(
+    r"^(?:\*\*[^*\n]+\|\s*((?:\d{1,2}:)?\d{1,2}:\d{2})\*\*|\[((?:\d{1,2}:)?\d{1,2}:\d{2})\])", re.M
+)
+DURATION_LINE_RE = re.compile(r"^\*\*Длительность:\*\*\s*(?:(\d+)\s*ч)?\s*(?:(\d+)\s*мин)?", re.M)
 RAW_DIRNAME = "raw"  # сырой вывод claude на каждый вызов: <home>/raw/<дата>-<slug>.txt
 
 
@@ -290,6 +302,96 @@ def transcript_ready(text):
     if n < MIN_SPEAKER_LINES:
         return False, "short:%d" % n
     return True, "ok:%d" % n
+
+
+def _clock_seconds(stamp):
+    total = 0
+    for part in str(stamp).split(":"):
+        total = total * 60 + int(part)
+    return total
+
+
+def call_signature(text):
+    """(начало в минутах от полуночи MSK | None, длительность в секундах | None).
+
+    Начало: время из названия Krisp («12:02 PM - … meeting») — у таких записей строка
+    «Дата» бывает временем конца; иначе строка «Дата». Длительность: последняя метка
+    времени в транскрипте (`**Имя | 19:41**` или `[00:19:41]`), запасной вариант —
+    строка «Длительность» (она часто «0мин», поэтому вторая).
+    """
+    text = text or ""
+    start = None
+    m = TITLE_TIME_RE.search(transcript_title(text))
+    if m:
+        hour, minute = int(m.group(1)) % 12, int(m.group(2))
+        if m.group(3).upper() == "PM":
+            hour += 12
+        start = hour * 60 + minute
+    else:
+        m = DATE_LINE_RE.search(text)
+        if m:
+            start = int(m.group(1)) * 60 + int(m.group(2))
+    duration = None
+    stamps = [a or b for a, b in STAMP_RE.findall(text)]
+    if stamps:
+        duration = max(_clock_seconds(x) for x in stamps)
+    if not duration:
+        m = DURATION_LINE_RE.search(text)
+        if m and (m.group(1) or m.group(2)):
+            duration = (int(m.group(1) or 0) * 60 + int(m.group(2) or 0)) * 60
+    return start, (duration or None)
+
+
+def same_call(sig_a, sig_b):
+    """Две записи одного разговора. Нет начала или длительности у любой — не дубль."""
+    (start_a, dur_a), (start_b, dur_b) = sig_a, sig_b
+    if None in (start_a, dur_a, start_b, dur_b):
+        return False
+    if abs(start_a - start_b) > DUP_START_MINUTES:
+        return False
+    return abs(dur_a - dur_b) <= DUP_DURATION_SHARE * max(dur_a, dur_b)
+
+
+def find_duplicate(cfg, state, cand):
+    """Имя уже разобранного транскрипта того же разговора или None."""
+    sig = call_signature(cand.get("text"))
+    if None in sig:
+        return None
+    for name, entry in sorted(state.get("calls", {}).items()):
+        if name == cand["name"] or entry.get("status") not in HANDLED:
+            continue
+        path = os.path.join(cfg.vault, TRANSCRIPTS_REL, name)
+        m = NAME_DATE_RE.search(name)
+        if not m or m.group(1) != cand["date"].isoformat():
+            continue
+        if same_call(sig, call_signature(read_text(path))):
+            return name
+    return None
+
+
+def snapshot_kb(cfg):
+    """Содержимое трёх баз проектов до вызова модели: {путь: текст | None}."""
+    out = {}
+    for rel in KB_REL.values():
+        path = os.path.join(cfg.vault, rel)
+        out[path] = read_text(path) if os.path.exists(path) else None
+    return out
+
+
+def restore_kb(snapshot):
+    """Вернуть базы к снимку. Список путей, которые модель успела изменить."""
+    reverted = []
+    for path, before in (snapshot or {}).items():
+        if before is None:
+            continue  # файла не было: созданное не удаляем
+        if read_text(path) == before:
+            continue
+        tmp = path + ".tmp-calls"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(before)
+        os.replace(tmp, path)
+        reverted.append(path)
+    return reverted
 
 
 def read_text(path):
@@ -753,6 +855,14 @@ class Tick:
                         e.setdefault("first_seen", _iso(self.now))
                         e.update(status=ST_RETRY, krisp_call_id=cand["krisp_call_id"], updated_at=_iso(self.now))
                 continue
+            twin = find_duplicate(self.cfg, self.state, cand)
+            if twin:
+                # тот же разговор по второй записи: модель не зовём, Антону не пишем
+                self.plan("%s: дубль разговора «%s» -> пропуск" % (name, _short(twin)))
+                if not self.dry:
+                    self.entry(name).update(status=ST_DUPLICATE, duplicate_of=twin,
+                                            krisp_call_id=cand["krisp_call_id"], updated_at=_iso(self.now))
+                continue
             if self.used >= self.max:
                 self.plan("%s: в очереди на разбор (лимит %d за тик)" % (name, self.max))
                 continue
@@ -773,6 +883,7 @@ class Tick:
         entry["attempts"] = attempt
         started = time.monotonic()
         prompt = build_prompt(self.cfg, cand, forced_track, existing_summary, self.now)
+        kb_before = snapshot_kb(self.cfg)
         res = self.claude_fn(prompt, self.cfg)
         text, kind, cost = res[0], res[1], res[2]
         raw = res[3] if len(res) > 3 else text
@@ -807,6 +918,20 @@ class Tick:
             return False
 
         track = forced_track or result["track"]
+        # Трек «мимо» или уверенность ниже порога: в базы проектов и в задачи ничего не идёт.
+        # Базы проверяет код: правки модели откатываются к снимку до вызова.
+        guard_note = ""
+        if forced_track is None and (track in (None, "none") or result["confidence"] < CONFIDENCE_MIN):
+            reverted = restore_kb(kb_before)
+            if reverted:
+                logger.warning("%s: трек не ясен, откатила правки баз: %s", name,
+                               ", ".join(os.path.basename(p) for p in reverted))
+                log["kb_reverted"] = len(reverted)
+            result["kb_updates"] = []
+            if result["tasks"]:
+                titles = "; ".join(str((t or {}).get("title") or "?") for t in result["tasks"] if isinstance(t, dict))
+                guard_note = "\n\nПроект не ясен, а задачи в «Мои» уже поставлены: %s. Проверь, лишние закрой." % (titles or "?")
+                log["tasks_without_track"] = len(result["tasks"])
         log.update(track=track, confidence=result["confidence"], summary_path=result["summary_path"],
                    kb_updates=len(result["kb_updates"]), tasks=len(result["tasks"]))
         append_log(self.cfg, log)
@@ -823,12 +948,12 @@ class Tick:
                 "asked_at": _iso(self.now), "status": "pending", "track": None,
             })
             self.queue_dirty = True
-            self.send(result["report_text"].rstrip() + "\n\n" + QUESTION_TAIL, with_backlog=False)
+            self.send(result["report_text"].rstrip() + guard_note + "\n\n" + QUESTION_TAIL, with_backlog=False)
             append_journal(self.cfg, "📞 звонок «%s»: не уверена в проекте, спросила Антона" % _short(name), self.now)
             return True
 
         entry.update(status=ST_DONE, track=track, summary_path=result["summary_path"], updated_at=_iso(self.now))
-        self.send(result["report_text"])
+        self.send(result["report_text"].rstrip() + guard_note)
         summary = os.path.basename(result["summary_path"]).replace(".md", "") if result["summary_path"] else ""
         what = "📞 разбор звонка «%s»: %s" % (_short(name), TRACK_RU.get(track, track))
         if summary:

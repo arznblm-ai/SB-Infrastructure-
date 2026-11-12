@@ -651,3 +651,129 @@ def test_hermes_mcp_servers_gcal_limited(tmp_path):
     assert servers["gcal"]["tools"]["include"] == list(bot.GCAL_TOOLS)
     assert "save_item" not in servers["gcal"]["tools"]["include"]
     assert servers["todoist"]["command"] == "/py" and "tools" not in servers["todoist"]
+
+
+# ---------------------------------------------------------------------------
+# Аудит 2026-11-10: правила Hermes, PDF -> Claude, журнал в промпте, окно пересылок
+# ---------------------------------------------------------------------------
+def test_hermes_rules_whole_sentences_and_signatures():
+    rules = bot.HERMES_RULES
+    assert "без вопроса и без подтверждения" in rules
+    assert "вопрос, Исключение" not in rules and "не меняй. чужие" not in rules  # разрыв вставкой
+    for needle in ("list_events(date=", "create_event(title, start=", "update_event(event_id",
+                   "delete_event(event_id)", "todoist_add_task(content", "todoist_close_task(task_id)",
+                   "бренд", "## Журнал", "meetings/"):
+        assert needle in rules
+    for line in rules.strip().strip("[]").split("\n"):
+        assert line.rstrip().endswith((".", "]")), line
+
+
+def test_batch_only_forwards_waits_longer_and_comment_restores_short_window():
+    b = bot.Batch(quiet=4, quiet_forward=11)
+    t0 = utc(2026, 11, 10, 9, 0, 0)
+    fwd = {"source": "Виталик", "date": t0}
+    b.add(rec("давай в сб в 12", 1, forward=fwd), now=t0)
+    assert not b.due(t0 + timedelta(seconds=5))
+    assert b.due(t0 + timedelta(seconds=11))
+    # комментарий Антона через 8 с попал в ту же пачку; дальше обычные 4 с
+    b.add(rec("поставь это", 2), now=t0 + timedelta(seconds=8))
+    assert len(b) == 2 and not b.due(t0 + timedelta(seconds=11))
+    assert b.due(t0 + timedelta(seconds=12))
+    assert bot.Batch().quiet_forward >= 10
+
+
+def test_journal_head_goes_into_prompt(tmp_path):
+    path = tmp_path / "journal.md"
+    body = ["---", "track: none", "---", "", "# Общая память", "", "## Сейчас в работе", "",
+            "<!-- подсказка", "на две строки -->", "- держи в голове смету", "", "## Журнал", ""]
+    body += ["- 2026-11-%02d 10:00 · tg · строка %d" % (30 - i, i) for i in range(60)]
+    path.write_text("\n".join(body), encoding="utf-8")
+    head = bot.read_journal_head(str(path))
+    lines = head.splitlines()
+    assert len(lines) == bot.JOURNAL_HEAD_LINES == 40
+    assert "track: none" not in head and "подсказка" not in head
+    assert "- держи в голове смету" in lines and "## Журнал" in lines and "строка 0" in head
+    assert bot.read_journal_head(str(tmp_path / "нет.md")) == ""
+    prompt = bot.build_turn_prompt([rec("привет", 1)], journal_text=head)
+    assert "Общий журнал" in prompt and "строка 0" in prompt
+    assert "Общий журнал" not in bot.build_turn_prompt([rec("привет", 1)])
+    assert bot.journal_path("/v").endswith("общая память Аси с Антоном – 2026-10-20.md")
+
+
+def test_footer_no_longer_asks_to_read_journal_first():
+    with open(os.path.join(ROOT, "config", "workspace-footer.md"), encoding="utf-8") as f:
+        footer = f.read()
+    assert "Перед ответом: Read первые 40 строк" not in footer
+    assert "уже в сообщении" in footer and "бренд" in footer
+    with open(os.path.join(ROOT, "persona", "asya.md"), encoding="utf-8") as f:
+        persona = f.read()
+    assert "Strategic Board" not in persona
+    assert "Живых треков четыре" in persona and "`бренд`" in persona
+    assert "3–5 главных" in persona and "update_event без вопроса" in persona
+
+
+def test_todoist_server_accepts_brand_track():
+    path = os.path.join(ROOT, "..", "daily focus", "deploy", "todoist_mcp_server.py")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    assert 'TRACKS = ("портал", "луч", "зекиро", "бренд", "личное")' in src
+
+
+def _pdf_record():
+    media = [{"kind": media_intake.KIND_PDF, "path": "/x/inbox/a.pdf", "rel": "inbox/a.pdf", "name": "a.pdf",
+              "mime": "application/pdf", "author": "Антон"}]
+    return bot.build_record("что в договоре", message_id=1, attachments=["document"], media=media)
+
+
+def test_pdf_batch_goes_to_claude_not_hermes(monkeypatch, runtime):
+    calls = []
+
+    async def fake_claude(prompt):
+        calls.append("claude")
+        return "В договоре срок 10 дней.", None
+
+    async def no_hermes(*a, **kw):
+        calls.append("hermes")
+        return "не вижу файл", None
+
+    monkeypatch.setattr(bot, "run_claude", fake_claude)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", no_hermes)
+    monkeypatch.setenv("ASYA_PRIMARY_ENGINE", "hermes")
+    assert bot.has_pdf([_pdf_record()]) and not bot.has_pdf([rec("текст", 1)])
+    fake_bot = FakeBot()
+    asyncio.run(bot.process_batch(fake_bot, [_pdf_record()]))
+    assert calls == ["claude"]
+    assert fake_bot.sent[-1][1] == "В договоре срок 10 дней."
+    assert bot.RESERVE.last_reason == "pdf"
+
+
+def test_pdf_batch_falls_back_when_claude_fails(monkeypatch, runtime):
+    calls = []
+
+    async def bad_claude(prompt):
+        calls.append("claude")
+        return "", "quota"
+
+    async def hermes(*a, **kw):
+        calls.append("hermes")
+        return "ответ запасной модели", None
+
+    monkeypatch.setattr(bot, "run_claude", bad_claude)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", hermes)
+    monkeypatch.setenv("ASYA_PRIMARY_ENGINE", "hermes")
+    fake_bot = FakeBot()
+    asyncio.run(bot.process_batch(fake_bot, [_pdf_record()]))
+    assert calls[:2] == ["claude", "hermes"]
+    assert fake_bot.sent[-1][1] == "ответ запасной модели"
+
+
+def test_error_handler_logs_one_line_without_token(monkeypatch, caplog):
+    monkeypatch.setattr(bot, "BOT_TOKEN", "123:SECRET")
+    ctx = SimpleNamespace(error=RuntimeError("сбой\nhttps://api.telegram.org/bot123:SECRET/getUpdates"))
+    with caplog.at_level("WARNING", logger="asya"):
+        asyncio.run(bot.on_error(None, ctx))
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "RuntimeError" in msg and "SECRET" not in msg and "\n" not in msg
+    with open(os.path.join(HERE, "asya_bot.py"), encoding="utf-8") as f:
+        assert "app.add_error_handler(on_error)" in f.read()

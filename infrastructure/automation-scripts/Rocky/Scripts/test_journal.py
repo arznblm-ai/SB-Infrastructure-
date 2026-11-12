@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -266,3 +266,47 @@ def test_weekly_summary():
     text = journal.format_weekly_text(s, days)
     assert "Антон:" in text and "Ралина:" in text and "тренд -0.5" in text
     assert "Дней в норме (±10%): 1 из 2" in text and "ни одной записи" in text
+
+
+# --- аудит 10.11: проверки чисел еды и дедуп ------------------------------------
+def test_normalize_meal_bounds_and_macros():
+    ok = {"items": ["гречка"], "kcal": 620, "kcal_lo": 550, "kcal_hi": 700, "p": 42, "f": 24, "c": 55}
+    assert journal.normalize_meal(ok) == (ok, [])
+    fixed, notes = journal.normalize_meal({"items": ["паста"], "kcal": 1200, "kcal_lo": 500, "kcal_hi": 700,
+                                           "p": 30, "f": 20, "c": 80})
+    assert fixed["kcal"] == 620 and fixed["kcal_lo"] == 500 and fixed["kcal_hi"] == 700 and len(notes) == 1
+    fixed, notes = journal.normalize_meal({"kcal": 600, "kcal_lo": 700, "kcal_hi": 500})
+    assert (fixed["kcal_lo"], fixed["kcal"], fixed["kcal_hi"]) == (500, 600, 700) and notes
+    fixed, notes = journal.normalize_meal({"kcal": 900, "kcal_lo": 400, "kcal_hi": 600})
+    assert fixed["kcal_hi"] == 900 and fixed["kcal"] == 900 and notes
+    # неполные БЖУ и алкоголь по БЖУ не пересчитываются
+    assert journal.normalize_meal({"kcal": 500, "p": 10})[1] == []
+    beer = {"items": ["пиво 0,5"], "kcal": 215, "p": 2, "f": 0, "c": 18}
+    assert journal.normalize_meal(beer) == (beer, [])
+
+
+def test_apply_fixes_kcal_by_macros_and_warns_not_rejects(tmp_path):
+    data = str(tmp_path)
+    res = journal.apply_actions([meal(kcal=1200, p=30, f=20, c=80, items=["паста"])], NOW, data)
+    assert res["applied"] == ["add_meal m-20261022-1"] and not res["errors"] and len(res["warnings"]) == 1
+    entry = journal.read_entries("2026-10-22", data)[0]
+    assert entry["kcal"] == 620 and entry["added_ts"].startswith("2026-10-22T")
+    res = journal.apply_actions([{"op": "update_entry", "id": "m-20261022-1", "fields": {"kcal": 100}}], NOW, data)
+    assert res["applied"] and res["warnings"] and journal.read_entries("2026-10-22", data)[0]["kcal"] == 620
+
+
+def test_dedup_same_meal_within_ten_minutes(tmp_path):
+    data = str(tmp_path)
+    bare = dict(kcal_lo=None, kcal_hi=None, p=None, f=None, c=None)  # без БЖУ: kcal не пересчитывается
+    m = meal(items=["Гречка 150 г"], kcal=400, **bare)
+    assert journal.apply_actions([m], NOW, data)["applied"]
+    again = journal.apply_actions([meal(items=["гречка  150 г"], kcal=400, **bare)], NOW + timedelta(minutes=9), data)
+    assert again["applied"] == [] and len(again["skipped"]) == 1 and not again["errors"]
+    assert journal.apply_actions([meal(who="ralina", items=["гречка 150 г"], kcal=400, **bare)], NOW, data)["applied"]
+    assert journal.apply_actions([meal(items=["гречка 150 г"], kcal=450, **bare)], NOW, data)["applied"]
+    assert journal.apply_actions([m], NOW + timedelta(minutes=11), data)["applied"]
+    # запись на вчера: окно считается от момента добавления, не от условных 12:00
+    y = dict(m, day="2026-10-21")
+    assert journal.apply_actions([y], NOW, data)["applied"]
+    assert journal.apply_actions([y], NOW + timedelta(minutes=2), data)["skipped"]
+    assert len(journal.read_entries("2026-10-21", data)) == 1

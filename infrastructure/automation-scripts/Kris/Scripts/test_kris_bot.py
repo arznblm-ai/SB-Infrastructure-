@@ -279,10 +279,84 @@ def test_evening_prompt_asks_only_for_problems():
     assert "—" not in prompt
 
 
-def test_evening_prompt_prefers_default_over_question():
+def test_evening_prompt_limits_defaults_to_internal_deadlines():
     prompt = kb.build_evening_prompt(memory_dir="/mem")
-    assert "Правило дефолта вместо вопроса" in prompt
-    assert "без движения" in prompt
+    assert "только для внутренних сроков" in prompt
+    assert "Срок клиенту, сумму, ставку, бюджет не придумываешь" in prompt
+    assert "кандидатом в память не записываешь" in prompt
+    assert '"сдан", "закрыт"' in prompt
+
+
+def test_evening_prompt_carries_previous_status_and_no_news_rule():
+    prompt = kb.build_evening_prompt(memory_dir="/mem", previous="P&G: жду ответ по срокам")
+    assert "Вчерашний статус: P&G: жду ответ по срокам" in prompt
+    assert "Не повторяй вопросы и пункты из вчерашнего статуса" in prompt
+    assert kb.NO_NEWS in prompt
+    assert "первый статус" in kb.build_evening_prompt(memory_dir="/mem")
+
+
+def test_evening_prompt_embeds_shared_memory(tmp_path):
+    (tmp_path / "{kris} {research} общая память с Антоном – 2026-10-19.md").write_text(
+        "## Сейчас в работе\n- OVI сдан 10.11\n", encoding="utf-8")
+    prompt = kb.build_evening_prompt(memory_dir=str(tmp_path))
+    assert "OVI сдан 10.11" in prompt
+    assert "общая память с Антоном" in prompt
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Нового нет", True), ("нового нет.", True), ('"Нового нет"', True),
+    ("Нового нет, но по P&G сорван срок: клиент ждал вчера, а исходников нет", False),
+    ("P&G: срок завтра", False), ("", False),
+])
+def test_is_no_news(text, expected):
+    assert kb.is_no_news(text) is expected
+
+
+def test_now_line_is_moscow_with_weekday():
+    from datetime import datetime, timezone
+    line = kb.now_line(datetime(2026, 11, 10, 19, 5, tzinfo=timezone.utc))
+    assert line == "Сейчас: 10.11.2026 22:05 МСК, вторник"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Крис, запомни ставку моушн-дизайнера 15к", True),
+    ("запомни правило: комиссия по Лучу 0", True),
+    ("ставку колориста запомни - 20 000", True),
+    ("запиши урок в `memory/knowledge/{alina} {rule} правила расчёта.md`", True),
+    ("запомни, что Егор сдаёт стилы в пятницу", False),
+    ("что по ставкам на P&G?", False),
+])
+def test_needs_claude_for_knowledge_writes(text, expected):
+    assert kb.needs_claude(text) is expected
+
+
+def _write_payload(path):
+    return {"tool_name": "write_file", "tool_input": {"path": path, "content": "x"}}
+
+
+def test_hermes_cannot_write_knowledge_and_templates_but_reads_them(tmp_path):
+    import importlib.util
+    (tmp_path / "guard.py").write_text(kb.hermes_reserve.GUARD_SOURCE, encoding="utf-8")
+    (tmp_path / "kris_guard.py").write_text(kb.KRIS_GUARD_SOURCE, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("kris_guard_under_test", tmp_path / "kris_guard.py")
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    policy = kb.RESERVE.policy()
+    mem = os.path.realpath(kb.MEMORY_DIR)
+    assert kb.WRITE_DENY_REASON == guard.verdict(_write_payload(mem + "/knowledge/rates.md"), policy)
+    assert kb.WRITE_DENY_REASON == guard.verdict(_write_payload(mem + "/templates/t.xlsx"), policy)
+    patch = {"tool_name": "patch", "tool_input": {
+        "mode": "patch", "patch": "*** Update File: %s/knowledge/rules.md\n@@\n-a\n+b" % mem}}
+    assert kb.WRITE_DENY_REASON == guard.verdict(patch, policy)
+    # рабочая память и сметы пишутся, справочная база читается
+    assert guard.verdict(_write_payload(mem + "/Новый проект.md"), policy) is None
+    assert guard.verdict(_write_payload(mem + "/estimates/b.md"), policy) is None
+    assert guard.verdict(_write_payload(os.path.realpath(kb.WORKSPACE) + "/out/1/estimate.json"), policy) is None
+    read = {"tool_name": "read_file", "tool_input": {"path": mem + "/knowledge/rates.md"}}
+    assert guard.verdict(read, policy) is None
+    # общий страж по-прежнему работает
+    assert guard.verdict(_write_payload("/root/.ssh/x"), policy)
+    assert "kris_guard.py" in kb.RESERVE.config()["hooks"]["pre_tool_call"][0]["command"]
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +524,8 @@ def test_run_owner_turn_drains_queue_after_batch(isolated_state, monkeypatch):
     bot = FakeBot()
     asyncio.run(kb.run_owner_turn(bot, kb.ALLOWED_USER, None))
 
-    assert calls == [("привет, ты тут?", None)]
+    assert len(calls) == 1 and calls[0][1] is None
+    assert calls[0][0].startswith("Сейчас: ") and calls[0][0].endswith("\n\nпривет, ты тут?")
     assert bot.sent == [(kb.ALLOWED_USER, "ответ владельцу")]
     assert list(kb.pending_queue) == []
 
@@ -474,7 +549,8 @@ def test_run_owner_turn_drains_multiple_queued_messages(isolated_state, monkeypa
 
     # Первый прогон забирает "первое" + всё, что успело накопиться ("второе"),
     # склеивая их одним промптом - так же, как это делал старый цикл в on_private_message.
-    assert prompts == ["первое\n\nвторое"]
+    assert len(prompts) == 1 and prompts[0].startswith("Сейчас: ")
+    assert prompts[0].split("\n\n", 1)[1] == "первое\n\nвторое"
     assert list(kb.pending_queue) == []
     assert len(bot.sent) == 1
 
@@ -627,3 +703,61 @@ def test_batch_has_no_word_escalation(tmp_path, monkeypatch):
     monkeypatch.setattr(kb, "run_claude_resume", fake_claude)
     assert asyncio.run(kb.run_model("в чате: попроси клода")) == ("ok", None, None)
     assert calls == [] and "missed_claude" not in kb.load_state()
+
+
+def test_knowledge_turn_goes_to_claude(tmp_path, monkeypatch):
+    """«Запомни ставку» при основном Hermes уходит в Claude: knowledge у Hermes закрыт."""
+    monkeypatch.setattr(kb, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(kb, "STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("KRIS_PRIMARY_ENGINE", raising=False)
+    monkeypatch.delenv("KRIS_FORCE_ENGINE", raising=False)
+    seen = []
+
+    async def fake_hermes(prompt, resume=None, reason="reserve"):
+        seen.append("hermes")
+        kb.RESERVE.last_engine = "hermes"
+        return "h", None
+
+    async def fake_claude(prompt, session_id):
+        seen.append("claude")
+        return "записала", "s", None
+
+    monkeypatch.setattr(kb.RESERVE, "run_hermes", fake_hermes)
+    monkeypatch.setattr(kb, "run_claude_resume", fake_claude)
+    reply, _sid, kind = asyncio.run(kb.run_model("запомни ставку монтажёра 12к", None, dialog=True))
+    assert (reply, kind, seen) == ("записала", None, ["claude"])
+    assert kb.load_state()["missed_hermes"][0]["user"] == "запомни ставку монтажёра 12к"
+
+
+class _Ctx:
+    def __init__(self):
+        self.bot = FakeBot()
+
+
+def test_evening_job_stores_status_and_feeds_it_next_day(isolated_state, monkeypatch):
+    prompts, replies = [], ["P&G: клиент ждёт срок, спроси Антона", "Нового нет"]
+
+    async def fake_run_model(prompt, session_id=None, dialog=False):
+        prompts.append(prompt)
+        return (replies[len(prompts) - 1], None, None)
+
+    monkeypatch.setattr(kb, "run_model", fake_run_model)
+    monkeypatch.setattr(kb, "shared_memory_head", lambda *a, **k: "")
+    ctx = _Ctx()
+    asyncio.run(kb.evening_job(ctx))
+    assert kb.load_state()["last_evening_text"] == replies[0]
+    asyncio.run(kb.evening_job(ctx))
+    assert "Вчерашний статус: " + replies[0] in prompts[1]
+    # «Нового нет» уходит одной строкой и прошлый статус не затирает
+    assert [t for _c, t in ctx.bot.sent] == replies
+    assert kb.load_state()["last_evening_text"] == replies[0]
+
+
+def test_missing_fee_is_not_sent_to_model_for_fixing(isolated_state, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("модель не должна дописывать проценты")
+
+    monkeypatch.setattr(kb, "run_model", boom)
+    bot = FakeBot()
+    ok = asyncio.run(kb._fix_estimate_json(bot, 1, "/x/estimate.json", "не указаны комиссия/налог: нет поля"))
+    assert ok is False and "комиссия и налог" in bot.sent[0][1]

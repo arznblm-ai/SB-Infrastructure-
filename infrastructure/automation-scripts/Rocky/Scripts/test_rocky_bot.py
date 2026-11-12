@@ -109,7 +109,8 @@ def test_turn_prompt_contents():
                           media=[{"rel": "inbox/2026-10-22/7-photo.jpg"}], dt=NOW)
     p = rb.build_turn_prompt([rec], "anton", NOW, PROFILES, TODAY, ["- 12:00 Ралина: привет"], "/data")
     assert "Тип запуска: message" in p and "2026-10-22 13:05 МСК, четверг" in p
-    assert "m-20261022-1" in p and "m-20261022-2" not in p  # только журнал автора
+    assert "m-20261022-1" in p
+    assert "Сегодняшний журнал партнёра: Ралина" in p and "m-20261022-2" in p  # чужие записи с id
     assert "400 из 2100" in p and "осталось 1700" in p
     assert "Ралина (ralina): профиль не заполнен" in p
     assert "- 12:00 Ралина: привет" in p
@@ -357,6 +358,13 @@ def test_parse_vision_output():
     assert rb.parse_vision_output("") is None and rb.parse_vision_output("не json") is None
 
 
+def test_parse_vision_cost():
+    assert rb.parse_vision_cost('шум\n{"ok": true, "text": "x", "cost": 0.00561}\n') == 0.00561
+    assert rb.parse_vision_cost('{"ok": true, "text": "x", "cost": null}') is None
+    assert rb.parse_vision_cost('{"ok": false, "error": "x"}') is None and rb.parse_vision_cost("") is None
+    assert rb.fmt_cost(0.00561) == "$0.0056" and rb.fmt_cost(None) == "?"
+
+
 def test_batch_images(tmp_path):
     (tmp_path / "inbox").mkdir()
     (tmp_path / "inbox" / "1-photo.jpg").write_bytes(b"x")
@@ -424,3 +432,133 @@ def test_hermes_reply_path_unfenced_block_applied(tmp_path):
     reply = rb.hermes_reserve.pick_reply(rows)
     text, outcome = rb.handle_reply(reply, NOW, str(tmp_path))
     assert text.startswith("Антон, записал скир.") and "записано 120 ккал" in text and outcome["applied"] == ["add_meal m-20261022-1"]
+
+
+# --- аудит 10.11: фото, контекст, итоги кодом, отправка ---------------------------
+def test_tail_photo_paths_scrubbed_and_text_turn_has_no_images(tmp_path):
+    old = tmp_path / "inbox" / "old.jpg"
+    old.parent.mkdir()
+    old.write_bytes(b"x")
+    new = tmp_path / "inbox" / "new1.jpg"
+    new.write_bytes(b"x")
+    new2 = tmp_path / "inbox" / "new2.jpg"
+    new2.write_bytes(b"x")
+    tail = ["[2026-10-21] - 14:00 Антон: [фото: inbox/old.jpg] обед"]
+    r = rb.RockyReserve("ROCKYT", str(tmp_path / "e.json"), str(tmp_path / "h"), str(tmp_path),
+                        read_roots=[str(tmp_path)], toolsets=["file", "vision"])
+    text_rec = rb.build_record("anton", "а сколько белка было?", 9, dt=NOW)
+    p = rb.build_turn_prompt([text_rec], "anton", NOW, PROFILES, TODAY, tail, str(tmp_path))
+    assert "inbox/old.jpg" not in p and "Антон: [фото] обед" in p
+    assert "картинок нет" in p and "## Картинки" not in p
+    assert r.images_for(p) == [] and r.images_for(p, []) == []
+    recs = [rb.build_record("anton", "", 10, media=[{"rel": "inbox/new1.jpg"}], dt=NOW),
+            rb.build_record("anton", "ужин", 11, media=[{"rel": "inbox/new2.jpg"}], dt=NOW)]
+    p2 = rb.build_turn_prompt(recs, "anton", NOW, PROFILES, TODAY, tail, str(tmp_path))
+    got = [os.path.basename(x) for x in r.images_for(p2)]
+    assert got == ["new1.jpg", "new2.jpg"]
+    explicit = [os.path.basename(x) for x in r.images_for(p2, rb.batch_images(recs, str(tmp_path)))]
+    assert explicit == ["new1.jpg", "new2.jpg"]
+    d = rb.build_daily_prompt(NOW, PROFILES, TODAY, tail, str(tmp_path))
+    assert "inbox/old.jpg" not in d and "недобор" in d and "на ужин" in d
+
+
+def test_reply_context_and_prompt_line():
+    user = lambda uid, bot=False, name="Гость": SimpleNamespace(id=uid, is_bot=bot, full_name=name, username=None)
+    msg = SimpleNamespace(reply_to_message=SimpleNamespace(from_user=user(RALINA), text="сырники 2 шт", caption=None,
+                                                           photo=None, document=None))
+    assert rb.reply_context(msg, ANTON, RALINA) == "Ралина, сырники 2 шт"
+    photo = SimpleNamespace(reply_to_message=SimpleNamespace(from_user=user(RALINA), text=None, caption=None,
+                                                             photo=[1], document=None))
+    assert rb.reply_context(photo, ANTON, RALINA) == "Ралина, [фото]"
+    bot = SimpleNamespace(reply_to_message=SimpleNamespace(from_user=user(5, True), text="x" * 500, caption=None,
+                                                           photo=None, document=None))
+    line = rb.reply_context(bot, ANTON, RALINA)
+    assert line.startswith("Роки, ") and len(line) < rb.REPLY_QUOTE_CHARS + 20
+    assert rb.reply_context(SimpleNamespace(reply_to_message=None)) is None
+    assert rb.reply_context(SimpleNamespace()) is None
+    rec = rb.build_record("anton", "у меня такой же", 12, dt=NOW, reply_to="Ралина, [фото]")
+    p = rb.build_turn_prompt([rec], "anton", NOW, PROFILES, TODAY, [], "/data")
+    assert "  Ответ на сообщение: Ралина, [фото]" in p
+    assert "Ответ на сообщение" not in rb.record_content(rec)
+
+
+def test_strip_model_totals_keeps_dish_estimate():
+    dish = "≈ 780 ккал (660–900) · Б 60 · Ж 27 · У 79"
+    text = "Паста с курицей.\n%s\nЗа день 1850 из 2100 ккал. Белка уже 95 из 130. Хороший обед!" % dish
+    clean, n = rb.strip_model_totals(text)
+    assert dish in clean and "Хороший обед!" in clean and "Паста с курицей." in clean
+    assert "1850" not in clean and "95 из 130" not in clean and n == 2
+    clean, n = rb.strip_model_totals(dish + ", за день 1500 из 2100 ккал")
+    assert clean == dish and n == 1
+    for phrase in ("Осталось 860 ккал.", "До нормы ещё 900.", "За день уже 1500 ккал.", "Итого за сегодня: 1740 ккал",
+                   "Сегодня 1240 ккал из 2100."):
+        clean, n = rb.strip_model_totals("Ок.\n" + phrase)
+        assert clean == "Ок." and n == 1, phrase
+    same = "Съел 2 из 3 сырников, за день 2 тренировки. Вес 72.4 кг."
+    assert rb.strip_model_totals(same) == (same, 0)
+    assert rb.strip_model_totals(dish) == (dish, 0)
+
+
+def test_totals_line_from_journal_replaces_model_numbers(tmp_path):
+    data = str(tmp_path)
+    journal.write_json_atomic(journal.profiles_path(data), {"anton": {"target_kcal": 2100}, "ralina": {}})
+    reply = REPLY.replace("Гречка с курицей, норм.", "Гречка с курицей, норм. За день 9999 из 2100 ккал.")
+    text, outcome = rb.handle_reply(reply, NOW, data, who="anton")
+    assert "9999" not in text and "≈ 620 ккал (550–700) · Б 42 · Ж 24 · У 55" in text
+    assert "Антон, 2026-10-22: записано 620 из 2100 ккал, Б 42 · Ж 24 · У 55" in text
+    assert outcome["stripped"] == 1 and "Итог дня обновлён" not in text
+    # вопрос без действий: числа модели вырезаны, подставлена строка из журнала автора
+    text, outcome = rb.handle_reply("Смотри: за день 500 из 2100 ккал.", NOW, data, who="anton")
+    assert "500 из" not in text and "записано 620 из 2100 ккал" in text and not outcome["errors"]
+    # без who и без действий текст не теряется
+    assert rb.handle_reply("За день 500 из 2100 ккал.", NOW, data)[0] == "За день 500 из 2100 ккал."
+    assert rb.handle_reply("NO_REPLY", NOW, data, who="anton")[0] is None
+
+
+def test_daily_already_sent_gets_update_line(tmp_path):
+    data = str(tmp_path)
+    journal.write_json_atomic(journal.profiles_path(data), {"anton": {"target_kcal": 2100}, "ralina": {}})
+    text, _ = rb.handle_reply(REPLY, NOW, data, who="anton", daily_sent="2026-10-22")
+    assert "Итог дня обновлён (Антон, 2026-10-22): 620 из 2100 ккал, Б 42 · Ж 24 · У 55" in text
+    assert "Сверка журнала" not in text
+    late = REPLY.replace('"who": "anton",', '"who": "anton", "day": "2026-10-21",')
+    text, _ = rb.handle_reply(late, NOW, data, who="anton", daily_sent="2026-10-21")
+    assert "Итог дня обновлён (Антон, 2026-10-21): 620 из 2100 ккал" in text
+    upd = 'Поправил.\n```rocky-actions\n[{"op": "update_entry", "id": "m-20261022-1", "fields": {"kcal": 700, "kcal_hi": 800}}]\n```'
+    text, _ = rb.handle_reply(upd, NOW, data, who="anton", daily_sent="2026-10-21")
+    assert "Итог дня обновлён" not in text and "записано" in text
+
+
+def test_duplicate_meal_is_silent_not_error(tmp_path):
+    data = str(tmp_path)
+    rb.handle_reply(REPLY, NOW, data, who="anton")
+    text, outcome = rb.handle_reply(REPLY.replace("норм.", "записал."), NOW + timedelta(minutes=3), data, who="anton")
+    assert outcome["skipped"] and not outcome["applied"] and not outcome["errors"]
+    assert "Не получилось сохранить" not in text and "записано 620 ккал" in text
+    assert len(journal.read_entries("2026-10-22", data)) == 1
+
+
+class _Bot:
+    def __init__(self, fail):
+        self.fail, self.calls, self.sent = fail, 0, []
+
+    async def send_message(self, chat_id=None, text=None):
+        self.calls += 1
+        if self.calls <= self.fail:
+            raise TimeoutError("Timed out https://api.telegram.org/bot123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAA/sendMessage")
+        self.sent.append(text)
+
+
+def test_send_retries_once_and_chatlog_only_after_success(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setattr(rb, "CHATLOG_DIR", str(tmp_path))
+    ok_bot = _Bot(fail=1)
+    assert asyncio.run(rb._deliver(ok_bot, "привет", retry_delay=0)) is True
+    assert ok_bot.calls == 2 and ok_bot.sent == ["привет"]
+    tail = rb.read_chatlog_tail(chatlog_dir=str(tmp_path))
+    assert len(tail) == 1 and tail[0].endswith("Роки: привет")
+    bad_bot = _Bot(fail=2)
+    assert asyncio.run(rb._deliver(bad_bot, "потеряно", retry_delay=0)) is False
+    assert bad_bot.calls == 2 and bad_bot.sent == []
+    assert not any("потеряно" in ln for ln in rb.read_chatlog_tail(chatlog_dir=str(tmp_path)))
+    assert "AAAA" not in rb.redact("bot123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAA/x")

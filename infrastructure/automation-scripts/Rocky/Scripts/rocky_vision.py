@@ -8,7 +8,7 @@
 Запускается интерпретатором Hermes (`/usr/local/lib/hermes-agent/venv/bin/python`),
 чтобы взять Nous OAuth тем же кодом, что и сам Hermes (refresh, lock стора).
 Секреты не печатаются и не пишутся. Выход — одна JSON-строка в stdout:
-{"ok": true, "text": "..."} или {"ok": false, "error": "..."}.
+{"ok": true, "text": "...", "usage": {...}, "cost": $|null} или {"ok": false, "error": "..."}.
 
 Использование: rocky_vision.py --model M [--timeout 40] IMG [IMG ...]
 Окружение: HERMES_HOME (профиль бота), HERMES_SHARED_AUTH_DIR.
@@ -17,10 +17,14 @@ import argparse
 import base64
 import io
 import json
+import os
 import sys
+import time
 
 MAX_SIDE = 1024
 JPEG_QUALITY = 85
+PRICE_CACHE = "vision_prices.json"  # в HERMES_HOME; цены каталога Nous за токен
+PRICE_TTL = 24 * 3600
 
 PROMPT = (
     "Ты помогаешь коучу по питанию. На входе %d фото по порядку (фото 1..%d). "
@@ -46,6 +50,49 @@ def encode(path):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def model_price(creds, model, timeout):
+    """(prompt, completion) $/токен из каталога Nous /models, кэш PRICE_TTL. Нет - None."""
+    import httpx
+    path = os.path.join(os.environ.get("HERMES_HOME") or ".", PRICE_CACHE)
+    try:
+        with open(path) as fh:
+            cache = json.load(fh)
+        if time.time() - float(cache.get("ts", 0)) < PRICE_TTL and model in cache.get("prices", {}):
+            return tuple(cache["prices"][model])
+    except (OSError, ValueError, TypeError):
+        pass
+    resp = httpx.get(str(creds["base_url"]).rstrip("/") + "/models", timeout=timeout,
+                     headers={"Authorization": "Bearer " + creds["api_key"]})
+    resp.raise_for_status()
+    data = resp.json()
+    prices = {}
+    for m in (data.get("data", []) if isinstance(data, dict) else data):
+        pr = (m or {}).get("pricing") or {}
+        try:
+            prices[m["id"]] = [float(pr["prompt"]), float(pr["completion"])]
+        except (KeyError, TypeError, ValueError):
+            continue
+    try:
+        with open(path, "w") as fh:
+            json.dump({"ts": time.time(), "prices": prices}, fh)
+    except OSError:
+        pass
+    return tuple(prices[model]) if model in prices else None
+
+
+def usage_cost(creds, model, usage, timeout):
+    """$ за запрос: usage x цена каталога; каталог недоступен - usage.cost; иначе None."""
+    try:
+        price = model_price(creds, model, timeout)
+        if price:
+            return round(int(usage.get("prompt_tokens") or 0) * price[0]
+                         + int(usage.get("completion_tokens") or 0) * price[1], 6)
+    except Exception:  # noqa: BLE001 - цена не критична для разбора
+        pass
+    cost = usage.get("cost")
+    return float(cost) if isinstance(cost, (int, float)) else None
+
+
 def describe(paths, model, timeout):
     from hermes_cli.auth import resolve_nous_runtime_credentials
     import httpx
@@ -69,7 +116,8 @@ def describe(paths, model, timeout):
     text = text.strip()
     if not text:
         raise RuntimeError("пустой ответ")
-    return text, (data.get("usage") or {})
+    usage = data.get("usage") or {}
+    return text, usage, usage_cost(creds, model, usage, min(15.0, timeout))
 
 
 def main(argv=None):
@@ -79,8 +127,8 @@ def main(argv=None):
     ap.add_argument("images", nargs="+")
     args = ap.parse_args(argv)
     try:
-        text, usage = describe(args.images, args.model, args.timeout)
-        out = {"ok": True, "text": text, "usage": usage}
+        text, usage, cost = describe(args.images, args.model, args.timeout)
+        out = {"ok": True, "text": text, "usage": usage, "cost": cost}
     except Exception as exc:  # noqa: BLE001 - любой сбой = откат на старый путь
         out = {"ok": False, "error": ("%s: %s" % (type(exc).__name__, exc))[:400]}
     sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")

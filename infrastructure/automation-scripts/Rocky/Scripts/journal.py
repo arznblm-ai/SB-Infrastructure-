@@ -14,6 +14,7 @@
 """
 
 import json
+import logging
 import math
 import os
 import re
@@ -32,6 +33,14 @@ ID_RE = re.compile(r"^([mwg])-(\d{8})-(\d+)$")
 
 EDIT_WINDOW_DAYS = 7      # update/delete - только записи последних 7 дней
 NORM_TOLERANCE = 0.10     # «день в норме» = ккал в пределах ±10% от target_kcal
+MACRO_TOLERANCE = 0.25    # kcal против 4Б+9Ж+4У: больше - пересчитываем kcal по БЖУ
+DEDUP_SECONDS = 600       # такая же еда (who, день, состав, kcal) за 10 минут - дубль
+# Алкоголь даёт 7 ккал/г мимо БЖУ: такие записи по БЖУ не пересчитываем.
+ALCOHOL_RE = re.compile(
+    r"пив|вин[оа]\b|вина\b|винишк|алкогол|коктейл|виски|водк|шампанск|просекко|сидр|джин|\bром\b|текил|"
+    r"коньяк|апероль|ликёр|ликер|глинтвейн|спирт|настойк|\bэль\b|лагер|бурбон", re.I)
+
+logger = logging.getLogger("rocky")
 
 OPS = ("add_meal", "add_workout", "add_weight", "update_entry", "delete_entry", "move_entry", "set_profile")
 ADD_OPS = {"add_meal": "meal", "add_workout": "workout", "add_weight": "weight"}
@@ -356,9 +365,75 @@ def validate_action(raw):
 
 
 # ---------------------------------------------------------------------------
+# Проверки еды при записи
+# ---------------------------------------------------------------------------
+def _is_num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def normalize_meal(fields):
+    """Сверка чисел еды. -> (поля, предупреждения). Ничего не отклоняет, только чинит.
+
+    1) kcal против 4Б+9Ж+4У: расхождение больше 25% -> kcal пересчитан по БЖУ
+       (нужны все три макро; алкоголь пропускаем - его ккал в БЖУ нет);
+    2) kcal_lo <= kcal <= kcal_hi: перепутанные границы меняются местами,
+       вилка раздвигается так, чтобы kcal был внутри.
+    """
+    out = dict(fields or {})
+    warnings = []
+    kcal = out.get("kcal")
+    if not _is_num(kcal):
+        return out, warnings
+    p, f, c = out.get("p"), out.get("f"), out.get("c")
+    label = " ".join(str(x) for x in (out.get("items") or [])) + " " + str(out.get("note") or "")
+    if all(_is_num(x) for x in (p, f, c)) and not ALCOHOL_RE.search(label):
+        est = 4 * p + 9 * f + 4 * c
+        if est > 0 and abs(kcal - est) > MACRO_TOLERANCE * est:
+            warnings.append("kcal %s не сходится с БЖУ (4Б+9Ж+4У=%d), записано %d" % (_fmt_num(kcal), round(est), round(est)))
+            kcal = out["kcal"] = int(round(est))
+    lo, hi = out.get("kcal_lo"), out.get("kcal_hi")
+    if _is_num(lo) and _is_num(hi) and lo > hi:
+        warnings.append("kcal_lo %s > kcal_hi %s, поменял местами" % (_fmt_num(lo), _fmt_num(hi)))
+        lo, hi = hi, lo
+        out["kcal_lo"], out["kcal_hi"] = lo, hi
+    if _is_num(lo) and lo > kcal:
+        warnings.append("kcal_lo %s > kcal %s, вилка раздвинута" % (_fmt_num(lo), _fmt_num(kcal)))
+        out["kcal_lo"] = kcal
+    if _is_num(hi) and hi < kcal:
+        warnings.append("kcal_hi %s < kcal %s, вилка раздвинута" % (_fmt_num(hi), _fmt_num(kcal)))
+        out["kcal_hi"] = kcal
+    return out, warnings
+
+
+def _items_key(items):
+    return tuple(" ".join(str(x).lower().split()) for x in (items or ()))
+
+
+def find_duplicate_meal(who, day, fields, now, data_dir, window=DEDUP_SECONDS):
+    """Живая запись еды с тем же (who, день, состав, kcal), добавленная за последние 10 минут."""
+    key = _items_key(fields.get("items"))
+    stamp = msk(now)
+    for entry in read_entries(day, data_dir):
+        if entry.get("kind") != "meal" or entry.get("who") != who:
+            continue
+        if _items_key(entry.get("items")) != key or entry.get("kcal") != fields.get("kcal"):
+            continue
+        try:
+            added = datetime.fromisoformat(str(entry.get("added_ts") or entry.get("ts")))
+        except ValueError:
+            continue
+        if added.tzinfo is None:
+            added = added.replace(tzinfo=MSK)
+        if 0 <= (stamp - added).total_seconds() <= window:
+            return entry
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Применение действий
 # ---------------------------------------------------------------------------
-def add_entry(kind, who, fields, now, data_dir):
+def add_entry(kind, who, fields, now, data_dir, added_at=None):
+    """now - время события (для чужого дня - полдень), added_at - когда реально записали."""
     day = day_of(now)
     existing = read_entries(day, data_dir, include_deleted=True)
     entry = {
@@ -367,6 +442,8 @@ def add_entry(kind, who, fields, now, data_dir):
         "who": who,
         "ts": msk(now).isoformat(timespec="seconds"),
     }
+    if added_at is not None:
+        entry["added_ts"] = msk(added_at).isoformat(timespec="seconds")
     entry.update(fields)
     _append_entry_line(day, entry, data_dir)
     return entry
@@ -380,8 +457,8 @@ def _within_window(entry_day, now):
     return 0 <= delta <= EDIT_WINDOW_DAYS
 
 
-def update_entry(entry_id, fields, now, data_dir):
-    """(запись, None) или (None, ошибка)."""
+def update_entry(entry_id, fields, now, data_dir, warnings=None):
+    """(запись, None) или (None, ошибка). warnings - список, куда дописать правки чисел еды."""
     day = day_from_id(entry_id)
     if day is None:
         return None, "кривой id"
@@ -393,6 +470,11 @@ def update_entry(entry_id, fields, now, data_dir):
             if entry.get("deleted"):
                 return None, "запись удалена"
             entry.update(fields)
+            if entry.get("kind") == "meal":
+                fixed, notes = normalize_meal(entry)
+                entry.update(fixed)
+                if warnings is not None:
+                    warnings.extend("%s: %s" % (entry_id, n) for n in notes)
             entry["updated_ts"] = msk(now).isoformat(timespec="seconds")
             write_entries(day, entries, data_dir)
             return entry, None
@@ -474,8 +556,9 @@ def merge_profile(profiles, who, fields, now):
 
 def apply_actions(actions, now, data_dir):
     """Применить список сырых действий. Невалидное действие пропускается (в errors),
-    валидные применяются. Возвращает {"applied": [...], "errors": [...]}."""
-    result = {"applied": [], "errors": []}
+    валидные применяются. Возвращает {"applied", "errors", "skipped", "warnings"}:
+    skipped - дубли еды (не добавлены повторно), warnings - числа, поправленные при записи."""
+    result = {"applied": [], "errors": [], "skipped": [], "warnings": []}
     if not isinstance(actions, list):
         result["errors"].append("actions не список")
         return result
@@ -495,7 +578,20 @@ def apply_actions(actions, now, data_dir):
             fields = dict(action["fields"])
             if day and day != day_of(now):
                 fields["time_unknown"] = True
-            entry = add_entry(action["kind"], action["who"], fields, event_time, data_dir)
+            if action["kind"] == "meal":
+                fields, notes = normalize_meal(fields)
+                dup = find_duplicate_meal(action["who"], day_of(event_time), fields, now, data_dir)
+                if dup:
+                    result["skipped"].append("%s: дубль %s, повторно не добавляю" % (op, dup.get("id")))
+                    logger.warning("journal: add_meal - дубль %s за последние %d мин, пропущен",
+                                   dup.get("id"), DEDUP_SECONDS // 60)
+                    continue
+            else:
+                notes = []
+            entry = add_entry(action["kind"], action["who"], fields, event_time, data_dir, added_at=now)
+            for note in notes:
+                result["warnings"].append("%s: %s" % (entry["id"], note))
+                logger.warning("journal: %s: %s", entry["id"], note)
             result["applied"].append("%s %s" % (op, entry["id"]))
         elif op == "move_entry":
             entry, err = move_entry(action["id"], action["day"], now, data_dir)
@@ -504,7 +600,11 @@ def apply_actions(actions, now, data_dir):
             else:
                 result["applied"].append("move_entry %s -> %s" % (action["id"], entry["id"]))
         elif op == "update_entry":
-            entry, err = update_entry(action["id"], action["fields"], now, data_dir)
+            notes = []
+            entry, err = update_entry(action["id"], action["fields"], now, data_dir, warnings=notes)
+            for note in notes:
+                result["warnings"].append(note)
+                logger.warning("journal: %s", note)
             if err:
                 result["errors"].append("update_entry %s: %s" % (action["id"], err))
             else:

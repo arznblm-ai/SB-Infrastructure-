@@ -456,3 +456,104 @@ def test_raw_saved_on_success(env):
 
 def test_fallback_message_style():
     assert "ё" not in "Разобрала звонок, но не смогла собрать отчет. Проверь саммари в meetings/ и базу проекта."
+
+
+# ---------------------------------------------------------------------------
+# Аудит 2026-11-10: базы не трогаются при none / низкой уверенности; дедуп записей
+# ---------------------------------------------------------------------------
+def _kb(cfg, track="luch", text="# База\n\n- 01.10: старый факт\n"):
+    path = os.path.join(cfg.vault, cr.KB_REL[track])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+class WritingFake(Fake):
+    """Модель, которая вопреки заданию дописала в базу."""
+
+    def __init__(self, kb_path, replies):
+        super().__init__(replies)
+        self.kb_path = kb_path
+
+    def claude(self, prompt, cfg):
+        with open(self.kb_path, "a", encoding="utf-8") as f:
+            f.write("- 23.10: лишний факт\n")
+        return super().claude(prompt, cfg)
+
+
+@pytest.mark.parametrize("track,confidence", [("none", 0.95), ("luch", 0.4)])
+def test_kb_reverted_when_track_none_or_low_confidence(env, track, confidence):
+    kb = _kb(env)
+    add_transcript(env, NAME, full_transcript())
+    reply = json.loads(model_reply(track, confidence).split("```json\n")[1].split("\n```")[0])
+    reply["tasks"] = [{"title": "Прислать смету", "track": "luch", "due": ""}]
+    fake = WritingFake(kb, [json.dumps(reply, ensure_ascii=False)])
+    tick(env, fake)
+    assert cr.read_text(kb) == "# База\n\n- 01.10: старый факт\n"
+    assert "Прислать смету" in fake.sent[0] and "Проект не ясен" in fake.sent[0]
+    log = [json.loads(x) for x in open(env.log_file, encoding="utf-8")][-1]
+    assert log["kb_reverted"] == 1 and log["kb_updates"] == 0 and log["tasks_without_track"] == 1
+    assert "в базу" not in cr.read_text(env.journal_path())
+
+
+def test_kb_kept_when_track_confident(env):
+    kb = _kb(env)
+    add_transcript(env, NAME, full_transcript())
+    fake = WritingFake(kb, [model_reply("luch", 0.9)])
+    tick(env, fake)
+    assert "лишний факт" in cr.read_text(kb)
+    assert "Проект не ясен" not in fake.sent[0]
+
+
+def _rec(title, date_line, stamps, speaker=True, n=40):
+    lines = ["---", "date: 2026-10-23", "---", "", "# " + title, "", "**Дата:** " + date_line, "", "## Транскрипт", ""]
+    for i in range(n):
+        stamp = stamps[min(i, len(stamps) - 1)] if i >= n - len(stamps) else "00:%02d" % (i % 60)
+        lines += ["**Антон | %s**" % stamp if speaker else "[00:%s] реплика" % stamp, "текст %d" % i, ""]
+    return "\n".join(lines)
+
+
+def test_call_signature_and_same_call():
+    krisp = _rec("B2B Pricing Sync", "2026-10-23 13:03", ["19:41"])
+    whisper = _rec("01:03 PM - zoom.us meeting October 23", "2026-10-23 13:23", ["19:39"], speaker=False)
+    short = _rec("01:01 PM - Telemost", "2026-10-23 13:02", ["01:17"])
+    assert cr.call_signature(krisp) == (13 * 60 + 3, 19 * 60 + 41)
+    assert cr.call_signature(whisper) == (13 * 60 + 3, 19 * 60 + 39)
+    assert cr.same_call(cr.call_signature(krisp), cr.call_signature(whisper))
+    assert not cr.same_call(cr.call_signature(krisp), cr.call_signature(short))  # длительность
+    assert not cr.same_call((780, 1000), (790, 1000))  # начало дальше 5 минут
+    assert not cr.same_call((780, None), (780, 1000))
+    assert cr.call_signature("# Mobile recording  - November 5, 2026 1:54 PM\n")[0] == 13 * 60 + 54
+
+
+def test_second_recording_of_same_call_is_skipped_before_model(env):
+    first = "{meeting} B2B Pricing Sync – 2026-10-23.md"
+    second = "{meeting} 01 03 PM - zoom.us meeting October 23 – 2026-10-23.md"
+    add_transcript(env, first, _rec("B2B Pricing Sync", "2026-10-23 13:03", ["19:41"]))
+    fake = Fake()
+    tick(env, fake)
+    assert len(fake.prompts) == 1
+    add_transcript(env, second, _rec("01:03 PM - zoom.us meeting October 23", "2026-10-23 13:23", ["19:39"], speaker=False))
+    actions = tick(env, fake, now=NOW + timedelta(minutes=10))
+    assert len(fake.prompts) == 1 and len(fake.sent) == 1  # модель и Telegram не тронуты
+    state = cr.load_state(env)
+    assert state["calls"][second]["status"] == cr.ST_DUPLICATE
+    assert state["calls"][second]["duplicate_of"] == first
+    assert any("дубль" in a for a in actions)
+    assert tick(env, fake, now=NOW + timedelta(minutes=20)) == []  # больше не кандидат
+
+
+def test_other_call_same_day_is_not_duplicate(env):
+    add_transcript(env, "{meeting} Утренний синк – 2026-10-23.md", _rec("Утренний синк", "2026-10-23 10:00", ["19:41"]))
+    fake = Fake()
+    tick(env, fake)
+    add_transcript(env, "{meeting} Дневной синк – 2026-10-23.md", _rec("Дневной синк", "2026-10-23 13:03", ["19:41"]))
+    tick(env, fake, now=NOW + timedelta(minutes=10))
+    assert len(fake.prompts) == 2
+
+
+def test_prompt_forbids_kb_and_tasks_for_none():
+    with open(os.path.join(ROOT, "config", "calls_prompt.md"), encoding="utf-8") as f:
+        text = f.read()
+    assert "при уверенном `track: none`" in text and "откатываются" in text
