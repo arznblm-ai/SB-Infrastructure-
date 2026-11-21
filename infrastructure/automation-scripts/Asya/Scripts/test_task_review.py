@@ -3,6 +3,19 @@ import task_review as review
 def test_parse_result_with_surrounding_prose():
     assert review.parse_result('Готово:\n```json\n{"decisions": [], "notes": "ok"}\n```')['notes'] == 'ok'
 
+def test_reference_bundle_only_uses_approved_directories(tmp_path):
+    meetings = tmp_path / 'meetings'; meetings.mkdir()
+    (meetings / 'summary – 2026-11-01.md').write_text('meeting facts')
+    (meetings / 'archive').mkdir()
+    (meetings / 'archive' / 'old – 2026-11-01.md').write_text('secret archive')
+    kris = tmp_path / 'infrastructure/Kris/memory'; kris.mkdir(parents=True)
+    (kris / 'status.md').write_text('project status')
+    (kris / 'estimates').mkdir()
+    (kris / 'estimates' / 'private.md').write_text('secret estimate')
+    bundle = review.reference_bundle(tmp_path)
+    assert 'meeting facts' in bundle and 'project status' in bundle
+    assert 'secret archive' not in bundle and 'secret estimate' not in bundle
+
 def test_completion_cannot_be_inferred_from_related_event():
     assert not review.explicit_completion({'quote': 'суббота 12:00, общий календарь'})
     assert review.explicit_completion({'quote': '02.11 Антон: проект КИТ сдали'})
