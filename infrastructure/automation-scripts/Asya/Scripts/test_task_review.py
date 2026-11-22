@@ -44,3 +44,26 @@ def test_kris_project_status_requires_dated_quote_and_excludes_private_subfolder
     private = kris / 'estimates'; private.mkdir()
     (private / 'status.md').write_text(item['quote'], encoding='utf-8')
     assert not review.valid_evidence({**item, 'source': 'infrastructure/Kris/memory/estimates/status.md'}, task)
+
+
+def test_compact_context_preserves_exact_status_and_deduplicates_shared_evidence():
+    source = 'infrastructure/Kris/memory/status.md'
+    status = '02.11 · Антон: проект КИТ завершили и сдали заказчику.'
+    payment = '02.11 · Оплата за КИТ ещё не поступила, ждём заказчика.'
+    docs = [(source, f'{status}\n\n{payment}\n\n' + ('нерелевантный текст ' * 1200))]
+    tasks = [{'title': 'КИТ: получить оплату'}, {'title': 'КИТ: проверить сдачу'}]
+
+    bundle = review.compact_reference_bundle(docs, tasks, limit=350)
+
+    assert len(bundle) <= 350
+    assert bundle.count(status) == 1
+    assert bundle.count(payment) == 1
+    assert f'### ИСТОЧНИК: {source}\n{status}' in bundle
+
+
+def test_compact_context_keeps_recent_meeting_decision_with_its_context():
+    source = 'meetings/summary – 2026-11-14.md'
+    body = '# Зекиро\n\nПолучили бриф.\n\n## Решения\n\nРешили запустить оформление сейчас.'
+    bundle = review.compact_reference_bundle([(source, body)], [{'title': 'Оформление'}], limit=1000)
+    assert body in bundle
+    assert bundle.count(source) == 1
