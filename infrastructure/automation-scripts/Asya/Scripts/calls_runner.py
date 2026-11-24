@@ -8,10 +8,8 @@
   2. кандидаты: `transcripts/{meeting} *.md` за 7 дней (или `--since`), mtime
      старше 20 мин, нет в state.json. Пустой/короткий транскрипт -> pending_retry
      до 24 ч, потом «нет транскрипта» в отчёт;
-  3. `claude -p --model sonnet` с заданием `calls_prompt.md` + пути файлов.
-     Модель сама пишет саммари в meetings/ и правки баз (Edit/Write разрешены
-     флагами CLI только туда), ставит задачи в Todoist (add_task/set_track) и
-     печатает в конце строгий JSON;
+  3. Codex получает текст транскрипта и возвращает JSON без инструментов.
+     Код сохраняет саммари в meetings/; предложения для баз и Todoist идут в черновик.
   4. код (не модель) шлёт `report_text` Антону токеном Аси, пишет строку в общий
      журнал Аси, `cost_usd` -> log.jsonl, state.json <- done.
 
@@ -27,7 +25,8 @@ import json
 import logging
 import os
 import re
-import subprocess
+import tempfile
+from pathlib import Path
 import sys
 import time
 from dataclasses import dataclass, field
@@ -36,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import calls_text_engine
 import asya_bot  # noqa: E402  (права, split_message, разбор CLI, атомарная запись)
 
 logger = logging.getLogger("asya.calls")
@@ -529,35 +529,76 @@ def save_raw(cfg, name, raw, now):
         return None
 
 
-def run_claude(prompt, cfg):
-    """(текст, error_kind, cost_usd, raw). error_kind: None | quota | timeout | error.
+def codex_draft(cfg, cand, forced_track=None):
+    """Only the approved transcript and bounded project descriptors reach Codex."""
+    context = {
+        "luch": "Луч ИИ: работа агентства, его команда и клиентские проекты",
+        "zekiro": "Зекиро: стартап, разработка и продажа агентов для бизнеса",
+        "producer": "Портал и собственные проекты Антона как креативного продюсера",
+        "instruction": "Название клиента само по себе не определяет трек. Укажи конкретные "
+                       "решения и владельцев только если они подтверждены транскриптом. "
+                       "Уточни, что неизвестно. Обновления баз и задачи — предложения.",
+    }
+    with tempfile.TemporaryDirectory(prefix="asya-calls-codex-") as workspace:
+        return calls_text_engine.analyze(cand["text"], cand["date"], context, workspace,
+                                         forced_track=forced_track)
 
-    raw — stdout целиком (+ stderr, если не пуст), для сохранения в <home>/raw/.
-    """
-    cmd = build_claude_cmd(prompt, cfg)
-    env = os.environ.copy()
-    env.setdefault("HOME", cfg.home_dir)
-    os.makedirs(cfg.workspace, exist_ok=True)
+
+def load_named_candidate(cfg, name):
+    if Path(name).name != name or not name.startswith("{meeting} ") or not NAME_DATE_RE.search(name):
+        raise ValueError("invalid transcript filename")
+    root = (Path(cfg.vault) / TRANSCRIPTS_REL).resolve()
+    path = root / name
+    if path.resolve().parent != root:
+        raise ValueError("transcript outside approved directory")
+    text = path.read_text(encoding="utf-8")
+    ready, why = transcript_ready(text)
+    if not ready:
+        raise ValueError("transcript not ready: " + why)
+    return {"name": name, "path": str(path), "date": transcript_date(str(path), text),
+            "krisp_call_id": frontmatter(text).get("krisp_call_id"), "text": text}
+
+
+def write_codex_summary(cfg, cand, draft, existing_summary=None):
+    """The file name and frontmatter are chosen by code. Never replace another call."""
+    root = Path(cfg.vault) / MEETINGS_REL
+    root.mkdir(exist_ok=True)
+    name = "{meeting} {summary} " + cand["name"].removeprefix("{meeting} ")
+    if existing_summary:
+        known = Path(existing_summary)
+        if known.parts[:-1] not in ((MEETINGS_REL,), ()):
+            raise ValueError("invalid existing summary")
+        name = known.name
+    target = root / name
+    rel = str(target.relative_to(cfg.vault))
+    if target.resolve().parent != root.resolve():
+        raise ValueError("summary outside meetings")
+    source = f'{TRANSCRIPTS_REL}/{cand["name"]}'
+    marker = "source: " + json.dumps(source, ensure_ascii=False)
+    prior = target.read_text(encoding="utf-8") if target.exists() else ""
+    if prior and marker not in prior.splitlines() and not existing_summary:
+        raise ValueError("existing summary belongs to a different workflow")
+    track = draft["track"] if draft["confidence"] >= CONFIDENCE_MIN else "none"
+    body = draft["summary_markdown"].strip()
+    body = re.sub(r"^---\s*\n.*?^---\s*\n", "", body, count=1, flags=re.M | re.S) if body.startswith("---\n") else body
+    links = ["- Транскрипт: [[" + cand["name"].removesuffix(".md") + "]]"]
+    if track in KB_REL:
+        links.append("- База проекта: [[" + Path(KB_REL[track]).stem + "]]")
+    call_id = cand.get("krisp_call_id")
+    call_marker = "krisp_call_id: " + json.dumps(call_id, ensure_ascii=False) + "\n" if call_id else ""
+    content = (f"---\ntrack: {track}\ndate: {cand['date']}\n{marker}\n{call_marker}---\n\n"
+               f"{body}\n\n## Связи\n" + "\n".join(links) + "\n")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=root, delete=False) as temp:
+        temp.write(content)
     try:
-        proc = subprocess.run(
-            cmd, cwd=cfg.workspace, env=env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=CLAUDE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        return "", "timeout", None, "TIMEOUT %ss\n%s" % (CLAUDE_TIMEOUT, out)
-    except OSError as exc:
-        logger.warning("claude не запустился: %s", exc)
-        return "", "error", None, "OSError: %s" % exc
-    text, kind = asya_bot.parse_claude_output(proc.returncode, proc.stdout, proc.stderr)
-    if not kind and not (text or "").strip():
-        kind = "empty"  # пустой ответ = сбой процесса, повтор допустим
-    if kind:
-        logger.warning("claude %s rc=%s tail=%s", kind, proc.returncode, (proc.stderr or proc.stdout)[-400:])
-    raw = "rc=%s\n--- stdout ---\n%s" % (proc.returncode, proc.stdout or "")
-    if (proc.stderr or "").strip():
-        raw += "\n--- stderr ---\n%s" % proc.stderr
-    return text, kind, claude_cost(proc.stdout), raw
+        os.chmod(temp.name, 0o644)
+        if prior:
+            os.replace(temp.name, target)
+        else:
+            os.link(temp.name, target)
+    finally:
+        Path(temp.name).unlink(missing_ok=True)
+    return rel
 
 
 # ---------------------------------------------------------------------------
@@ -742,7 +783,7 @@ class Tick:
         self.dry = dry_run
         self.since = since
         self.max = max_calls if max_calls is not None else cfg.max_per_tick
-        self.claude_fn = claude_fn or run_claude
+        self.claude_fn = claude_fn
         self.send_fn = send_fn or send_telegram
         self.state = load_state(cfg)
         self.queue = load_queue(cfg)
@@ -882,11 +923,29 @@ class Tick:
         attempt = int(entry.get("attempts") or 0) + 1
         entry["attempts"] = attempt
         started = time.monotonic()
-        prompt = build_prompt(self.cfg, cand, forced_track, existing_summary, self.now)
-        kb_before = snapshot_kb(self.cfg)
-        res = self.claude_fn(prompt, self.cfg)
-        text, kind, cost = res[0], res[1], res[2]
-        raw = res[3] if len(res) > 3 else text
+        kb_before = {}
+        if self.claude_fn is not None:  # test injection for the runner state machine
+            prompt = build_prompt(self.cfg, cand, forced_track, existing_summary, self.now)
+            kb_before = snapshot_kb(self.cfg)
+            res = self.claude_fn(prompt, self.cfg)
+            text, kind, cost = res[:3]
+            raw = res[3] if len(res) > 3 else text
+        else:
+            cost = None
+            try:
+                draft = codex_draft(self.cfg, cand, forced_track)
+                summary = write_codex_summary(self.cfg, cand, draft, existing_summary)
+            except (ValueError, RuntimeError, OSError) as exc:
+                logger.warning("engine=codex call=%s error=%s", name, type(exc).__name__)
+                text, raw, kind = "", type(exc).__name__, "codex_error"
+            else:
+                raw = json.dumps(draft, ensure_ascii=False, indent=2)
+                result = {**draft, "summary_path": summary, "kb_updates": [], "tasks": []}
+                result["report_text"] += "\nСаммари сохранено. Базы и Todoist не изменялись."
+                if draft["kb_updates"] or draft["tasks"]:
+                    result["report_text"] += "\nПредложения к проверке: базы %d, задачи %d." % (
+                        len(draft["kb_updates"]), len(draft["tasks"]))
+                text, kind = json.dumps(result, ensure_ascii=False), None
         raw_path = save_raw(self.cfg, name, raw, self.now)
         result = None
         if not kind:
@@ -894,7 +953,7 @@ class Tick:
             if not result or not result["report_text"] or (forced_track is None and result["track"] is None):
                 result = None
         log = {
-            "ts": _iso(self.now), "transcript": name, "attempt": attempt, "model": self.cfg.model,
+            "ts": _iso(self.now), "transcript": name, "attempt": attempt, "model": (self.cfg.model if self.claude_fn else os.environ.get("ASYA_CALLS_CODEX_MODEL", "codex-default")),
             "forced_track": forced_track, "error": kind if kind else (None if result else "bad_json"),
             "cost_usd": cost, "duration_s": round(time.monotonic() - started, 1), "raw": raw_path,
         }
@@ -994,11 +1053,16 @@ def setup_logging(cfg):  # pragma: no cover - побочный эффект
 
 def main(argv=None):  # pragma: no cover - рантайм
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--dry-run", action="store_true", help="только показать кандидатов и план, без claude/записей/отправок")
+    ap.add_argument("--dry-run", action="store_true", help="только показать кандидатов и план, без модели/записей/отправок")
     ap.add_argument("--since", help="бэкфилл: брать транскрипты с даты YYYY-MM-DD (вместо 7 дней)")
     ap.add_argument("--max", type=int, help="сколько звонков разбирать за тик (дефолт ASYA_CALLS_MAX или 1)")
+    ap.add_argument("--preview-call", help="разобрать один транскрипт в stdout, без записи")
+    ap.add_argument("--retry-call", help="повторить один failed транскрипт без Telegram")
     args = ap.parse_args(argv)
     cfg = Config()
+    if args.preview_call:
+        print(json.dumps(codex_draft(cfg, load_named_candidate(cfg, args.preview_call)), ensure_ascii=False))
+        return 0
     since_raw = args.since or os.environ.get("ASYA_CALLS_SINCE", "").strip()  # бэкфилл и через drop-in юнита
     since = date.fromisoformat(since_raw) if since_raw else None
     if args.dry_run:
@@ -1016,6 +1080,22 @@ def main(argv=None):  # pragma: no cover - рантайм
         except OSError:
             logger.info("другой тик ещё идёт — выхожу")
             return 0
+        if args.retry_call:
+            tick = Tick(cfg, send_fn=lambda *_: True)
+            cand = load_named_candidate(cfg, args.retry_call)
+            entry = tick.state["calls"].get(cand["name"], {})
+            if entry.get("status") != ST_FAILED:
+                ap.error("--retry-call requires a failed call")
+            if find_duplicate(cfg, tick.state, cand):
+                ap.error("matching call already analyzed")
+            entry["attempts"] = 0
+            tick.send = lambda *_a, **_k: True
+            tick.analyze(cand)
+            asya_bot.write_json_atomic(cfg.state_file, tick.state)
+            if tick.queue_dirty:
+                asya_bot.write_json_atomic(cfg.queue_path(), merge_queue(tick.queue, load_queue(cfg)))
+            print(json.dumps({k: entry.get(k) for k in ("status", "track", "summary_path", "error")}, ensure_ascii=False))
+            return 0 if entry.get("status") in (ST_DONE, ST_TRACK) else 1
         actions = Tick(cfg, since=since, max_calls=args.max).run()
     logger.info("тик: %d действий", len(actions))
     for a in actions:

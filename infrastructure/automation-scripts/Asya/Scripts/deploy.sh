@@ -7,12 +7,12 @@
 # /root/.hermes/profiles/inbox/.env (тот же бот), в argv не попадает.
 #
 # Шаги (на мак — только проверки и сборка CLAUDE.md, всё остальное на VPS):
-#   [0] мак: файлы на месте, py_compile, bash -n, JSON; ssh и claude на VPS; заливка в /opt/asya/.staging
+#   [0] мак: файлы на месте, py_compile, bash -n, JSON; ssh и Hermes на VPS; заливка в /opt/asya/.staging
 #   [1] Hermes: оба user-gateway disable --now + reset-failed, маркер архива — ДО Аси (один токен — один полер)
 #   [2] код Аси в /opt/asya + venv (python-telegram-bot, faster-whisper), workspace: CLAUDE.md, settings.json, mcp.json
 #   [3] /root/.config/asya/.env (600): создаётся один раз, существующий не перезаписывается
 #   [4] todoist-mcp server.py из vault с бэкапом *.bak-2026-10-16-asya
-#   [5] permcheck.py на VPS-версии claude (фейковый API, квоту не тратит); провален → Асю НЕ запускаем
+#   [5] проверка Hermes и зависимостей на VPS
 #   [6] юниты asya.service + asya-watchdog.timer; рестарт только если что-то поменялось или юнит не active
 #   [7] meeting-notes-delivery.env → токен Аси (файлом), chat 324186708, без thread — с бэкапом
 #   [8] смоук: is-active, getMe (только ok/username), хвост bot.log без токенов, сводка
@@ -32,7 +32,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"                    # infrastructure/
 VAULT_DIR="$(cd "$PROJECT_DIR/../.." && pwd)"                  # корень vault
 TODOIST_SRC="$VAULT_DIR/infrastructure/daily focus/deploy/todoist_mcp_server.py"
 STAGING="/opt/asya/.staging"
-CLAUDE_BIN="/root/.local/bin/claude"
+HERMES_BIN="/usr/local/bin/hermes"
 
 fail() { echo "  ✗ $*" >&2; exit 1; }
 
@@ -55,8 +55,8 @@ python3 -c 'import json,sys; [json.load(open(p)) for p in sys.argv[1:]]' \
 grep -q "def todoist_add_task" "$TODOIST_SRC" || fail "в todoist_mcp_server.py нет todoist_add_task — не та версия"
 echo "  ✓ файлы на месте, код компилируется"
 
-$SSH "test -x '$CLAUDE_BIN'" || fail "нет ssh до VPS или нет исполняемого $CLAUDE_BIN"
-echo "  ✓ VPS отвечает, $CLAUDE_BIN на месте"
+$SSH "test -x '$HERMES_BIN'" || fail "нет ssh до VPS или нет исполняемого $HERMES_BIN"
+echo "  ✓ VPS отвечает, $HERMES_BIN на месте"
 
 TMP_DIR="$(mktemp -d -t asya-deploy)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -92,7 +92,7 @@ CFG=/root/.config/asya
 ENV_FILE=/root/.config/asya/.env
 INBOX_ENV=/root/.hermes/profiles/inbox/.env
 VAULT=/root/second-brain
-CLAUDE_BIN=/root/.local/bin/claude
+HERMES_BIN=/usr/local/bin/hermes
 ANTON_ID=324186708
 STAMP=2026-10-16
 MARKER=/root/.hermes/ARCHIVED-2026-10-16.md
@@ -208,7 +208,7 @@ else
   python3 -m venv "$VENV" && "$VENV/bin/pip" install -q --upgrade pip && ok "venv создан" || bad "venv не создался"
 fi
 # ставим один раз: faster-whisper тянет ctranslate2 на сотни МБ; модель small уже в /root/.cache/huggingface
-for pkg in python-telegram-bot faster-whisper; do
+for pkg in python-telegram-bot faster-whisper pypdf; do
   if "$VENV/bin/pip" show "$pkg" >/dev/null 2>&1; then
     skip "$pkg уже стоит"
   else
@@ -263,11 +263,6 @@ else
     TOKEN=""
   fi
 fi
-# claude -p под systemd авторизуется долгоживущим токеном (как Марко/Крис); без него — «OAuth session expired» (17.10)
-if [ -f "$ENV_FILE" ] && ! grep -q '^CLAUDE_CODE_OAUTH_TOKEN=.' "$ENV_FILE"; then
-  grep '^CLAUDE_CODE_OAUTH_TOKEN=.' /root/.config/marco-group/.env >> "$ENV_FILE" 2>/dev/null && ok "CLAUDE_CODE_OAUTH_TOKEN скопирован из .env Марко" && CHANGED=1 || bad "нет CLAUDE_CODE_OAUTH_TOKEN — claude -p не авторизуется (claude setup-token → $ENV_FILE)"
-fi
-
 # ── [4] Todoist MCP ─────────────────────────────────────────────────────────
 echo "[4] Todoist MCP server.py (тулзы «Мои»)"
 if [ ! -f "$TODOIST_DST" ] || [ ! -x "$TODOIST_PY" ]; then
@@ -292,20 +287,14 @@ else
   fi
 fi
 
-# ── [5] permcheck ───────────────────────────────────────────────────────────
-echo "[5] permcheck.py на $("$CLAUDE_BIN" --version 2>/dev/null | head -1 || echo '?') (фейковый API, без квоты)"
+# ── [5] Runtime preflight ──────────────────────────────────────────────────────
+echo "[5] Проверка Hermes и локального чтения PDF"
 PERM_OK=0
-if [ ${#PROBLEMS[@]} -gt 0 ]; then
-  bad "permcheck пропущен: выше уже есть ✗ — Асю не запускаю"
+if [ ${#PROBLEMS[@]} -eq 0 ] && [ -x "$HERMES_BIN" ] && "$VENV/bin/python" -c 'import pypdf'; then
+  PERM_OK=1
+  ok "Hermes и pypdf доступны"
 else
-  PC_OUT=$(cd /tmp && timeout 600 "$VENV/bin/python" "$CODE/permcheck.py" --claude "$CLAUDE_BIN" 2>&1); PC_RC=$?
-  printf '%s\n' "$PC_OUT" | redact | tail -40 | sed 's/^/    /'
-  if [ "$PC_RC" = 0 ]; then
-    PERM_OK=1
-    ok "permcheck: все ожидания совпали"
-  else
-    bad "permcheck провален (rc=$PC_RC) — права на VPS-версии claude не те, Асю НЕ запускаю"
-  fi
+  bad "проверка Hermes / pypdf не прошла"
 fi
 
 # ── [6] Юниты ───────────────────────────────────────────────────────────────

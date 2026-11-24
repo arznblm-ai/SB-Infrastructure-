@@ -428,58 +428,6 @@ def test_parse_claude_output_variants():
     assert bot.parse_claude_output(0, "not json", "") == ("", "error")
 
 
-class FakeProc:
-    def __init__(self, rc=0, out=b"", err=b"", delay=0):
-        self.returncode, self._out, self._err, self._delay = rc, out, err, delay
-        self.killed = False
-
-    async def communicate(self):
-        await asyncio.sleep(self._delay)
-        return self._out, self._err
-
-    def kill(self):
-        self.killed = True
-
-    async def wait(self):
-        return self.returncode
-
-
-def _patch_exec(monkeypatch, proc, seen=None):
-    async def fake_exec(*cmd, **kw):
-        if seen is not None:
-            seen.update(cmd=cmd, kw=kw)
-        return proc
-
-    monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", fake_exec)
-
-
-def test_run_claude_success_runs_in_workspace_with_devnull(monkeypatch, tmp_path):
-    seen = {}
-    monkeypatch.setattr(bot, "WORKSPACE", str(tmp_path))
-    _patch_exec(monkeypatch, FakeProc(out=json.dumps({"result": "ok", "total_cost_usd": 0.1}).encode()), seen)
-    assert asyncio.run(bot.run_claude("p")) == ("ok", None)
-    assert seen["kw"]["cwd"] == str(tmp_path)
-    assert seen["kw"]["stdin"] == asyncio.subprocess.DEVNULL
-
-
-def test_run_claude_timeout_kills(monkeypatch, tmp_path):
-    proc = FakeProc(delay=1)
-    monkeypatch.setattr(bot, "WORKSPACE", str(tmp_path))
-    monkeypatch.setattr(bot, "CLAUDE_TIMEOUT", 0.05)
-    _patch_exec(monkeypatch, proc)
-    assert asyncio.run(bot.run_claude("p")) == ("", "timeout")
-    assert proc.killed
-
-
-def test_run_claude_missing_binary(monkeypatch, tmp_path):
-    async def boom(*a, **k):
-        raise FileNotFoundError("claude")
-
-    monkeypatch.setattr(bot, "WORKSPACE", str(tmp_path))
-    monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", boom)
-    assert asyncio.run(bot.run_claude("p")) == ("", "error")
-
-
 # ---------------------------------------------------------------------------
 # Прогон пачки: ошибка -> короткий ответ, не молчание
 # ---------------------------------------------------------------------------
@@ -518,13 +466,12 @@ def runtime(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("kind", ["error", "timeout", "quota"])
 def test_process_batch_error_sends_short_reply(monkeypatch, runtime, kind):
-    async def fake_run(prompt):
+    async def fake_run(prompt, **kwargs):
         return "", kind
 
-    monkeypatch.setattr(bot, "run_claude", fake_run)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("поставь синк", 1)]))
-    # Hermes основной (27.10) тут падает -> эскалация в Claude -> его ошибка как есть
     shown = kind
     assert fb.sent == [(ANTON, bot.error_reply(shown))]
     assert len(bot.error_reply(shown)) < 120
@@ -535,10 +482,10 @@ def test_process_batch_error_sends_short_reply(monkeypatch, runtime, kind):
 
 
 def test_process_batch_empty_reply_is_not_silence(monkeypatch, runtime):
-    async def fake_run(prompt):
+    async def fake_run(prompt, **kwargs):
         return "   ", None
 
-    monkeypatch.setattr(bot, "run_claude", fake_run)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("?", 1)]))
     assert fb.sent == [(ANTON, bot.error_reply("empty"))]
@@ -547,11 +494,11 @@ def test_process_batch_empty_reply_is_not_silence(monkeypatch, runtime):
 def test_process_batch_success_prompt_and_chatlog(monkeypatch, runtime):
     prompts = []
 
-    async def fake_run(prompt):
+    async def fake_run(prompt, **kwargs):
         prompts.append(prompt)
         return "Синк сб 17.10 13:00–14:00 → календарь.", None
 
-    monkeypatch.setattr(bot, "run_claude", fake_run)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("первое", 1)]))
     asyncio.run(bot.process_batch(fb, [rec("второе", 2)]))
@@ -565,10 +512,10 @@ def test_process_batch_success_prompt_and_chatlog(monkeypatch, runtime):
 
 
 def test_process_batch_splits_long_reply(monkeypatch, runtime):
-    async def fake_run(prompt):
+    async def fake_run(prompt, **kwargs):
         return "а" * 4500, None
 
-    monkeypatch.setattr(bot, "run_claude", fake_run)
+    monkeypatch.setattr(bot.RESERVE, "run_hermes", fake_run)
     fb = FakeBot()
     asyncio.run(bot.process_batch(fb, [rec("длинно", 1)]))
     assert len(fb.sent) == 2 and all(len(t) <= bot.TG_LIMIT for _c, t in fb.sent)
@@ -725,46 +672,26 @@ def _pdf_record():
     return bot.build_record("что в договоре", message_id=1, attachments=["document"], media=media)
 
 
-def test_pdf_batch_goes_to_claude_not_hermes(monkeypatch, runtime):
+def test_pdf_and_explicit_claude_request_still_use_hermes(monkeypatch, runtime):
     calls = []
 
-    async def fake_claude(prompt):
-        calls.append("claude")
-        return "В договоре срок 10 дней.", None
+    async def hermes(prompt, **kwargs):
+        calls.append(prompt)
+        return "В документе срок 10 дней.", None
 
-    async def no_hermes(*a, **kw):
-        calls.append("hermes")
-        return "не вижу файл", None
+    async def forbidden(*a, **kw):
+        pytest.fail("Claude should never run")
 
-    monkeypatch.setattr(bot, "run_claude", fake_claude)
-    monkeypatch.setattr(bot.RESERVE, "run_hermes", no_hermes)
-    monkeypatch.setenv("ASYA_PRIMARY_ENGINE", "hermes")
-    assert bot.has_pdf([_pdf_record()]) and not bot.has_pdf([rec("текст", 1)])
-    fake_bot = FakeBot()
-    asyncio.run(bot.process_batch(fake_bot, [_pdf_record()]))
-    assert calls == ["claude"]
-    assert fake_bot.sent[-1][1] == "В договоре срок 10 дней."
-    assert bot.RESERVE.last_reason == "pdf"
-
-
-def test_pdf_batch_falls_back_when_claude_fails(monkeypatch, runtime):
-    calls = []
-
-    async def bad_claude(prompt):
-        calls.append("claude")
-        return "", "quota"
-
-    async def hermes(*a, **kw):
-        calls.append("hermes")
-        return "ответ запасной модели", None
-
-    monkeypatch.setattr(bot, "run_claude", bad_claude)
+    monkeypatch.setattr(bot.RESERVE, "_claude", forbidden)
     monkeypatch.setattr(bot.RESERVE, "run_hermes", hermes)
-    monkeypatch.setenv("ASYA_PRIMARY_ENGINE", "hermes")
+    monkeypatch.setattr(bot, "pdf_context", lambda _: "PDF test: 10 дней")
+    monkeypatch.setenv("ASYA_FORCE_ENGINE", "claude")
+    record = _pdf_record()
+    record["text"] += " спроси Claude"
     fake_bot = FakeBot()
-    asyncio.run(bot.process_batch(fake_bot, [_pdf_record()]))
-    assert calls[:2] == ["claude", "hermes"]
-    assert fake_bot.sent[-1][1] == "ответ запасной модели"
+    asyncio.run(bot.process_batch(fake_bot, [record]))
+    assert len(calls) == 1 and "PDF test: 10 дней" in calls[0]
+    assert fake_bot.sent[-1][1] == "В документе срок 10 дней."
 
 
 def test_error_handler_logs_one_line_without_token(monkeypatch, caplog):
