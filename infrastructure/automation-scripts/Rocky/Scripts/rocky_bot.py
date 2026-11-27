@@ -870,6 +870,15 @@ _PRE_DESCRIBED = contextvars.ContextVar("rocky_pre_described", default=False)
 
 
 class RockyReserve(hermes_reserve.Reserve):
+    def config(self):
+        cfg = super().config()
+        if self.provider == "custom:rocky-nous":
+            cfg["providers"] = {"rocky-nous": {
+                "base_url": "https://inference-api.nousresearch.com/v1",
+                "key_env": "NOUS_API_KEY", "default_model": self.model,
+            }}
+        return cfg
+
     def images_in(self, prompt):
         return [] if _PRE_DESCRIBED.get() else super().images_in(prompt)
 

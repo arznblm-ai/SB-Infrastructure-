@@ -97,7 +97,9 @@ def describe(paths, model, timeout):
     from hermes_cli.auth import resolve_nous_runtime_credentials
     import httpx
 
-    creds = resolve_nous_runtime_credentials(timeout_seconds=min(15.0, timeout))
+    key = os.environ.get("NOUS_API_KEY")
+    creds = ({"api_key": key, "base_url": "https://inference-api.nousresearch.com/v1"}
+             if key else resolve_nous_runtime_credentials(timeout_seconds=min(15.0, timeout)))
     content = [{"type": "text", "text": PROMPT % (len(paths), len(paths))}]
     for i, p in enumerate(paths, 1):
         content.append({"type": "text", "text": "фото %d:" % i})
