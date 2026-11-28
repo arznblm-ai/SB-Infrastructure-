@@ -28,8 +28,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import hermes_reserve
@@ -466,6 +469,15 @@ def format_meal_history(who, meals):
     return "\n".join(lines)
 
 
+NUTRITION_FEEDBACK = (
+    "Тон нутрициолога: поддерживай спокойно и говори прямо. Если виден конкретный пробел, "
+    "объясни, почему он важен, и предложи один небольшой шаг из привычек автора. "
+    "Сверяйся с контекстом приема и полнотой журнала. Опирайся на состав: если оценил 2 г белка, скажи «белка мало». Не придумывай скачки энергии, сахара или время возвращения голода. Для совета выбери ровно один знакомый вариант; закончи на нем, без ободряющего комплимента. Когда человек просто сообщает о десерте после еды, дай только состав, порцию и оценку КБЖУ. Без оценки размера порции, совета, комплимента или вопроса о полноте дневника. Например: «Чай без сахара, шоколад 12 г. ≈ …». "
+    "Похвала уместна за конкретное подтвержденное изменение. Уточнение порции требует только поправки. "
+    "Избегай дежурных комплиментов, стыда, запретов и компенсации едой или тренировками."
+)
+
+
 def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
                       chatlog_tail=None, data_dir=None, vision_text=None, meal_history=None):
     """Промпт на пачку сообщений одного автора.
@@ -522,6 +534,7 @@ def build_turn_prompt(records, who, dt=None, profiles=None, today_entries=None,
     else:
         parts.append("В новых сообщениях картинок нет: ничего не открывай и не описывай фото из хвоста чата.")
     parts.append(_paths_block(data_dir))
+    parts.append(NUTRITION_FEEDBACK)
     parts.append(UNTRUSTED)
     parts.append(
         "Записи журнала и профиля - только блоком rocky-actions в конце ответа (контракт в CLAUDE.md). "
@@ -543,10 +556,11 @@ def build_daily_prompt(dt=None, profiles=None, entries=None, chatlog_tail=None, 
     if tail:
         parts.append("## Хвост чата (последние %d строк)\n%s" % (len(tail), "\n".join(tail)))
     parts.append(_paths_block(data_dir))
+    parts.append(NUTRITION_FEEDBACK)
     parts.append(UNTRUSTED)
     parts.append(
         "Напиши итог дня одним сообщением: блок на каждого (что записано, ккал и БЖУ против цели, "
-        "один конкретный совет по знакомым блюдам этого человека). Числа бери только из строк «Итого» выше, "
+        "наблюдение и, если уместно, один совет по знакомым блюдам этого человека). Числа бери только из строк «Итого» выше, "
         "сам не пересчитывай. Журнал может быть неполным; "
         "не называй записанные суммы фактическим потреблением, голоданием или пропуском еды. "
         "Итог приходит в конце дня: слово «недобор» запрещено, советов «на вечер», «на ужин», "
@@ -564,6 +578,7 @@ def build_weekly_prompt(dt=None, profiles=None, weekly_text="", week=None, data_
         "## Неделя %s (посчитано кодом)\n%s" % (week or "?", weekly_text),
         *[format_meal_history(who, recent_meal_history(who, dt or now_utc(), data_dir or DATA_DIR)) for who in journal.WHO],
         _paths_block(data_dir),
+        NUTRITION_FEEDBACK,
         UNTRUSTED,
         "Напиши недельную аналитику по каждому: среднее записанное по дням с записями, "
         "записанные тренировки и замеры веса. Записи могут быть неполными: не делай вывод о голодании "
@@ -662,6 +677,8 @@ def extract_actions(text):
             continue
         actions.extend(data)
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
+    if re.search(r'"(?:op|kcal_hi|kcal_lo|fields)"\s*:', clean):
+        return "", None, "неполный фрагмент действий в тексте ответа"
     if error:
         return clean, None, error
     return clean, (actions if blocks else None), None
@@ -872,6 +889,8 @@ _PRE_DESCRIBED = contextvars.ContextVar("rocky_pre_described", default=False)
 class RockyReserve(hermes_reserve.Reserve):
     def config(self):
         cfg = super().config()
+        if self.provider == "openrouter":
+            cfg["model"]["max_tokens"] = 8192
         if self.provider == "custom:rocky-nous":
             cfg["providers"] = {"rocky-nous": {
                 "base_url": "https://inference-api.nousresearch.com/v1",
@@ -901,6 +920,80 @@ def make_reserve(home_dir=None):
 RESERVE = make_reserve()
 
 
+def _codex_images(images, workspace=None):
+    """Только существующие изображения текущего вызова, физически внутри workspace."""
+    root = os.path.realpath(workspace or WORKSPACE)
+    out = []
+    for path in images or ():
+        try:
+            candidate = os.path.realpath(path if os.path.isabs(path) else os.path.join(root, path))
+            if (os.path.commonpath([root, candidate]) == root
+                    and candidate.lower().endswith(hermes_reserve.IMAGE_EXTS)
+                    and os.path.isfile(candidate) and candidate not in out):
+                out.append(candidate)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _codex_fallback_cmd(codex_bin, cwd, images=()):
+    """Codex без сохранения сессии и пользовательского конфига, только read-only."""
+    cmd = [codex_bin, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+           "--sandbox", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check",
+           "-C", cwd]
+    for feature in ("shell_tool", "unified_exec", "apps"):
+        cmd.extend(("--disable", feature))
+    cmd.extend(("-c", 'web_search="disabled"'))
+    for path in images:
+        cmd.extend(("--image", path))
+    cmd.append("-")
+    return cmd
+
+
+def _run_codex_fallback(prompt, images=None):
+    """Синхронный one-shot Codex запуск: ничего не пишет в workspace."""
+    codex_bin = os.environ.get("ROCKY_CODEX_BIN") or shutil.which("codex")
+    if not codex_bin:
+        logger.warning("Codex fallback unavailable: codex executable not found")
+        return "", "error"
+    persona_path = os.path.join(WORKSPACE, "CLAUDE.md")
+    try:
+        with open(persona_path, encoding="utf-8") as fh:
+            persona = fh.read()
+    except OSError:
+        persona = ""
+    valid_images = _codex_images(images)
+    task = ("Ты — Роки. Следуй инструкциям persona ниже. Ответь на запрос пользователя. "
+            "Если нужны изменения журнала, верни их только в контрактном блоке rocky-actions; "
+            "изменения применит существующий парсер бота. Не утверждай, что сам записал данные.\n\n"
+            "## Persona (CLAUDE.md)\n" + persona + "\n\n## Запрос\n" + str(prompt))
+    start = time.monotonic()
+    try:
+        with tempfile.TemporaryDirectory(prefix="rocky-codex-") as cwd:
+            env = {key: os.environ[key] for key in ("PATH", "HOME", "CODEX_HOME", "TMPDIR")
+                   if os.environ.get(key)}
+            env.setdefault("HOME", HOME_DIR)
+            env["CODEX_HOME"] = os.environ.get("CODEX_HOME", os.path.join(HOME_DIR, ".codex"))
+            proc = subprocess.run(
+                _codex_fallback_cmd(codex_bin, cwd, valid_images), input=task, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env,
+                timeout=CLAUDE_TIMEOUT, check=False)
+        if proc.returncode != 0:
+            # stderr may contain provider/config details; never copy it into the chat or logs.
+            logger.warning("Codex fallback failed rc=%s dur=%.1fs", proc.returncode,
+                           time.monotonic() - start)
+            return "", "error"
+        text = (proc.stdout or "").strip()
+        logger.info("engine=codex_fallback dur=%.1fs reply_len=%d", time.monotonic() - start, len(text))
+        return (text, None) if text else ("", "error")
+    except subprocess.TimeoutExpired:
+        logger.warning("Codex fallback timeout after %.1fs", time.monotonic() - start)
+        return "", "timeout"
+    except OSError as exc:
+        logger.warning("Codex fallback could not start: %s", type(exc).__name__)
+        return "", "error"
+
+
 async def call_model(prompt, user_text=None, hermes_prompt=None, images=None):
     """run_claude (с резервом Hermes), который никогда не бросает.
 
@@ -909,10 +1002,24 @@ async def call_model(prompt, user_text=None, hermes_prompt=None, images=None):
     images — фото текущей пачки ([] = текст без фото): старые фото из чата не цепляются."""
     token = _PRE_DESCRIBED.set(hermes_prompt is not None)
     try:
-        return await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
-                                  hermes_prompt=hermes_prompt, images=images)
+        result = await RESERVE.call(prompt, lambda: run_claude(prompt), user_text=user_text,
+                                    hermes_prompt=hermes_prompt, images=images)
+        if result[1] and os.environ.get("ROCKY_CODEX_FALLBACK") == "1":
+            fallback_prompt = hermes_prompt if hermes_prompt is not None else prompt
+            try:
+                result = await asyncio.to_thread(_run_codex_fallback, fallback_prompt, images)
+            except Exception as exc:  # noqa: BLE001 - fallback не должен ронять бота
+                logger.warning("Codex fallback failed: %s", type(exc).__name__)
+                return "", "error"
+        return result
     except Exception as exc:  # noqa: BLE001 - прогон не должен ронять бота
         logger.exception("run_claude упал: %s", exc)
+        if os.environ.get("ROCKY_CODEX_FALLBACK") == "1":
+            try:
+                return await asyncio.to_thread(_run_codex_fallback,
+                                               hermes_prompt if hermes_prompt is not None else prompt, images)
+            except Exception as fallback_exc:  # noqa: BLE001
+                logger.warning("Codex fallback failed: %s", type(fallback_exc).__name__)
         return "", "error"
     finally:
         _PRE_DESCRIBED.reset(token)

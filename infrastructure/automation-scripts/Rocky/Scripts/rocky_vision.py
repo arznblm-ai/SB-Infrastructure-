@@ -53,7 +53,8 @@ def encode(path):
 def model_price(creds, model, timeout):
     """(prompt, completion) $/токен из каталога Nous /models, кэш PRICE_TTL. Нет - None."""
     import httpx
-    path = os.path.join(os.environ.get("HERMES_HOME") or ".", PRICE_CACHE)
+    path = os.path.join(os.environ.get("HERMES_HOME") or ".",
+                        "openrouter-prices.json" if os.environ.get("ROCKY_HERMES_PROVIDER") == "openrouter" else PRICE_CACHE)
     try:
         with open(path) as fh:
             cache = json.load(fh)
@@ -97,8 +98,11 @@ def describe(paths, model, timeout):
     from hermes_cli.auth import resolve_nous_runtime_credentials
     import httpx
 
-    key = os.environ.get("NOUS_API_KEY")
-    creds = ({"api_key": key, "base_url": "https://inference-api.nousresearch.com/v1"}
+    if os.environ.get("ROCKY_HERMES_PROVIDER") == "openrouter":
+        creds = {"api_key": os.environ["OPENROUTER_API_KEY"], "base_url": "https://openrouter.ai/api/v1"}
+    else:
+        key = os.environ.get("NOUS_API_KEY")
+        creds = ({"api_key": key, "base_url": "https://inference-api.nousresearch.com/v1"}
              if key else resolve_nous_runtime_credentials(timeout_seconds=min(15.0, timeout)))
     content = [{"type": "text", "text": PROMPT % (len(paths), len(paths))}]
     for i, p in enumerate(paths, 1):

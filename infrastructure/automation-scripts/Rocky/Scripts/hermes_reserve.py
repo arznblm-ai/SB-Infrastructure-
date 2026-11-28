@@ -609,7 +609,11 @@ class Reserve:
         out = (out_b or b"").decode("utf-8", errors="replace")
         err = (err_b or b"").decode("utf-8", errors="replace")
         sid = (re.findall(r"session_id:\s*(\S+)", err + "\n" + out) or [None])[-1]
-        text = self.session_reply(sid) or _strip_junk(out)
+        try:
+            text = self.session_reply(sid) or _strip_junk(out)
+        except TruncatedReply:
+            self.log.warning("engine=hermes incomplete model response sid=%s", sid)
+            return "", "error"
         cost = self.session_cost(sid)
         if proc.returncode != 0 or not text:
             self.log.warning("engine=hermes reason=%s model=%s rc=%s dur=%.1fs cost_usd=%s tail=%s",
@@ -660,9 +664,16 @@ def _strip_junk(text):
                      if not ln.startswith(("session_id:", "Warning: Unknown toolsets"))).strip()
 
 
+class TruncatedReply(ValueError):
+    """The final assistant message is only a continuation, unsafe to deliver alone."""
+
+
 def pick_reply(rows):
     """rows: (role, content, tool_calls) по порядку. Пусто — если ответа не нашли."""
     last_user = max((i for i, r in enumerate(rows) if r[0] == "user"), default=-1)
+    if last_user >= 0 and (rows[last_user][1] or "").startswith(
+            "[System: Your previous response was truncated by the output length limit."):
+        raise TruncatedReply()
     for role, content, tool_calls in rows[last_user + 1:]:
         if role != "assistant" or (tool_calls or "").strip() not in ("", "[]", "null"):
             continue

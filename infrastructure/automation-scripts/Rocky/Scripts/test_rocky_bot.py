@@ -562,3 +562,16 @@ def test_send_retries_once_and_chatlog_only_after_success(tmp_path, monkeypatch)
     assert bad_bot.calls == 2 and bad_bot.sent == []
     assert not any("потеряно" in ln for ln in rb.read_chatlog_tail(chatlog_dir=str(tmp_path)))
     assert "AAAA" not in rb.redact("bot123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAA/x")
+
+
+def test_truncated_hermes_turn_triggers_fallback_and_does_not_expose_json():
+    import pytest
+    import hermes_reserve
+    import rocky_bot
+    marker = "[System: Your previous response was truncated by the output length limit. Continue exactly where you left off.]"
+    fragment = '100, "kcal_hi": 130}}, {"op": "add_meal"}]\n```'
+    with pytest.raises(hermes_reserve.TruncatedReply):
+        hermes_reserve.pick_reply([("user", "Уточнение", None), ("assistant", "Начало", None),
+                                   ("user", marker, None), ("assistant", fragment, None)])
+    clean, actions, error = rocky_bot.extract_actions(fragment)
+    assert clean == "" and actions is None and error
